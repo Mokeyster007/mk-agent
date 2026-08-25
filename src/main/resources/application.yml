@@ -1,0 +1,96 @@
+spring:
+  application:
+    name: mk-agent
+
+  profiles:
+    active: local
+
+  # AgentRun 建表脚本：启动时执行，语句全部幂等（IF NOT EXISTS）。
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema.sql
+
+  ai:
+    vectorstore:
+      pgvector:
+        index-type: HNSW
+        distance-type: COSINE_DISTANCE
+        dimensions: 1536
+        max-document-batch-size: 10000
+
+    mcp:
+      client:
+        enabled: true
+        type: SYNC
+        request-timeout: 60s
+
+       ##stdio:
+        ##  servers-configuration: classpath:mcp-servers.json
+
+        sse:
+          connections:
+            server1:
+              url: http://localhost:8127
+
+server:
+  port: 8123
+  servlet:
+    context-path: /api
+
+# =============================================================
+# Actuator：只暴露 health 端点，不暴露 env/beans/heapdump 等敏感端点。
+# 生产环境若需进一步收敛，可将 show-details 改为 never。
+# =============================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always
+
+# =============================================================
+# MkAgent 弹性与成本观测配置。
+# =============================================================
+mkagent:
+  agent:
+    # 全局最大并发 Agent 任务数（Semaphore 许可数）。
+    max-concurrency: 8
+  rate-limit:
+    # 用户级限流开关与阈值：每分钟最多发起多少次 Agent 请求。
+    enabled: true
+    max-requests: 10
+    window-seconds: 60
+  tool-retry:
+    # 只对安全、只读、幂等的工具自动重试。
+    enabled: true
+    max-attempts: 3
+    initial-backoff-millis: 200
+    multiplier: 2.0
+    retryable-tools: web_search,web_scrape
+    # 工具吞异常返回失败文案时的识别关键词（工具名:关键词，包含匹配）。
+    failure-markers: web_search:搜索工具执行失败,web_scrape:网页抓取失败
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+    tags-sorter: alpha
+    operations-sorter: alpha
+  api-docs:
+    path: /v3/api-docs
+  group-configs:
+    - group: default
+      paths-to-match: '/**'
+      packages-to-scan: com.example.mkagent.controller
+
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+logging:
+  level:
+    com.example.mkagent.advisor: DEBUG
+
