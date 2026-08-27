@@ -1,6 +1,6 @@
 # mk-agent
 
-一个基于 **Spring AI + Spring AI Alibaba（DashScope）** 的 Java Agent 学习项目：从最简单的聊天应用出发，逐步实现了一个具备 **ReAct 循环、工具调用、SSE 流式输出、状态机、任务取消、弹性限流、任务持久化** 的通用智能体（MkManus），并配套 RAG 知识库问答与 MCP 工具生态。
+一个基于 **Spring AI + Spring AI Alibaba（DashScope）** 的 Java Agent 学习项目：从最简单的聊天应用（chatApp，AI 学习知识咨询助手 + RAG 知识库）出发，逐步实现了一个具备 **ReAct 循环、工具调用、SSE 流式输出、状态机、任务取消、弹性限流、任务持久化** 的通用智能体（MkManus），并配套 RAG 知识库问答与 MCP 工具生态。
 
 > 定位：个人学习项目，代码中有大量中文注释解释原理，适合一起"手撕"学习。
 
@@ -51,9 +51,10 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 | 工具安全重试 | `ToolRetryWrapper`，只对白名单中的只读幂等工具（如搜索/抓取）自动重试 |
 | 模型健康检查 | `AiModelHealthIndicator`，接入 Spring Actuator `/health` |
 
-### 3. chatApp 恋爱咨询助手 + RAG 知识库
+### 3. chatApp AI 学习咨询助手 + RAG 知识库
 
-- 基础对话（含文件级对话记忆 `FileBasedChatMemory`）、结构化输出（恋爱报告）
+- 基础对话（含文件级对话记忆 `FileBasedChatMemory`）、结构化输出（AI 学习报告）
+- 知识库内容覆盖 AI 学习三阶段：入门篇（学习路线/数学基础/提示词）、进阶篇（LLM/Transformer/RAG/向量库）、实践篇（Spring AI/Agent/工程调优），按文件名后缀映射为 `status` 元数据过滤检索范围
 - 三种 RAG 知识库构建方式对比：
   1. 本地 Markdown 分片 + 内存向量库（SimpleVectorStore）
   2. 阿里云百炼云端知识库 Advisor
@@ -78,7 +79,7 @@ MCP 生态：
 mk-agent
 ├── src/main/java/com/example/mkagent
 │   ├── agent/          # Agent 核心：BaseAgent/ReActAgent/ToolCallAgent/MkManus、任务注册与取消
-│   ├── app/            # chatApp 恋爱咨询助手
+│   ├── app/            # chatApp AI 学习咨询助手
 │   ├── rag/            # RAG 三种构建方式 + pgvector 配置
 │   ├── tools/          # 内置工具（搜索/抓取/文件/PDF/下载）
 │   ├── resilience/     # 并发保护、限流、工具重试
@@ -89,7 +90,7 @@ mk-agent
 │   ├── chatmemory/     # 基于文件的对话记忆（Kryo 序列化）
 │   └── demo/           # 三种调用方式对比 demo（SDK/Spring AI/LangChain4j）
 ├── src/main/resources
-│   ├── document/       # RAG 知识库原始 Markdown
+│   ├── document/       # RAG 知识库原始 Markdown（AI 学习：入门/进阶/实践）
 │   ├── db/schema.sql   # agent_run 建表脚本（幂等）
 │   └── mcp-servers.json        # 本地 MCP 服务配置（含密钥，已忽略不上传）
 ├── mk-image-search-mcp-server/ # 图片搜索 MCP Server 子模块

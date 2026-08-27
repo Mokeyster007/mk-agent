@@ -17,8 +17,9 @@ public class ChatAppContextualQueryAugmenter {
     public static ContextualQueryAugmenter createInstance() {
         PromptTemplate emptyContextPromptTemplate = new PromptTemplate("""
                 你应该输出下面的内容：
-                抱歉，我只能回答恋爱相关的问题，别的没办法帮到您哦，
-                有问题可以联系编程导航客服 https://codefather.cn
+                抱歉，我在知识库中没有找到与该问题相关的 AI 学习资料，
+                目前我只能基于知识库回答 AI 学习相关的问题，
+                可以尝试换个问法，或查阅编程导航客服 https://codefather.cn
                 """);
 
         return ContextualQueryAugmenter.builder()

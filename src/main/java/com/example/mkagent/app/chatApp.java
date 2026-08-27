@@ -34,18 +34,18 @@ import java.util.List;
 public class chatApp {
 
     private static final String SYSTEM_PROMPT = """
-            你是一名深耕恋爱心理领域的咨询助手。
-            开场时先表明身份，并告诉用户可以倾诉恋爱难题。
+            你是一名专注于 AI 知识学习咨询的助手。
+            开场时先表明身份，并告诉用户可以咨询任何 AI 学习相关的问题。
 
-            根据用户状态进行追问：
-            - 单身：询问社交圈拓展、追求心仪对象的困难；
-            - 恋爱：询问沟通方式、习惯差异、冲突的具体经过；
-            - 已婚：询问家庭责任分配、亲属关系和沟通问题。
+            根据用户的学习阶段进行追问：
+            - 零基础：询问学习目标、编程与数学基础、可投入的学习时间；
+            - 入门中：询问当前学习的内容、遇到的卡点、使用的工具与框架；
+            - 进阶实践：询问正在做的项目、技术选型、遇到的具体技术问题。
 
-            引导用户说明事情经过、对方反应和自己的真实想法，
-            再给出温和、具体、可执行的建议。
-            不要把自己描述为持证心理医生；如用户出现自伤、他伤
-            或紧急危险迹象，应建议尽快联系当地紧急服务或专业人士。
+            引导用户说明学习背景、目标方向和当前的困惑，
+            再给出清晰、具体、可执行的学习建议与资源推荐。
+            回答时优先基于知识库中的资料作答；如知识库中没有相关内容，
+            请如实说明，并给出通用性的学习建议，不要编造不存在的课程或链接。
             """;
 
     private final ChatClient chatClient;
@@ -105,28 +105,28 @@ public class chatApp {
     }
 
 
-    record LoveReport(String title, List<String> suggestion){
+    record StudyReport(String title, List<String> suggestion){
 
     }
     /**
-     * AI 恋爱报告功能（支持结构化输出）
+     * AI 学习报告功能（支持结构化输出）
      * @param message
      * @param chatId
      * @return
      */
-    public LoveReport doChatWithReport(String message, String chatId) {
-        LoveReport loveReport = chatClient.prompt()
-                .system(SYSTEM_PROMPT + "每次对话都要生成恋爱结构，标题为{用户名}的恋爱报告，内容为建议列表")
+    public StudyReport doChatWithReport(String message, String chatId) {
+        StudyReport studyReport = chatClient.prompt()
+                .system(SYSTEM_PROMPT + "每次对话都要生成学习报告结构，标题为{用户名}的AI学习报告，内容为建议列表")
                 .user(message)
                 .advisors(advisor -> advisor.param(
                         ChatMemory.CONVERSATION_ID,
                         chatId
                 ))
                 .call()
-                .entity(LoveReport.class);
+                .entity(StudyReport.class);
 
-        log.info("LoveReport: {}", loveReport);
-        return loveReport;
+        log.info("StudyReport: {}", studyReport);
+        return studyReport;
     }
 
 
@@ -171,7 +171,7 @@ public class chatApp {
                  */
                 .advisors(
                         ChatAppRagCustomAdvisorFactory.createChatAppRagCustomAdvisor(
-                                chatAppVectorStore, "单身"  //自定义RAG
+                                chatAppVectorStore, "入门"  //自定义RAG，按学习阶段（入门/进阶/实践）过滤知识库文档
                         )
                 )
                 .call()
