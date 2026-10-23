@@ -1,0 +1,360 @@
+# 安全加固说明（SECURITY.md）
+
+本文档记录本项目的密钥管理、历史清理、提交前扫描与网络安全加固约定。
+
+> 约定：**文档中一律不写真实密钥，只写位置、类型与占位符。**
+> 需要真实值时，只放在 `application-local.yml`（已被 `.gitignore` 忽略）
+> 或运行环境变量里。
+
+---
+
+## 0. 结论速览
+
+| 项目 | 当前状态 | 谁来做 |
+|---|---|---|
+| 高德 Key 明文写在 `mcp-servers.json` | **已移除**，改为子进程继承环境变量 | 你：去控制台轮换该 Key |
+| `application-local.yml` 中的 4 处密钥 | 文件已被 `.gitignore` 忽略，从未进入版本库 | 你：逐一轮换 |
+| 密钥是否进过 git 历史 | **未发现**（见第 2 节核查结论） | 无需强推 |
+| `tmp/` 是否进过 git 历史 | **未发现** | 无需清理历史 |
+| 提交前密钥扫描 | 已提供 gitleaks 方案 + 单测兜底 | 建议本地装 gitleaks |
+| SSRF | 已加 `UrlSafetyValidator` | 见第 6 节残留风险 |
+
+---
+
+## 1. 密钥轮换（必须手动做）
+
+### 1.1 需要轮换的密钥清单（只列位置，不列值）
+
+| # | 位置 | 类型 | 说明 |
+|---|---|---|---|
+| 1 | `src/main/resources/application-local.yml` | PostgreSQL 密码 | 数据库账号口令 |
+| 2 | `src/main/resources/application-local.yml` | DashScope `api-key`（`sk-` 前缀） | 大模型调用凭证 |
+| 3 | `src/main/resources/application-local.yml` | 另一个 `api-key` | 第三方服务凭证 |
+| 4 | `src/main/resources/application-local.yml` | 再一个 `api-key` | 第三方服务凭证 |
+| 5 | `src/main/resources/mcp-servers.json` | 高德地图 Key（32 位十六进制） | **本次已从文件移除**，但仍需轮换 |
+
+> 第 5 项虽然已从工作区文件中删除，但它在磁盘上明文存在过相当长时间，
+> 仍应视为已泄露并轮换。
+
+### 1.2 轮换步骤
+
+1. **高德开放平台**：登录控制台 → 应用管理 → 找到对应 Key → 删除旧 Key → 新建 Key。
+2. **阿里云百炼 / DashScope**：控制台 → API-KEY 管理 → 禁用旧 Key → 创建新 Key。
+3. **PostgreSQL**：`ALTER USER <user> WITH PASSWORD '<新口令>';`
+4. 其余两个第三方 `api-key`：到各自控制台重新签发。
+
+### 1.3 轮换后怎么放
+
+- 数据库口令、DashScope Key：写回 `application-local.yml`（该文件不会进版本库）。
+- 高德 Key：**不要写回 `mcp-servers.json`**，改用环境变量（见第 5 节）。
+
+---
+
+## 2. Git 历史清理（预防性，本项目当前不需要强推）
+
+### 2.1 核查结论
+
+已执行以下核查，结果均为空：
+
+```bash
+# 1) mcp-servers.json 是否被提交过
+git log --all --oneline -- src/main/resources/mcp-servers.json
+# 输出为空 → 从未提交（该文件在 .gitignore 中）
+
+# 2) 密钥字符串是否出现在任何历史提交中
+git log --all -S "<高德 Key 原文>" --oneline
+# 输出为空 → 历史中检索不到
+
+# 3) tmp/ 是否被提交过
+git log --all --oneline -- tmp
+# 输出为空 → 从未提交
+```
+
+**结论：本仓库历史中未发现泄露的密钥，不需要改写历史，也不需要强制推送。**
+
+### 2.2 若将来发现密钥进了历史（备查命令）
+
+**方案 A：git filter-repo（推荐）**
+
+```bash
+# 安装：pip install git-filter-repo
+
+# 1) 备份仓库（filter-repo 会改写全部提交）
+cp -r mk-agent mk-agent.bak
+
+# 2) 整文件移除
+git filter-repo --path src/main/resources/mcp-servers.json --invert-paths
+
+# 3) 或按内容替换（把泄露的字符串替换成占位符）
+#    secrets.txt 每行格式：  原文==>***REMOVED***
+git filter-repo --replace-text secrets.txt
+```
+
+**方案 B：BFG**
+
+```bash
+java -jar bfg.jar --delete-files mcp-servers.json
+java -jar bfg.jar --replace-text secrets.txt
+git reflog expire --expire=now --all
+git gc --prune=now --aggressive
+```
+
+### 2.3 改写历史之后
+
+```bash
+git push --force --all
+git push --force --tags
+```
+
+**强制推送会重写提交 ID，必须通知所有协作者重新克隆**：
+
+```bash
+# 协作者侧
+git clone <repo-url> mk-agent-new
+# 不要在原仓库上 pull/rebase，否则会把旧对象再带回来
+```
+
+同时提醒协作者：旧的本地克隆、CI 缓存、Fork 仍保留旧历史，需要一并清理。
+
+---
+
+## 3. tmp/ 与个人内容
+
+### 3.1 现状
+
+- `.gitignore` 已加入 `tmp/`（此前是不带斜杠的 `tmp`）。
+- 核查结论：`git log --all -- tmp` 为空，**tmp/ 从未进入过 git 历史**。
+  因此 `tmp/file/shanghai_date_plan.txt` 等含个人内容的文件没有泄露风险。
+
+### 3.2 已被跟踪时的处理
+
+`git rm --cached` 只对**已被跟踪**的文件生效。
+本项目当前 `tmp/` 未被跟踪，执行下面命令会提示 `pathspec did not match`，
+属于预期结果（已在提交记录中说明）：
+
+```bash
+# 如果 tmp/ 曾被跟踪，必须执行这一步才会真正停止跟踪
+git rm -r --cached tmp
+git commit -m "chore: stop tracking tmp/"
+```
+
+注意：`git rm --cached` 只是让 git 不再跟踪，**不会删除本地文件**。
+
+### 3.3 个人内容清理
+
+`tmp/` 下包含会话记忆（`tmp/chat-memory/*.kryo`）、下载文件与临时产物，
+其中可能有个人内容。这部分需要你手动确认后清理，程序不会自动删除。
+
+---
+
+## 4. 提交前密钥扫描（gitleaks）
+
+### 4.1 安装
+
+```bash
+# Windows（scoop）
+scoop install gitleaks
+
+# 或直接下载 release 二进制
+# https://github.com/gitleaks/gitleaks/releases
+```
+
+### 4.2 使用
+
+```bash
+# 扫描全部历史
+gitleaks detect --source . -v
+
+# 只扫描暂存区（提交前用这个，最快）
+gitleaks protect --staged -v
+
+# 生成报告
+gitleaks detect --source . --report-format json --report-path gitleaks.json
+```
+
+### 4.3 建议配置为 pre-commit 钩子
+
+在仓库根目录新建 `.pre-commit-config.yaml`：
+
+```yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+```
+
+然后：
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+### 4.4 项目内兜底
+
+除 gitleaks 外，仓库内还有一个单元测试持续兜底：
+
+`src/test/java/com/example/mkagent/security/ResourceSecretScanUnitTest.java`
+
+它会扫描 `src/main/resources` 下的所有文本文件，命中以下任一规则即失败：
+
+1. 32 位十六进制字符串（疑似 API Key）；
+2. `sk-` 前缀密钥；
+3. `api-key` / `apiKey` / `api_key` 被赋了非占位符的值。
+
+> 说明：`application-local.yml` 被**排除**在扫描之外。
+> 原因是它含本机真实密钥、必须留在本机才能启动项目，
+> 且已被 `.gitignore` 忽略、永远不会进入版本库。
+
+---
+
+## 5. MCP 启动方式（密钥走环境变量）
+
+### 5.1 为什么不用 `${AMAP_MAPS_API_KEY}` 占位符
+
+已核实 Spring AI **1.0.0** 的实现：
+`McpStdioClientProperties#resourceToServerParameters()` 只是
+`new ObjectMapper().readValue(...)` 直接反序列化 JSON，
+**没有任何 `Environment` / `PropertyResolver` 参与**。
+
+也就是说，写 `${AMAP_MAPS_API_KEY}` 不会被展开，
+会被原样当作 Key 传给 MCP 服务，导致调用必然失败。
+因此本项目改为：**JSON 里不放 Key，由子进程继承父进程环境变量。**
+
+### 5.2 启动方式
+
+MCP stdio 子进程由 `ProcessBuilder` 拉起，默认继承父进程环境变量；
+`mcp-servers.json` 中 `env` 为空对象，因此会继承下面设置的值。
+
+**Windows PowerShell：**
+
+```powershell
+$env:AMAP_MAPS_API_KEY = "<你的高德 Key>"
+./mvnw spring-boot:run
+```
+
+**Windows CMD：**
+
+```bat
+set AMAP_MAPS_API_KEY=<你的高德 Key>
+mvnw.cmd spring-boot:run
+```
+
+**Linux / macOS：**
+
+```bash
+export AMAP_MAPS_API_KEY="<你的高德 Key>"
+./mvnw spring-boot:run
+```
+
+### 5.2.1 示例文件 `mcp-servers.example.json`
+
+`src/main/resources/mcp-servers.json` 被 `.gitignore` 忽略（含本机密钥），
+所以它**不会进版本库**，别人克隆仓库后拿不到这份配置。
+
+为此仓库里同时提供了一份**不含任何真实值**的模板：
+
+```
+src/main/resources/mcp-servers.example.json
+```
+
+用途与用法：
+
+1. 它是可提交、可 review 的"配置结构说明"，只描述有哪些 MCP 服务、
+   用什么命令启动，`env` 一律为空对象；
+2. 新环境初始化时复制一份即可：
+
+   ```bash
+   cp src/main/resources/mcp-servers.example.json src/main/resources/mcp-servers.json
+   ```
+
+3. 复制出来的 `mcp-servers.json` 已在 `.gitignore` 中，
+   **不要**把密钥写进它；密钥一律走环境变量（见 5.2）；
+4. 修改示例文件时**绝不能**填入真实 Key——`ResourceSecretScanUnitTest`
+   会扫描该目录，一旦出现 32 位十六进制 / `sk-` 前缀 / `api-key` 明文赋值就会失败。
+
+### 5.3 跨平台注意
+
+`mcp-servers.json` 中 `amap-maps` 的 `command` 目前是 `npx.cmd`（Windows 专用）。
+**迁移到 Linux 服务器时必须改为 `npx`**，否则子进程无法启动。
+
+### 5.4 当前状态说明
+
+`application.yml` 中 `spring.ai.mcp.client.stdio.servers-configuration`
+目前是**注释状态**，即 `mcp-servers.json` 尚未被加载，
+当前只有 SSE 连接（`http://localhost:8127`）处于启用状态。
+
+本次修复仍按规范整理好了该文件，待你启用 stdio 时可直接使用。
+
+---
+
+## 6. SSRF 与 DNS rebinding 残留风险
+
+### 6.1 已做的防护
+
+`WebScrapingTool` 抓取前会调用 `UrlSafetyValidator`：
+
+1. 只允许 `http` / `https`；
+2. 必须有 host，且 `localhost` 无条件拒绝；
+3. 用 `InetAddress.getAllByName` 解析出**全部** IP，
+   任意一条命中以下条件即拒绝：
+   - 回环（127.0.0.0/8、::1）
+   - 链路本地（169.254.0.0/16、fe80::/10）
+   - 私有（10/8、172.16/12、192.168/16）
+   - 通配（0.0.0.0、::）
+   - 组播（224/4、ff00::/8）
+   - IPv6 唯一本地（fc00::/7）
+   - 0.0.0.0/8、169.254.169.254（云元数据）、100.64.0.0/10（CGNAT，含阿里云 100.100.100.200）
+   - IPv4 映射的 IPv6（`::ffff:127.0.0.1`）按 IPv4 规则再判一次
+4. 不自动跟随重定向（`followRedirects(false)`）：
+   3xx 时把 `Location` 解析成绝对地址后**重新走同一套校验**，
+   通过才把最终 URL 交还给模型，不通过直接拒绝且不回显该地址；
+5. 非 2xx / 3xx 的错误页不返回正文，只返回 HTTP 状态码。
+
+### 6.2 残留风险：DNS rebinding
+
+**风险描述：**
+校验阶段用 `getAllByName` 解析得到的是公网 IP，
+但 jsoup 真正建立连接时会**再解析一次**域名。
+攻击者可以控制一个 TTL 极短的域名：
+第一次解析返回公网 IP（通过校验），第二次解析返回 `127.0.0.1`（实际连接内网）。
+
+**为什么本次没有彻底解决：**
+彻底解决需要"校验哪个 IP 就连哪个 IP"，即自定义连接工厂把连接目标钉死在
+已校验的 IP 上，同时手动设置 `Host` 头。
+但这样会破坏 HTTPS 的 SNI 与证书校验（证书绑定的是域名，不是 IP），
+实现成本与兼容风险都较高，超出本次范围。
+
+**缓解建议（按优先级）：**
+
+1. 生产环境把抓取工具放到**独立的、无内网访问权限的网络命名空间 / 容器**里运行；
+2. 出站流量只允许 80/443，且禁止访问 RFC1918 与云元数据网段（网络层 ACL）；
+3. 如确需在应用层解决，再实现自定义 `SocketFactory` 固定已校验 IP +
+   显式 `Host` 头（HTTPS 需自行处理 SNI）。
+
+**当前判定：** 项目仅在本机运行，风险可接受；
+部署到云服务器前必须至少落实缓解建议 1 或 2。
+
+---
+
+## 7. `application-local.yml` 检查清单
+
+该文件被 `.gitignore` 忽略，不会进版本库，但本机上仍以明文存在。请逐项确认：
+
+- [ ] 确认 `git check-ignore -v src/main/resources/application-local.yml` 有输出（确实被忽略）
+- [ ] 确认 `git ls-files | grep application-local` 为空（确实未被跟踪）
+- [ ] 轮换第 1 节清单中的全部密钥，并同步更新本文件
+- [ ] 检查是否还有**未列入清单**的 `password` / `secret` / `token` / `api-key` 字段
+- [ ] 确认该文件没有被复制到 `docs/`、`README.md`、截图、聊天记录或云笔记中
+- [ ] 确认 IDE 的"最近打开文件"、终端历史中没有粘贴过完整密钥
+- [ ] 若曾把该文件发给他人 / 上传网盘，按"已泄露"处理并立即轮换
+
+---
+
+## 8. 其他
+
+- 工具内部执行开关的手动验证步骤见
+  [`docs/agent-learning/06-tool-execution-and-network-safety.md`](agent-learning/06-tool-execution-and-network-safety.md)。
+- 所有日志、数据库、SSE 事件均不得包含密钥、系统提示词原文与工具参数原文；
+  新增代码请沿用现有的脱敏约定（`ToolEventMessageProvider`）。

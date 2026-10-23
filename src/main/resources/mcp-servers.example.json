@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "amap-maps": {
+      "command": "npx.cmd",
+      "args": [
+        "-y",
+        "@amap/amap-maps-mcp-server"
+      ],
+      "env": {}
+    },
+    "mk-image-search-mcp-server": {
+      "command": "java",
+      "args": [
+        "-Dspring.ai.mcp.server.stdio=true",
+        "-Dspring.main.web-application-type=none",
+        "-Dlogging.pattern.console=",
+        "-jar",
+        "mk-image-search-mcp-server/target/mk-image-search-mcp-server-0.0.1-SNAPSHOT.jar"
+      ],
+      "env": {}
+    }
+  }
+}
