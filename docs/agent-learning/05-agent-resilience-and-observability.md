@@ -661,3 +661,113 @@ Web 线程获取（`runStream` 同步段），`agent-*` 后台线程在 finally 
 | Prometheus + Grafana | Micrometer 暴露并发占用、限流拒绝数、工具重试数、Token 消耗速率，配合告警 |
 | 滑动窗口 / 令牌桶 | 限流算法升级，消除窗口切换瞬间的 2 倍流量问题 |
 | 并发闸门分布式化 | 多实例下用 Redis + Lua 实现全局信号量，或网关层统一限流 |
+
+---
+
+## 13. 模型调用失败治理（真实事故复盘）
+
+一次真实运行暴露了三个问题：模型地址配错 → DashScope 返回 HTTP 400 `InvalidParameter`
+→ 调用被反复重试 → 任务既没有立刻失败，日志也被堆栈刷满。
+
+### 13.1 谁在真正决定重试策略（先定位，再改）
+
+调用链（反编译 `spring-ai-alibaba-autoconfigure-dashscope-1.0.0.2` 核实）：
+
+```
+DashScopeChatAutoConfiguration#dashscopeChatModel(RetryTemplate retryTemplate, ...)
+        └── DashScopeChatModel.Builder#retryTemplate(retryTemplate)
+                └── RetryTemplate 来自 spring-ai-autoconfigure-retry 的
+                    SpringAiRetryAutoConfiguration#retryTemplate(SpringAiRetryProperties)
+                        └── 参数绑定：spring.ai.retry.*
+```
+
+结论：
+
+1. `DashScopeChatModel` **自己不构造**重试策略，只接收容器里的 `RetryTemplate`；
+2. 该 Bean 的默认值是 `maxAttempts=10` + 指数退避（2s 起、×5、上限 180s），
+   并且只对 `TransientAiException` 生效；
+3. 仓库里原本**没有任何** `spring.ai.retry` / 自定义 `RetryTemplate` 配置，
+   所以线上行为完全取决于框架默认值——一次 400 要等好几分钟，
+   最后还可能先撞上 Agent 的 2 分钟总超时（状态变成 `TIMED_OUT` 而不是 `FAILED`）。
+
+> 若日志里出现 `FixedBackOffPolicy`、间隔约 15 秒，那不是 Spring AI 1.0.0 的默认值
+> （默认构造的是 `ExponentialBackOffPolicy`；`RetryUtils.SHORT_RETRY_TEMPLATE`
+> 是固定 100ms）。它只能来自本地覆盖（`spring.ai.retry.*`）或本地自定义 Bean。
+> 本次改造后项目显式持有 `RetryTemplate`，并在启动时打印生效策略，这类"隐形覆盖"不会再发生。
+
+### 13.2 现在的策略：只重试"可能自愈"的失败
+
+`ModelRetryConfig` 定义同名 `RetryTemplate` Bean。Spring AI 的自动配置带
+`@ConditionalOnMissingBean`，会整体让位，所以策略由项目掌握。
+
+| 失败类型 | 典型状态码 | 是否重试 | 说明 |
+| --- | --- | --- | --- |
+| `NonTransientAiException` | 400 / 401 / 403 / 欠费 | ❌ 一次都不重试 | 重试没有意义，直接失败 |
+| `TransientAiException` | 5xx、429 | ✅ 最多 3 次 | 1s → 2s 指数退避，封顶 2s |
+| `ResourceAccessException` | 网络超时 | ✅ 最多 3 次 | 可用 `retry-on-timeout=false` 关闭 |
+| 其它异常 | — | 不接管 | 保持原有传播语义 |
+
+两个容易踩的细节：
+
+1. **429 默认会被归为 4xx**（`ResponseErrorHandler` 把 4xx 映射成 `NonTransientAiException`），
+   所以在 `application.yml` 里显式配置了 `spring.ai.retry.on-http-codes: 429`，
+   让它和 5xx 走同一条可重试路径；
+2. 重试耗尽后必须抛**真实异常**而不是 `ExhaustedRetryException`，
+   否则上层无法区分"配置错"和"临时故障"，因此设置了
+   `throwLastExceptionOnExhausted(true)`。
+
+### 13.3 快速失败：不要让用户等到超时
+
+`ToolCallAgent.think()` 在 `chatModel.call()` 外面加了一层翻译：
+
+```java
+catch (RuntimeException e) {
+    ModelCallException modelCallException = toModelCallException(e);
+    if (modelCallException != null) {
+        ctx.transitionTo(AgentState.FAILED);          // 立即终态
+        sendEvent(ctx, AgentEventType.ERROR, modelCallException.getUserMessage()); // 脱敏提示
+        throw modelCallException;
+    }
+    throw e;
+}
+```
+
+- `toModelCallException` 沿 cause 链识别 `NonTransientAiException` / `TransientAiException`，
+  并兜底识别未经过 Spring AI 映射的 `HttpClientErrorException` / `HttpServerErrorException` /
+  `ResourceAccessException`（不同版本客户端可能绕过 `ResponseErrorHandler`）；
+- 文案只有两句：`模型服务调用失败，请检查配置或额度`（配置类）、
+  `模型服务暂时不可用，请稍后重试`（临时类）；
+- `BaseAgent` 识别到 `ModelCallException` 时**不再**推送通用错误事件，避免前端收到两条 `error`；
+- 数据库里落的是 `模型服务调用失败（NonTransientAiException：HTTP 400 - ...）`，
+  有类型、可聚合，仍然不带堆栈。
+
+### 13.4 SSE 超时：不要往已断开的连接里写 JSON
+
+`AsyncRequestTimeoutException` / `AsyncRequestNotUsableException` 意味着
+连接已由容器接管或已经断开。若仍走通用异常处理器，会尝试写 JSON 错误体，
+二次抛出 `HttpMessageNotWritableException`，把一次正常超时刷成 ERROR 堆栈。
+
+`GlobalExceptionHandler` 对这两类异常单独处理：**方法返回 `void`**，
+Spring MVC 视为"已处理、无需响应体"，只记一行 WARN。
+
+### 13.5 日志降噪
+
+`ModelRetryLoggingListener` 替换框架自带的监听器：
+
+- WARN 只有一行：`模型调用失败：attempt=N, error=异常类型 - 单行摘要`；
+- 完整堆栈降到 DEBUG；
+- 摘要先折叠换行、再打码（`sk-***`、`api-key=***`）、最后截断到 300 字符。
+
+### 13.6 验证
+
+```bash
+./mvnw -o test -Dtest='ModelRetryPolicyTest,ModelRetryWiringTest,ModelRetryLoggingListenerTest,ToolCallAgentModelFailureTest,GlobalExceptionHandlerAsyncTimeoutTest'
+```
+
+| 测试类 | 覆盖 |
+| --- | --- |
+| `ModelRetryPolicyTest` | 400 只调 1 次；5xx/超时重试到 3 次；退避是指数且封顶；总耗时有界 |
+| `ModelRetryWiringTest` | 项目 Bean 覆盖 Spring AI 默认（10 → 3）；429 可重试、400/401 不可重试 |
+| `ModelRetryLoggingListenerTest` | 单行摘要、截断、密钥打码 |
+| `ToolCallAgentModelFailureTest` | 400 → 1 次调用、FAILED、脱敏 error 事件、耗时远小于超时 |
+| `GlobalExceptionHandlerAsyncTimeoutTest` | 异步超时不写响应体、不触碰已 committed 响应 |

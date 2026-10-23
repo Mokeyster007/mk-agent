@@ -3,6 +3,7 @@ package com.example.mkagent.agent;
 import com.example.mkagent.config.AgentExecutorConfig;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
+import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEvent;
 import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
@@ -540,16 +541,22 @@ public abstract class BaseAgent {
                 /*
                  * 错误事件只发送脱敏提示，
                  * 异常详情只记录在服务端日志，不外发堆栈。
+                 *
+                 * 模型调用失败时，ToolCallAgent.think() 已经在失败现场
+                 * 推送过一条更精确的 ERROR 事件（配置/额度问题），
+                 * 这里跳过，避免前端收到两条 error。
                  */
-                sendEvent(
-                        emitter,
-                        AgentEvent.of(
-                                runId,
-                                AgentEventType.ERROR,
-                                "智能体执行失败，请稍后重试。",
-                                ctx.getCurrentStep()
-                        )
-                );
+                if (findModelCallException(e) == null) {
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.ERROR,
+                                    "智能体执行失败，请稍后重试。",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                }
 
                 emitter.complete();
 
@@ -838,13 +845,53 @@ public abstract class BaseAgent {
     }
 
     /**
+     * 在异常链中查找模型调用失败异常。
+     *
+     * step 层会把异常包装成 RuntimeException("Agent 第 X 步执行失败", e)，
+     * 因此必须沿 cause 链查找。
+     */
+    private ModelCallException findModelCallException(Throwable e) {
+        Throwable current = e;
+
+        for (int depth = 0; current != null && depth < 10; depth++) {
+            if (current instanceof ModelCallException modelCallException) {
+                return modelCallException;
+            }
+
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
+
+        return null;
+    }
+
+    /**
      * 构造脱敏错误信息：只保留异常类型与简短消息并截断，
      * 不包含堆栈，避免敏感信息落库。
      *
      * step 层会把真实异常包装成 RuntimeException（“Agent 第 X 步执行失败”），
      * 因此这里递归解包到根因，保证库中能看到真实失败类型。
+     *
+     * 模型调用失败额外加上统一前缀，方便按前缀统计"配置/额度类故障"。
      */
     private String buildErrorMessage(Exception e) {
+        ModelCallException modelCallException = findModelCallException(e);
+
+        if (modelCallException != null) {
+            Throwable root = modelCallException;
+            while (root.getCause() != null && root.getCause() != root) {
+                root = root.getCause();
+            }
+
+            String detail = root.getClass().getSimpleName()
+                    + (root.getMessage() == null ? "" : "：" + root.getMessage());
+            String modelError = "模型服务调用失败（" + detail + "）";
+            return modelError.length() <= 500 ? modelError : modelError.substring(0, 500);
+        }
+
         Throwable root = e;
         while (root.getCause() != null && root.getCause() != root) {
             root = root.getCause();

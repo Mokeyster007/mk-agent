@@ -1,5 +1,6 @@
 package com.example.mkagent.agent;
 
+import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
@@ -17,7 +18,12 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.model.tool.ToolExecutionResult;
+import org.springframework.ai.retry.NonTransientAiException;
+import org.springframework.ai.retry.TransientAiException;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
@@ -38,6 +44,20 @@ public class ToolCallAgent extends ReActAgent {
 
     private static final Logger log =
             LoggerFactory.getLogger(ToolCallAgent.class);
+
+    /**
+     * 模型服务"配置类"失败（400 参数错误 / 401、403 鉴权 / 欠费）的脱敏提示。
+     *
+     * 这类错误重试没有意义，直接结束任务并提示用户检查配置或额度。
+     */
+    public static final String MODEL_CONFIG_FAILED_MESSAGE =
+            "模型服务调用失败，请检查配置或额度";
+
+    /**
+     * 模型服务"临时性"失败（5xx / 429 / 网络超时）重试耗尽后的脱敏提示。
+     */
+    public static final String MODEL_UNAVAILABLE_MESSAGE =
+            "模型服务暂时不可用，请稍后重试";
 
     /**
      * 当前使用的大模型。
@@ -156,9 +176,35 @@ public class ToolCallAgent extends ReActAgent {
          *
          * 注意：
          * 直接使用 ChatModel 不会自动执行工具。
+         *
+         * 失败快速通道：
+         * 模型层的重试策略（ModelRetryConfig）已经只对 5xx/429/超时做有限重试，
+         * 走到这里的 AiException 说明"重试没有意义或已经耗尽"。
+         * 此时立刻把任务置为 FAILED，而不是让它一直挂到 Agent 总超时（TIMED_OUT），
+         * 前端能马上收到一条脱敏的 ERROR 事件。
          */
         long modelCallStart = System.currentTimeMillis();
-        ChatResponse response = chatModel.call(prompt);
+        ChatResponse response;
+        try {
+            response = chatModel.call(prompt);
+        } catch (RuntimeException e) {
+            ModelCallException modelCallException = toModelCallException(e);
+            if (modelCallException != null) {
+                /*
+                 * 立即置 FAILED 并推送一条脱敏 ERROR 事件：
+                 * 前端不必等到 Agent 总超时才知道"模型调不通"。
+                 * BaseAgent 会识别本异常并跳过重复的通用错误事件。
+                 */
+                ctx.transitionTo(AgentState.FAILED);
+                sendEvent(
+                        ctx,
+                        AgentEventType.ERROR,
+                        modelCallException.getUserMessage()
+                );
+                throw modelCallException;
+            }
+            throw e;
+        }
         long modelCallCost = System.currentTimeMillis() - modelCallStart;
 
         /*
@@ -234,6 +280,57 @@ public class ToolCallAgent extends ReActAgent {
          * + ToolResponseMessage
          */
         return true;
+    }
+
+    /**
+     * 把模型调用异常翻译成"可立即结束任务"的 {@link ModelCallException}。
+     *
+     * 判定规则（沿 cause 链查找，兼容 RestClient 的包装）：
+     * 1. NonTransientAiException（400/401/403/欠费）→ 配置类错误，一次都不重试；
+     * 2. TransientAiException（5xx/429）→ 到这里说明重试已耗尽，不再额外等待；
+     * 3. 未经过 Spring AI 异常映射的 HTTP 错误（HttpClientErrorException /
+     *    HttpServerErrorException）按状态码区分：429/5xx 视为暂时不可用，其余 4xx 视为配置错误；
+     * 4. 网络超时（ResourceAccessException）→ 暂时不可用；
+     * 5. 其它异常（编程错误、空指针等）→ 返回 null，保持原有异常传播行为。
+     *
+     * 为什么 3 也要覆盖：
+     * 不同版本的 DashScope 客户端可能绕过 Spring AI 的 ResponseErrorHandler，
+     * 直接抛 RestClient 的 HTTP 异常。若只认 AiException，
+     * "模型地址/参数配错"就会退化成通用报错，用户看不出是配置问题。
+     *
+     * @return 可立即失败的业务异常；不属于模型调用失败时返回 null
+     */
+    private ModelCallException toModelCallException(Throwable error) {
+        Throwable current = error;
+
+        // 限制深度，避免异常链自引用导致死循环。
+        for (int depth = 0; current != null && depth < 10; depth++) {
+            if (current instanceof NonTransientAiException) {
+                return new ModelCallException(MODEL_CONFIG_FAILED_MESSAGE, error);
+            }
+            if (current instanceof TransientAiException) {
+                return new ModelCallException(MODEL_UNAVAILABLE_MESSAGE, error);
+            }
+            if (current instanceof HttpClientErrorException clientError) {
+                boolean throttled = clientError.getStatusCode().value() == 429;
+                return new ModelCallException(
+                        throttled ? MODEL_UNAVAILABLE_MESSAGE : MODEL_CONFIG_FAILED_MESSAGE,
+                        error
+                );
+            }
+            if (current instanceof HttpServerErrorException
+                    || current instanceof ResourceAccessException) {
+                return new ModelCallException(MODEL_UNAVAILABLE_MESSAGE, error);
+            }
+
+            Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
+
+        return null;
     }
 
     /**

@@ -33,6 +33,17 @@ spring:
             server1:
               url: http://localhost:8127
 
+    # ===========================================================
+    # Spring AI 的 HTTP 状态码 → 异常类型映射（由 ResponseErrorHandler 使用）。
+    # 默认 4xx 全部映射为 NonTransientAiException（不重试），
+    # 但 429 是"限流"而非"参数错误"，属于可自愈失败，
+    # 这里显式把它归入 TransientAiException，与 5xx 走同一条有限重试路径。
+    # 真正的重试次数/退避由 mkagent.model-retry 决定（见下方）。
+    # ===========================================================
+    retry:
+      on-http-codes:
+        - 429
+
 server:
   port: 8123
   servlet:
@@ -58,6 +69,22 @@ mkagent:
   agent:
     # 全局最大并发 Agent 任务数（Semaphore 许可数）。
     max-concurrency: 8
+
+  # ===========================================================
+  # 模型调用重试（DashScopeChatModel 实际使用的 RetryTemplate）。
+  # 只重试"可能自愈"的失败：5xx / 429 / 网络超时；
+  # 400 参数错误、401/403 鉴权、欠费属于 NonTransientAiException，一次都不重试，
+  # 直接让任务 FAILED，避免白等几分钟后撞上 Agent 总超时。
+  # ===========================================================
+  model-retry:
+    # 含首次调用；3 = 首次 + 最多 2 次重试。
+    max-attempts: 3
+    # 首次退避 1s，之后 2s（指数，封顶 max-backoff）。
+    initial-backoff: 1s
+    multiplier: 2.0
+    max-backoff: 2s
+    # 网络超时（ResourceAccessException）是否重试。
+    retry-on-timeout: true
 
   # ===========================================================
   # RAG 知识库：让应用启动与大模型可用性解耦。
