@@ -3,6 +3,7 @@ package com.example.mkagent.rag;
 import com.example.mkagent.app.chatApp;
 import com.example.mkagent.support.RagTestDoubles;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.tool.ToolCallback;
@@ -14,8 +15,11 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -65,6 +69,20 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class RagLazyInitTest {
 
     private static final AtomicInteger EMBEDDING_CALLS = new AtomicInteger();
+
+    /**
+     * 向量库落盘目录：用临时目录，避免污染项目内的 tmp/。
+     */
+    @TempDir
+    static Path ragStoreDir;
+
+    @DynamicPropertySource
+    static void ragProperties(DynamicPropertyRegistry registry) {
+        registry.add(
+                "mkagent.rag.store-path",
+                () -> ragStoreDir.resolve("store.json").toString()
+        );
+    }
 
     @TestConfiguration(proxyBeanMethods = false)
     static class StubModelConfig {

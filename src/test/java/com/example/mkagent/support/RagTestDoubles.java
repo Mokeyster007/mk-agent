@@ -70,6 +70,21 @@ public final class RagTestDoubles {
     }
 
     /**
+     * 固定返回关键词文本并计数的对话模型，用于统计富化调用次数。
+     */
+    public static ChatModel countingChatModel(AtomicInteger calls) {
+        return new ChatModel() {
+            @Override
+            public ChatResponse call(Prompt prompt) {
+                calls.incrementAndGet();
+                return new ChatResponse(
+                        List.of(new Generation(new AssistantMessage("关键词A,关键词B")))
+                );
+            }
+        };
+    }
+
+    /**
      * 调用即失败的 Embedding 模型。
      */
     public static EmbeddingModel failingEmbeddingModel(AtomicInteger calls) {
@@ -89,9 +104,71 @@ public final class RagTestDoubles {
     }
 
     /**
+     * 前 N 次成功、之后固定失败的 Embedding 模型。
+     *
+     * 用于模拟"入库到一半 Embedding 服务挂了"：
+     * 前 N 次（含维度探针）落盘成功，之后抛异常。
+     */
+    public static EmbeddingModel failingEmbeddingModelAfter(
+            AtomicInteger calls,
+            int successCount,
+            int dimensions
+    ) {
+        return new EmbeddingModel() {
+
+            @Override
+            public EmbeddingResponse call(EmbeddingRequest request) {
+                calls.incrementAndGet();
+                if (calls.get() > successCount) {
+                    throw new IllegalStateException("模拟 Embedding 服务中途不可用");
+                }
+
+                List<String> instructions = request.getInstructions();
+                List<Embedding> embeddings = new ArrayList<>(
+                        instructions == null ? 0 : instructions.size()
+                );
+                if (instructions != null) {
+                    for (int i = 0; i < instructions.size(); i++) {
+                        embeddings.add(new Embedding(vector(dimensions), i));
+                    }
+                }
+                return new EmbeddingResponse(embeddings);
+            }
+
+            @Override
+            public float[] embed(Document document) {
+                calls.incrementAndGet();
+                if (calls.get() > successCount) {
+                    throw new IllegalStateException("模拟 Embedding 服务中途不可用");
+                }
+                return vector(dimensions);
+            }
+
+            /**
+             * 必须显式实现：EmbeddingModel#dimensions 的默认实现会真的发一次
+             * Embedding 请求，会污染"调用次数"断言。
+             */
+            @Override
+            public int dimensions() {
+                return dimensions;
+            }
+        };
+    }
+
+    /**
      * 固定向量的 Embedding 模型，记录调用次数。
      */
     public static EmbeddingModel countingEmbeddingModel(AtomicInteger calls) {
+        return countingEmbeddingModel(calls, FIXED_VECTOR.length);
+    }
+
+    /**
+     * 指定维度的固定向量 Embedding 模型，记录调用次数。
+     */
+    public static EmbeddingModel countingEmbeddingModel(
+            AtomicInteger calls,
+            int dimensions
+    ) {
         return new EmbeddingModel() {
 
             @Override
@@ -105,7 +182,7 @@ public final class RagTestDoubles {
 
                 if (instructions != null) {
                     for (int i = 0; i < instructions.size(); i++) {
-                        embeddings.add(new Embedding(FIXED_VECTOR.clone(), i));
+                        embeddings.add(new Embedding(vector(dimensions), i));
                     }
                 }
 
@@ -115,8 +192,26 @@ public final class RagTestDoubles {
             @Override
             public float[] embed(Document document) {
                 calls.incrementAndGet();
-                return FIXED_VECTOR.clone();
+                return vector(dimensions);
+            }
+
+            /**
+             * 必须显式实现：EmbeddingModel#dimensions 的默认实现会真的发一次
+             * Embedding 请求，会污染"调用次数"断言。
+             */
+            @Override
+            public int dimensions() {
+                return dimensions;
             }
         };
+    }
+
+    /**
+     * 生成固定向量：全部为 0.5，保证余弦相似度为 1，检索一定命中。
+     */
+    private static float[] vector(int dimensions) {
+        float[] vector = new float[dimensions];
+        java.util.Arrays.fill(vector, 0.5f);
+        return vector;
     }
 }

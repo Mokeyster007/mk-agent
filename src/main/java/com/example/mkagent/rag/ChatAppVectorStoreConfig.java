@@ -2,7 +2,6 @@ package com.example.mkagent.rag;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.document.Document;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.vectorstore.SimpleVectorStore;
 import org.springframework.ai.vectorstore.VectorStore;
@@ -13,8 +12,6 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
-
-import java.util.List;
 
 /**
  * 向量数据库配置（初始化基于内存的向量数据库 bean）。
@@ -51,14 +48,18 @@ public class ChatAppVectorStoreConfig {
 
     private final RagAvailability ragAvailability;
 
+    private final RagProperties ragProperties;
+
     public ChatAppVectorStoreConfig(
             ChatAppDocumentLoader chatAppDocumentLoader,
             MyKeywordEnricher myKeywordEnricher,
-            RagAvailability ragAvailability
+            RagAvailability ragAvailability,
+            RagProperties ragProperties
     ) {
         this.chatAppDocumentLoader = chatAppDocumentLoader;
         this.myKeywordEnricher = myKeywordEnricher;
         this.ragAvailability = ragAvailability;
+        this.ragProperties = ragProperties;
     }
 
     /**
@@ -67,30 +68,31 @@ public class ChatAppVectorStoreConfig {
      * @Lazy 的作用：本 Bean 不会被容器预先实例化，
      * 只有第一次被真正取用时（ObjectProvider#getObject）才构建。
      * 这也是 lazy 模式"启动不依赖大模型"的实现基础。
+     *
+     * 真正的构建逻辑（稳定 ID、增量入库、本地持久化）在
+     * {@link RagKnowledgeBaseBuilder} 中，这里只负责把失败降级为
+     * "知识库不可用"，绝不向上抛异常拖垮 Spring 上下文。
      */
     @Bean
     @Lazy
     VectorStore chatAppVectorStore(EmbeddingModel dashscopeEmbeddingModel) {
-        SimpleVectorStore simpleVectorStore =
-                SimpleVectorStore.builder(dashscopeEmbeddingModel)
-                        .build();
-
         try {
-            List<Document> documents = chatAppDocumentLoader.loadMarkdowns();
-            List<Document> enrichedDocuments =
-                    myKeywordEnricher.enrichDocuments(documents);
+            RagKnowledgeBaseBuilder builder = new RagKnowledgeBaseBuilder(
+                    chatAppDocumentLoader,
+                    myKeywordEnricher,
+                    ragProperties
+            );
 
-            if (!enrichedDocuments.isEmpty()) {
-                simpleVectorStore.add(enrichedDocuments);
-            }
-
+            SimpleVectorStore simpleVectorStore = builder.build(dashscopeEmbeddingModel);
             ragAvailability.markAvailable();
-            log.info("知识库初始化完成：片段数={}", enrichedDocuments.size());
+            return simpleVectorStore;
 
         } catch (Exception e) {
             /*
-             * 构建失败（欠费、网络、配额、文档格式等）不向上抛：
+             * 构建失败（欠费、网络、配额、磁盘、文档格式等）不向上抛：
              * 否则 lazy 模式下会变成请求 500，eager 模式下会拖垮整个应用启动。
+             *
+             * 已成功入库的片段已经由 builder 落盘，下次启动会从断点继续。
              */
             ragAvailability.markUnavailable("向量库初始化失败");
             log.error(
@@ -98,9 +100,10 @@ public class ChatAppVectorStoreConfig {
                             + "Agent 等不依赖知识库的接口不受影响",
                     e
             );
-        }
 
-        return simpleVectorStore;
+            // 返回空库，保证 Bean 本身可用（请求侧由 RagAvailability 拦成 503）。
+            return SimpleVectorStore.builder(dashscopeEmbeddingModel).build();
+        }
     }
 
     /**

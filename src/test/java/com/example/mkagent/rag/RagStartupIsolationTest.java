@@ -121,9 +121,11 @@ class RagStartupIsolationTest {
                 "MkManus 不应因为知识库不可用而无法装配"
         );
 
-        // 2. eager 模式确实在启动阶段尝试过构建（关键词提取要调模型）。
+        // 2. eager 模式确实在启动阶段尝试过构建。
+        //    构建第一步是"向量维度探针"，因此 Embedding 调用即为构建入口的可靠证据；
+        //    探针失败会直接短路，连关键词提取都不会发起（避免白烧对话模型配额）。
         assertTrue(
-                MODEL_CALLS.get() > 0,
+                EMBEDDING_CALLS.get() > 0,
                 "init-mode=eager 应在启动阶段尝试构建知识库"
         );
 

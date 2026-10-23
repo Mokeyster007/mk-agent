@@ -70,6 +70,16 @@ mkagent:
     # lazy ：第一次 RAG 调用时才构建（默认）；
     # eager：启动阶段构建，失败只标记不可用，不影响应用启动。
     init-mode: lazy
+    # 本地向量库持久化文件。SimpleVectorStore 是内存实现，
+    # 不落盘的话每次启动都要重新做关键词提取 + Embedding（真实花钱）。
+    # 同目录下会自动生成 *.index.json 侧车索引，两者必须成对存在。
+    store-path: tmp/vector-store/chat-app-vector-store.json
+    # 嵌入模型标识（写入侧车索引）。留空则使用 EmbeddingModel 实现类名；
+    # DashScope 换模型时类名不变，建议显式填写，或直接删除 store 目录。
+    embedding-model: ""
+    keyword-enrich:
+      # 关闭后入库不再调用对话模型（每片段省一次调用），只做 Embedding。
+      enabled: true
 
   rate-limit:
     # 用户级限流开关与阈值：每分钟最多发起多少次 Agent 请求。
