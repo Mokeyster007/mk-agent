@@ -1,18 +1,21 @@
 package com.example.mkagent.rag;
 
 
-import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import jakarta.annotation.Resource;
+import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.model.transformer.KeywordMetadataEnricher;
-import org.springframework.ai.vectorstore.SimpleVectorStore;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.context.annotation.Bean;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
 
+/**
+ * 文档关键词富化器。
+ *
+ * 依赖声明为 ChatModel 而不是 DashScopeChatModel：
+ * 1. 便于单测注入桩模型，不需要构造真实 DashScope 客户端；
+ * 2. 后续接入"辅助模型"（mkagent.model.auxiliary）时不需要改注入类型。
+ */
 @Component
 public class MyKeywordEnricher {
 
@@ -21,7 +24,8 @@ public class MyKeywordEnricher {
 
 
     @Resource
-    DashScopeChatModel dashscopeChatModel;
+    private ChatModel dashscopeChatModel;
+
     List<Document> enrichDocuments(List<Document> documents)  {
         KeywordMetadataEnricher enricher = new KeywordMetadataEnricher(this.dashscopeChatModel,5);
 

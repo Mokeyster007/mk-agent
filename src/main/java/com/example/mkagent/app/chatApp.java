@@ -7,10 +7,13 @@ import com.example.mkagent.advisor.MyLoggerAdvisor;
 import com.example.mkagent.advisor.ReReadingAdvisor;
 import com.example.mkagent.chatmemory.FileBasedChatMemory;
 import com.example.mkagent.demo.invoke.TestApiKey;
+import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.rag.ChatAppRagCloudAdvisorConfig;
 import com.example.mkagent.rag.ChatAppRagCustomAdvisorFactory;
 import com.example.mkagent.rag.QueryRewriter;
+import com.example.mkagent.rag.RagAvailability;
+import com.example.mkagent.rag.RagProperties;
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -24,6 +27,8 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 
@@ -51,9 +56,37 @@ public class chatApp {
     private final ChatClient chatClient;
 
     /**
+     * 知识库向量库的延迟提供者。
+     *
+     * 用 ObjectProvider 而不是直接注入 VectorStore：
+     * 1. lazy 模式下向量库 Bean 带 @Lazy，只有真正调用 RAG 时才构建；
+     * 2. 构建失败时这里能捕获到异常并转换成 503，而不是让整个应用起不来。
+     */
+    private final ObjectProvider<VectorStore> chatAppVectorStoreProvider;
+
+    /**
+     * RAG 开关与构建时机。
+     */
+    private final RagProperties ragProperties;
+
+    /**
+     * 知识库可用性标记（构建失败后 fail-closed）。
+     */
+    private final RagAvailability ragAvailability;
+
+    /**
      * Spring 创建 ChatApp Bean 时自动注入 ChatModel。
      */
-    public chatApp(ChatModel chatModel) {
+    public chatApp(
+            ChatModel chatModel,
+            @Qualifier("chatAppVectorStore")
+            ObjectProvider<VectorStore> chatAppVectorStoreProvider,
+            RagProperties ragProperties,
+            RagAvailability ragAvailability
+    ) {
+        this.chatAppVectorStoreProvider = chatAppVectorStoreProvider;
+        this.ragProperties = ragProperties;
+        this.ragAvailability = ragAvailability;
 
         //初始化对于文件的对话记忆
         String fileDir = System.getProperty("user.dir") + "/tmp/chat-memory";
@@ -133,15 +166,45 @@ public class chatApp {
 
 
 
-     @Resource
-    private VectorStore chatAppVectorStore;
-
-
-    @Resource(name = "chatAppRagCloudAdvisor")
+     @Resource(name = "chatAppRagCloudAdvisor")
     private Advisor chatAppRagCloudAdvisor;
 
     @Resource
     private QueryRewriter queryRewriter;
+
+    /**
+     * 解析当前可用的知识库向量库。
+     *
+     * 顺序很重要：必须在查询改写（会调用大模型）之前判断，
+     * 否则知识库不可用时仍会先花一次模型调用才返回 503。
+     *
+     * @return 可用的向量库
+     * @throws BusinessException 503：知识库未启用 / 初始化失败
+     */
+    private VectorStore resolveRagVectorStore() {
+        if (!ragProperties.isEnabled()) {
+            throw new BusinessException(503, "知识库未启用");
+        }
+
+        if (!ragAvailability.isAvailable()) {
+            log.warn("知识库不可用，拒绝 RAG 请求：reason={}",
+                    ragAvailability.getUnavailableReason());
+            throw new BusinessException(503, "知识库暂不可用");
+        }
+
+        try {
+            // lazy 模式下，这一行才会真正构建向量库（含模型调用）。
+            return chatAppVectorStoreProvider.getObject();
+
+        } catch (Exception e) {
+            /*
+             * 对外只返回统一文案：异常原文可能包含路径、URL 等内部信息。
+             */
+            ragAvailability.markUnavailable("向量库初始化失败");
+            log.error("知识库初始化失败，RAG 请求返回 503", e);
+            throw new BusinessException(503, "知识库暂不可用");
+        }
+    }
 
     /**
      * 和RAG知识库进行问答
@@ -151,6 +214,8 @@ public class chatApp {
      */
 
     public String doChatWithRag(String message, String chatId) {
+
+        VectorStore chatAppVectorStore = resolveRagVectorStore();
 
         String rewrittenMessage = queryRewriter.doQueryRewrite(message);
 

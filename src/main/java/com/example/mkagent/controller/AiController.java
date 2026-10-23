@@ -92,6 +92,22 @@ public class AiController {
     }
 
     /**
+     * 知识库问答（RAG）。
+     *
+     * 与其他 chat 接口保持一致的同步返回风格。
+     * 知识库未启用或初始化失败时，由 chatApp 抛出
+     * BusinessException(503)，经 GlobalExceptionHandler
+     * 转换为 503 + JSON 业务错误，不影响其他接口。
+     */
+    @GetMapping("/chat_app/rag")
+    public String doChatWithChatAppRag(
+            @RequestParam String message,
+            @RequestParam String chatId
+    ) {
+        return chatApp.doChatWithRag(message, chatId);
+    }
+
+    /**
      * 方式 1：
      * 直接返回 Flux<String>。
      *
