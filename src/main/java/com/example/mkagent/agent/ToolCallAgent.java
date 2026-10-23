@@ -96,6 +96,24 @@ public class ToolCallAgent extends ReActAgent {
     }
 
     /**
+     * 构造本轮模型调用使用的工具选项。
+     *
+     * think() 与 act() 必须使用完全一致的选项，
+     * 因此统一收敛到这一个私有方法，避免两处各写一份后出现不一致。
+     *
+     * internalToolExecutionEnabled(false) 的语义：
+     * 明确告诉模型实现层“不要在 ChatModel 内部自动执行工具”，
+     * 工具只由 act(ctx) 中的 ToolCallingManager 手动执行一次。
+     * 这样可以杜绝“框架内部执行 + 我们手动执行”造成的重复调用。
+     */
+    private ToolCallingChatOptions buildToolCallingOptions() {
+        return ToolCallingChatOptions.builder()
+                .toolCallbacks(availableTools)
+                .internalToolExecutionEnabled(false)
+                .build();
+    }
+
+    /**
      * Think：调用模型，让模型决定下一步。
      */
     @Override
@@ -105,11 +123,11 @@ public class ToolCallAgent extends ReActAgent {
          *
          * 手动调用 ChatModel 时，工具要通过
          * ToolCallingChatOptions 传入。
+         *
+         * 选项统一由 buildToolCallingOptions() 构造，
+         * 其中显式关闭了“模型内部自动执行工具”。
          */
-        ToolCallingChatOptions options =
-                ToolCallingChatOptions.builder()
-                        .toolCallbacks(availableTools)
-                        .build();
+        ToolCallingChatOptions options = buildToolCallingOptions();
 
         /*
          * Prompt 包含：
@@ -288,10 +306,11 @@ public class ToolCallAgent extends ReActAgent {
             return "本轮没有需要执行的工具。";
         }
 
-        ToolCallingChatOptions options =
-                ToolCallingChatOptions.builder()
-                        .toolCallbacks(availableTools)
-                        .build();
+        /*
+         * 与 think() 使用同一份选项构造逻辑，
+         * 保证两处永远一致（包括关闭内部工具执行开关）。
+         */
+        ToolCallingChatOptions options = buildToolCallingOptions();
 
 
 
