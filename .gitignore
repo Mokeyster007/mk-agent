@@ -2,7 +2,16 @@
 application-local.yml
 # MCP 服务配置含本地真实密钥，不上传；仓库中如需示例可另建 mcp-servers.example.json
 mcp-servers.json
-tmp
+
+# 临时产物目录（会话记忆、下载文件、个人草稿等），不进版本库
+tmp/
+# 会话记忆序列化文件（Kryo），可能包含用户对话内容
+*.kryo
+# 本地环境变量文件，通常含密钥
+.env
+.env.*
+# AI 助手在本项目内的记忆/会话数据，属于本机工作数据
+.workbuddy-ai/
 
 HELP.md
 target/
