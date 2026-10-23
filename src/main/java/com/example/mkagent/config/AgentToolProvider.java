@@ -24,6 +24,7 @@ import java.util.Map;
  * CHAT  ：web_search
  * MANUS ：web_search、web_scrape、terminate_task
  * FILE  ：read_file、write_file、download_resource、generate_pdf
+ * EVAL  ：评测专用，复用 MANUS 的只读工具集
  *
  * 高风险工具（文件读写、资源下载）不会进入
  * 与文件操作无关的 Agent，
@@ -71,6 +72,16 @@ public class AgentToolProvider {
                         fileOperationTool,
                         resourceDownloadTool,
                         pdfGenerationTool
+                ),
+                /*
+                 * 评测类型复用 MANUS 的只读工具集，
+                 * 但评测 Agent 由 AgentEvaluator 直接注入工具，
+                 * 不经过线上请求链路。
+                 */
+                AgentType.EVAL, List.of(
+                        webSearchTool,
+                        webScrapingTool,
+                        terminateTool
                 )
         );
     }

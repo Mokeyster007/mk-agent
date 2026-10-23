@@ -57,6 +57,15 @@ public class AgentRunContext {
      */
     private int toolCallCount = 0;
 
+    /**
+     * 实际执行过的工具名序列（按执行顺序）。
+     *
+     * 该列表只记录 toolName，不记录工具参数原文，
+     * 避免搜索词、文件路径等敏感信息进入评测报告或日志。
+     * 主要供离线评测（AgentEvaluator）判断工具选择是否正确。
+     */
+    private final List<String> toolTrace = new ArrayList<>();
+
     // ===== 模型 Usage 累计（跨多轮 think 累加） =====
 
     /**
@@ -213,6 +222,27 @@ public class AgentRunContext {
      */
     public void addToolCallCount(int count) {
         toolCallCount += count;
+    }
+
+    /**
+     * 记录一次实际执行的工具名（按调用顺序追加）。
+     *
+     * 只允许记录 toolName，禁止把 ToolCall.arguments 传入，
+     * 保证参数原文不会进入评测数据。
+     *
+     * @param toolName 实际执行完成的工具名
+     */
+    public void recordToolName(String toolName) {
+        if (toolName != null && !toolName.isBlank()) {
+            toolTrace.add(toolName);
+        }
+    }
+
+    /**
+     * 获取实际执行过的工具名序列（只读快照）。
+     */
+    public List<String> getToolTrace() {
+        return List.copyOf(toolTrace);
     }
 
     /**

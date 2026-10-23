@@ -123,6 +123,41 @@ public abstract class BaseAgent {
         }
 
         /*
+         * 默认入口保持原有行为：每次 run 都创建新的 ctx。
+         *
+         * ctx 属于“本次任务”，不能放到成员变量中，
+         * 否则多个用户并发请求会互相污染消息和状态。
+         */
+        return run(userPrompt, new AgentRunContext());
+    }
+
+    /**
+     * 执行一次完整 Agent 任务（同步），并使用调用方传入的上下文。
+     *
+     * 与 {@link #run(String)} 的唯一区别是 ctx 由调用方创建：
+     * 离线评测（AgentEvaluator）需要在 run 结束后读取
+     * state / step / toolCallCount / token / toolTrace 等指标，
+     * 因此不能使用 run 内部创建后即丢失的 ctx。
+     *
+     * 约束：
+     * 1. 调用方必须传入一个新的、未被复用的 ctx；
+     * 2. 该方法与 run(String) 共用同一套状态机、预算、
+     *    并发闸门、持久化与清理逻辑，不改变既有行为；
+     * 3. 同一个 ctx 不允许被并发执行。
+     *
+     * @param userPrompt 用户本次输入的任务
+     * @param ctx        本次任务专属上下文（不能为 null）
+     * @return 最终模型回答；若异常或达到预算，则返回执行摘要
+     */
+    public String run(String userPrompt, AgentRunContext ctx) {
+        if (userPrompt == null || userPrompt.isBlank()) {
+            throw new IllegalArgumentException("用户任务不能为空");
+        }
+        if (ctx == null) {
+            throw new IllegalArgumentException("AgentRunContext 不能为空");
+        }
+
+        /*
          * 全局并发控制：获取不到许可直接拒绝（429），
          * 不阻塞等待，避免请求在队列里堆积。
          * 许可在最外层 finally 释放，覆盖成功/失败/取消/超时所有场景。
@@ -130,14 +165,6 @@ public abstract class BaseAgent {
         acquireConcurrencyPermit();
 
         try {
-
-        /*
-         * 每次 run 都创建新的 ctx。
-         *
-         * ctx 属于“本次任务”，不能放到成员变量中，
-         * 否则多个用户并发请求会互相污染消息和状态。
-         */
-        AgentRunContext ctx = new AgentRunContext();
 
         /*
          * 固化用户身份与 Agent 类型：

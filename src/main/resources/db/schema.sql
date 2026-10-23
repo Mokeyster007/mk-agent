@@ -67,7 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_run_created_at
 COMMENT ON TABLE agent_run IS 'Agent 任务运行记录';
 COMMENT ON COLUMN agent_run.run_id IS '任务业务唯一键（UUID）';
 COMMENT ON COLUMN agent_run.user_id IS '任务归属用户（当前来自请求头 X-User-Id，占位方案）';
-COMMENT ON COLUMN agent_run.agent_type IS 'Agent 类型：CHAT / MANUS / FILE';
+COMMENT ON COLUMN agent_run.agent_type IS 'Agent 类型：CHAT / MANUS / FILE / EVAL（EVAL 仅用于离线评测，评测不写本表）';
 COMMENT ON COLUMN agent_run.user_prompt IS '用户输入的任务（不保存系统提示词）';
 COMMENT ON COLUMN agent_run.state IS '任务状态：RUNNING / SUCCEEDED / FAILED / CANCELLED / TIMED_OUT / MAX_STEPS_REACHED';
 COMMENT ON COLUMN agent_run.current_step IS '已执行的 Agent Loop 轮数';

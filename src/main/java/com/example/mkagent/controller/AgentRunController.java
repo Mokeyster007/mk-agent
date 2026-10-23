@@ -56,7 +56,7 @@ public class AgentRunController {
      * 支持筛选：
      * - state：任务状态（RUNNING / SUCCEEDED / FAILED / CANCELLED /
      *   TIMED_OUT / MAX_STEPS_REACHED）
-     * - agentType：Agent 类型（CHAT / MANUS / FILE）
+     * - agentType：Agent 类型（CHAT / MANUS / FILE / EVAL）
      * - startTime / endTime：创建时间范围（ISO-8601，
      *   例如 2026-08-24T00:00:00）
      *

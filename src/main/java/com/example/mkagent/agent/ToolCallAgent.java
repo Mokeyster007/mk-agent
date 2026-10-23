@@ -379,14 +379,20 @@ public class ToolCallAgent extends ReActAgent {
                 toolResponseMessage.getResponses().size()
         );
 
-        toolResponseMessage.getResponses().forEach(responseItem ->
-                log.info(
-                        "工具实际执行完成：runId={}, toolName={}, result={}",
-                        ctx.getRunId(),
-                        responseItem.name(),
-                        responseItem.responseData()
-                )
-        );
+        toolResponseMessage.getResponses().forEach(responseItem -> {
+            /*
+             * 只记录工具名，按实际执行顺序追加；
+             * 不记录 toolCall.arguments，避免参数原文进入评测数据。
+             */
+            ctx.recordToolName(responseItem.name());
+
+            log.info(
+                    "工具实际执行完成：runId={}, toolName={}, result={}",
+                    ctx.getRunId(),
+                    responseItem.name(),
+                    responseItem.responseData()
+            );
+        });
 
         /*
          * 判断模型是否调用了终止工具。

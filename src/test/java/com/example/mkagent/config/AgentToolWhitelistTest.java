@@ -90,6 +90,22 @@ class AgentToolWhitelistTest {
         assertFalse(names.contains("web_scrape"));
     }
 
+    @Test
+    void evalAgentReusesManusReadOnlyTools() {
+        Set<String> names = toolNames(provider.getTools(AgentType.EVAL));
+
+        assertEquals(
+                Set.of("web_search", "web_scrape", "terminate_task"),
+                names
+        );
+
+        // 评测类型同样不能获得文件类高风险工具。
+        assertFalse(names.contains("read_file"));
+        assertFalse(names.contains("write_file"));
+        assertFalse(names.contains("download_resource"));
+        assertFalse(names.contains("generate_pdf"));
+    }
+
     private static Set<String> toolNames(ToolCallback[] callbacks) {
         return Arrays.stream(callbacks)
                 .map(callback -> callback.getToolDefinition().name())

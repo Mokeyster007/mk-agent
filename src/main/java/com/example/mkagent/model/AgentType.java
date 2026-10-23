@@ -24,5 +24,15 @@ public enum AgentType {
      *
      * 当前只保留类型与工具映射，尚未创建完整的 FILE Agent 实例。
      */
-    FILE
+    FILE,
+
+    /**
+     * 离线评测专用类型。
+     *
+     * 仅用于 AgentEvaluator 内部创建的评测 Agent：
+     * 1. 复用 MANUS 的工具白名单与系统提示词；
+     * 2. 使用独立的评测并发闸门；
+     * 3. 不注入 AgentRunRecorder，因此不会写入 agent_run 表。
+     */
+    EVAL
 }

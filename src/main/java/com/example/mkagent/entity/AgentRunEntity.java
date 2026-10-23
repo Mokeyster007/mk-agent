@@ -36,7 +36,8 @@ public class AgentRunEntity {
     private String userId;
 
     /**
-     * Agent 类型：CHAT / MANUS / FILE。
+     * Agent 类型：CHAT / MANUS / FILE / EVAL。
+     * EVAL 仅用于离线评测；评测 Agent 不注入记录器，不会写入本表。
      */
     private String agentType;
 

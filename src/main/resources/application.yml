@@ -73,6 +73,28 @@ mkagent:
     # 工具吞异常返回失败文案时的识别关键词（工具名:关键词，包含匹配）。
     failure-markers: web_search:搜索工具执行失败,web_scrape:网页抓取失败
 
+  # ===========================================================
+  # 离线评测配置（AgentEvaluator）。
+  # 与线上 agent.max-concurrency / rate-limit 完全独立：
+  # 评测使用自己的 Semaphore，不占用线上许可。
+  # ===========================================================
+  eval:
+    # 是否允许运行评测；真实评测 runner 还需 -Dmkagent.eval.enabled=true。
+    enabled: false
+    # 评测专用并发闸门许可数。
+    max-concurrency: 2
+    # 用例文件位置（测试资源中提供）。
+    cases-path: classpath:eval/cases.json
+    # Markdown 报告输出路径。
+    report-path: target/eval-report/agent-eval-report.md
+    # LLM-as-judge 开关与温度。
+    judge-enabled: true
+    judge-temperature: 0.0
+    # 评委提示词中最终回答的最大字符数。
+    judge-max-answer-chars: 4000
+    # 单条用例最大执行时间（秒）。
+    case-timeout-seconds: 120
+
 springdoc:
   swagger-ui:
     path: /swagger-ui.html
