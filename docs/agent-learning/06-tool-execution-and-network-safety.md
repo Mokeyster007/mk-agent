@@ -156,16 +156,28 @@ Jsoup.connect(url).followRedirects(false).ignoreHttpErrors(true).execute();
 为什么不自动跟随：自动跟随等于把"目标是否安全"交给 HttpClient，
 而 HttpClient 不做 SSRF 校验。
 
-### 5.3 第三层：非 2xx 不返回正文
-
-```java
-if (statusCode < 200 || statusCode >= 300) {
-    return "网页抓取失败：HTTP 状态码 " + statusCode;
-}
-```
+### 5.3 第三层：非 2xx 不返回正文，且区分“可重试 / 不可重试”
 
 `ignoreHttpErrors(true)` 只是让 jsoup 不抛异常，
 **必须自己判状态码**，否则 404 页面、网关错误页、登录页都会被当成正文喂给模型。
+
+同时要区分两类失败，因为 `ToolRetryWrapper` 是按**返回值前缀**判断要不要重试的：
+
+| 场景 | 返回值前缀 | 命中 failure-markers | 是否重试 |
+| --- | --- | --- | --- |
+| 网络超时 / 连接失败 | `网页抓取失败：` | 是 | ✅ 重试 |
+| 5xx（服务端临时故障） | `网页抓取失败：` | 是 | ✅ 重试 |
+| SSRF 校验被拒 | `网页抓取被拒绝：` | 否 | ❌ 只调一次 |
+| 4xx（404 / 403 / 401） | `网页抓取被拒绝：` | 否 | ❌ 只调一次 |
+| 重定向目标被拒 / 地址非法 | `网页抓取被拒绝：` | 否 | ❌ 只调一次 |
+| 正常重定向（需要模型换地址） | `页面发生重定向…` | 否 | ❌ 不是失败 |
+
+`application.yml` 中 `failure-markers` 配置为 `web_scrape:网页抓取失败`，
+所以"被拒绝"这类**重试也没用**的失败不会被白白重试 3 次。
+
+配套的 SSE 文案也要跟着区分：
+`DefaultToolEventMessageProvider` 对 `web_scrape` 会检查返回值，
+失败 / 被拒绝 / 重定向时**不会**再显示"网页抓取完成"。
 
 ---
 
@@ -176,6 +188,8 @@ if (statusCode < 200 || statusCode >= 300) {
 | `ToolCallAgentToolExecutionSwitchTest` | options 开关、think 不执行工具、act 只执行一次 | 否 |
 | `UrlSafetyValidatorTest` | 11 组内网 / 保留地址、非 HTTP 协议、无 host、公网放行 | 否（注入解析器） |
 | `WebScrapingToolHttpHandlingUnitTest` | 4xx/5xx 不返回正文、3xx 不跟随、内网重定向被拒 | 仅本机回环 |
+| `WebScrapingToolRetrySemanticsTest` | 4xx / SSRF 拒绝只调一次；5xx 按 maxAttempts 重试 | 仅本机回环 |
+| `DefaultToolEventMessageProviderTest` | 失败 / 拒绝 / 重定向不显示“网页抓取完成”，文案不回显 URL | 否 |
 
 `WebScrapingToolHttpHandlingUnitTest` 用 JDK 自带 `HttpServer` 在 `127.0.0.1` 起桩服务，
 不访问任何外部网络。
@@ -186,9 +200,9 @@ if (statusCode < 200 || statusCode >= 300) {
 
 1. **DNS rebinding 未彻底解决**（详见 `docs/SECURITY.md` 6.2）：
    校验与连接是两次独立解析，理论上可被短 TTL 域名绕过；
-2. **抓取工具的失败文案会触发重试**：
-   返回 `网页抓取失败：HTTP 状态码 404` 会命中 `ToolRetryWrapper` 的失败标记，
-   导致 404 也被重试（默认 3 次）。对只读抓取无害，但会浪费少量请求；
-3. **重定向只解析一层**：
+2. **重定向只解析一层**：
    模型拿到最终 URL 后再抓，如果该地址又返回 3xx，会再次走同样的流程，
-   不会无限跟随（每次都由模型决定），但会多消耗一轮对话。
+   不会无限跟随（每次都由模型决定），但会多消耗一轮对话；
+3. **被拒绝的抓取仍然消耗一次模型轮次**：
+   工具只调一次就返回拒绝结果，但模型仍要基于这个结果再想下一步。
+   这是"拒绝也要让模型知道"的必然代价，不做额外优化。
