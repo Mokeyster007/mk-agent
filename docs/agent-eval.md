@@ -148,6 +148,9 @@ mkagent:
     judge-temperature: 0.0
     judge-max-answer-chars: 4000
     case-timeout-seconds: 120
+    # 评测预算策略：默认关闭，M4 对比实验可临时开启
+    budget-warning-steps: 0
+    force-final-answer: false
     # 整轮预算：任一项超限即停止启动新用例，0 = 不限
     max-total-tokens: 2000000
     max-duration-seconds: 1800
@@ -174,6 +177,26 @@ mkagent:
 
 预算行为由 `EvalBudgetUnitTest` 用桩模型覆盖（含 judge Token 计入预算、时长预算用注入时钟验证），
 不需要真实调用。
+
+### 5.5 评测专用预算策略
+
+评测环境与生产使用两套默认值，均由 `AgentEvaluator` 在创建 `EvalAgent` 后
+通过既有 setter 注入（`EvalAgent` 手动 `super(...)`，不会走 `@Value`）：
+
+| 配置项 | 默认 | 生产对应项 | 说明 |
+| --- | --- | --- | --- |
+| `budget-warning-steps` | 0（关闭） | `mkagent.agent.budget-warning-steps`（2） | 评测度量固定预算下的原始策略；设为 1~3 可做对比实验，负值按 0 处理并告警 |
+| `force-final-answer` | false | `mkagent.agent.force-final-answer`（true） | 预算耗尽后是否再问模型一次 |
+
+`force-final-answer` 默认关闭的原因：
+
+1. `DeterministicChecker` 要求终态为 `SUCCEEDED`，`MAX_STEPS_REACHED` 一律判失败，
+   强制收尾不会改变通过率；
+2. 该调用会真实消耗 Token，并计入整轮预算，可能让后续用例更早被"预算跳过"；
+3. 关闭后与 E2 之前的评测口径一致，历史 Token / 失败明细可比。
+
+若 M4 需要评估"尽力回答"的质量，应新增独立指标（回答非空率、引用忠实度等），
+不能依赖通过率。
 
 ## 6. 报告字段
 

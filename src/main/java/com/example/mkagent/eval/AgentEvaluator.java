@@ -231,6 +231,7 @@ public class AgentEvaluator {
                 evalConcurrencyGuard
         );
         agent.setTimeout(Duration.ofSeconds(properties.getCaseTimeoutSeconds()));
+        applyEvalBudgetPolicy(agent);
 
         EvalBudget budget = EvalBudget.from(properties);
 
@@ -278,6 +279,30 @@ public class AgentEvaluator {
         }
 
         return new EvalRun(results, budget.summary(cases.size()));
+    }
+
+    /**
+     * 把评测专用的预算策略显式落到 EvalAgent 上。
+     *
+     * 为什么不用 @Value：EvalAgent 是手动 super(...) 构造的非 Spring Bean，
+     * 方法注入不会执行；必须在创建后通过既有 setter 设置。
+     *
+     * 默认值与生产相反（提示 0、强制收尾 false）：
+     * 评测要度量固定预算下的原始策略，且 MAX_STEPS_REACHED 的判定
+     * 不因强制回答而改变，额外调用只会增加成本、影响整轮预算与历史可比性。
+     */
+    private void applyEvalBudgetPolicy(EvalAgent agent) {
+        int warningSteps = properties.getBudgetWarningSteps();
+        if (warningSteps < 0) {
+            log.warn(
+                    "mkagent.eval.budget-warning-steps={} 非法（不能为负），按 0 处理",
+                    warningSteps
+            );
+            warningSteps = 0;
+        }
+
+        agent.setBudgetWarningSteps(warningSteps);
+        agent.setForceFinalAnswer(properties.isForceFinalAnswer());
     }
 
     /**

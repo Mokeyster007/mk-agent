@@ -59,6 +59,27 @@ public class EvalProperties {
     private int caseTimeoutSeconds = 120;
 
     /**
+     * 评测环境是否追加"剩余步数不足"收尾提示（0 = 关闭）。
+     *
+     * 默认 0：评测度量的是固定预算下的原始策略，
+     * 额外提示会改变被测行为，破坏与历史数据的可比性。
+     * M4 做对比实验时可临时设为 1~3。
+     * 负值由 AgentEvaluator 按 0 处理并 WARN。
+     */
+    private int budgetWarningSteps = 0;
+
+    /**
+     * 评测环境是否在预算耗尽且无答案时再问模型一次
+     * （生产配置 mkagent.agent.force-final-answer 的评测开关）。
+     *
+     * 默认 false：
+     * 1. 该调用不改变 MAX_STEPS_REACHED 的失败判定，只会多花 Token；
+     * 2. 多出的 Token 计入整轮预算，可能让后续用例更早被跳过；
+     * 3. 与 E2 之前的评测口径一致，保证历史数据可比。
+     */
+    private boolean forceFinalAnswer = false;
+
+    /**
      * 整轮评测的 Token 预算上限（Agent 模型 + LLM judge），0 表示不限。
      */
     private long maxTotalTokens = 2_000_000L;
@@ -135,6 +156,22 @@ public class EvalProperties {
 
     public void setCaseTimeoutSeconds(int caseTimeoutSeconds) {
         this.caseTimeoutSeconds = caseTimeoutSeconds;
+    }
+
+    public int getBudgetWarningSteps() {
+        return budgetWarningSteps;
+    }
+
+    public void setBudgetWarningSteps(int budgetWarningSteps) {
+        this.budgetWarningSteps = budgetWarningSteps;
+    }
+
+    public boolean isForceFinalAnswer() {
+        return forceFinalAnswer;
+    }
+
+    public void setForceFinalAnswer(boolean forceFinalAnswer) {
+        this.forceFinalAnswer = forceFinalAnswer;
     }
 
     public long getMaxTotalTokens() {
