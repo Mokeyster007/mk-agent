@@ -54,12 +54,22 @@ public class DefaultToolEventMessageProvider
 
     @Override
     public String resultMessage(String toolName, String rawResult) {
+        /*
+         * 必须先解码：
+         * @Tool 返回值经 MethodToolCallback 序列化后是 JSON 字符串字面量
+         * （首尾带引号、换行转义成 \n）。不解码的话：
+         *   - startsWith("没有找到") 永远 false；
+         *   - split("\n---\n") 永远只得到 1 段 → “搜索结果永远是 1 条”。
+         * ToolResultTexts 对未编码的原始文本同样安全（原样返回）。
+         */
+        String result = ToolResultTexts.decode(rawResult);
+
         if ("web_search".equals(toolName)) {
-            return webSearchResultMessage(rawResult);
+            return webSearchResultMessage(result);
         }
 
         if ("web_scrape".equals(toolName)) {
-            return webScrapeResultMessage(rawResult);
+            return webScrapeResultMessage(result);
         }
 
         return RESULT_MESSAGES.getOrDefault(toolName, "工具调用完成");
@@ -79,6 +89,28 @@ public class DefaultToolEventMessageProvider
     private String webScrapeResultMessage(String rawResult) {
         if (rawResult == null || rawResult.isBlank()) {
             return "网页抓取完成";
+        }
+
+        /*
+         * 站点级熔断（"该站点连续失败……本次未再执行"）。
+         *
+         * 必须最先判断：这条文案既不含"网页抓取失败"也不含
+         * "多次尝试仍失败"，漏判就会退到最后的"网页抓取完成"，
+         * 前端会误以为抓到了正文。
+         */
+        if (rawResult.contains(ToolResultMarkers.TARGET_BLOCKED)) {
+            return "该站点连续失败，已跳过本次抓取";
+        }
+
+        /*
+         * 重试耗尽文案（"工具 web_scrape 多次尝试仍失败：..."）。
+         *
+         * 必须放在最前面判断：它既不含"网页抓取失败"也不含
+         * "网页抓取被拒绝"，漏判就会退到最后的"网页抓取完成"，
+         * 前端会误以为抓到了正文。
+         */
+        if (rawResult.contains(ToolResultMarkers.EXHAUSTED)) {
+            return "网页抓取多次重试后仍失败";
         }
 
         if (rawResult.contains("网页抓取被拒绝")) {
@@ -102,6 +134,14 @@ public class DefaultToolEventMessageProvider
     private String webSearchResultMessage(String rawResult) {
         if (rawResult == null || rawResult.isBlank()) {
             return "网页搜索完成";
+        }
+
+        if (rawResult.contains(ToolResultMarkers.TARGET_BLOCKED)) {
+            return "该站点连续失败，已跳过本次搜索";
+        }
+
+        if (rawResult.contains(ToolResultMarkers.EXHAUSTED)) {
+            return "网页搜索多次重试后仍失败";
         }
 
         if (rawResult.startsWith("没有找到")) {

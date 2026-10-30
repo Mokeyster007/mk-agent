@@ -5,6 +5,8 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
@@ -42,21 +44,210 @@ public class WebScrapingTool {
      */
     private static final String REJECTED_PREFIX = "网页抓取被拒绝：";
 
+    /**
+     * 默认单页抓取超时（毫秒）。
+     *
+     * 10 秒对中文站点通常够用，但对 GitHub、MDN 这类
+     * 首字节返回慢的境外站点会稳定超时——真实运行里
+     * 就是因为这个固定值把 web_scrape 拖进了重试耗尽。
+     * 因此改成可配置，默认值保持 10 秒不变。
+     */
+    private static final long DEFAULT_TIMEOUT_MILLIS = 10_000L;
+
+    /**
+     * 默认单页输出上限（字符）。
+     *
+     * 与改动前硬编码的 12000 保持一致，行为不变；
+     * 现在改成可配置，且**链接区块优先于正文尾部**保留
+     * （见 {@link #renderPage}）。
+     */
+    private static final int DEFAULT_MAX_CHARS = 12_000;
+
+    /**
+     * 正文被截断时的标记。
+     */
+    private static final String TRUNCATED_MARKER = "\n\n[内容过长，已截断]";
+
     private final UrlSafetyValidator urlSafetyValidator;
+
+    /**
+     * 单页抓取超时（毫秒），来自 mkagent.tools.web-scrape.timeout-ms。
+     */
+    private final long timeoutMillis;
+
+    /**
+     * 单页输出上限（字符），来自 mkagent.tools.web-scrape.max-chars。
+     */
+    private final int maxChars;
 
     /**
      * 默认构造器：使用真实 DNS 解析。
      * 保留无参构造，兼容既有的直接 new 用法与测试。
      */
     public WebScrapingTool() {
-        this(new UrlSafetyValidator());
+        this(new UrlSafetyValidator(), DEFAULT_TIMEOUT_MILLIS, DEFAULT_MAX_CHARS);
+    }
+
+    /**
+     * Spring 注入入口：超时与输出上限都可配置。
+     *
+     * UrlSafetyValidator 不是容器 Bean（它需要真实 DNS，
+     * 测试里要替换成桩），所以这里直接 new，保持原有行为。
+     */
+    @Autowired
+    public WebScrapingTool(
+            @Value("${mkagent.tools.web-scrape.timeout-ms:10000}")
+            long timeoutMillis,
+            @Value("${mkagent.tools.web-scrape.max-chars:12000}")
+            int maxChars
+    ) {
+        this(new UrlSafetyValidator(), timeoutMillis, maxChars);
     }
 
     /**
      * 可注入校验器的构造器，便于单元测试替换 DNS 解析结果。
      */
     public WebScrapingTool(UrlSafetyValidator urlSafetyValidator) {
+        this(urlSafetyValidator, DEFAULT_TIMEOUT_MILLIS, DEFAULT_MAX_CHARS);
+    }
+
+    /**
+     * 完整构造器：校验器与超时（测试用）。
+     */
+    public WebScrapingTool(
+            UrlSafetyValidator urlSafetyValidator,
+            long timeoutMillis
+    ) {
+        this(urlSafetyValidator, timeoutMillis, DEFAULT_MAX_CHARS);
+    }
+
+    /**
+     * 完整构造器：校验器、超时与输出上限都可替换（测试用）。
+     */
+    public WebScrapingTool(
+            UrlSafetyValidator urlSafetyValidator,
+            long timeoutMillis,
+            int maxChars
+    ) {
         this.urlSafetyValidator = urlSafetyValidator;
+        // 非正数视为没配，回退默认值，避免 0 超时导致必然失败。
+        this.timeoutMillis = timeoutMillis > 0
+                ? timeoutMillis
+                : DEFAULT_TIMEOUT_MILLIS;
+        // 太小会把正文挤没、链接区块也放不下，低于 500 直接回退默认值。
+        this.maxChars = maxChars >= 500 ? maxChars : DEFAULT_MAX_CHARS;
+    }
+
+    /**
+     * 当前生效的单页抓取超时（毫秒）。
+     *
+     * 暴露出来是为了让测试能断言"配置真的落到了工具上"：
+     * Jsoup 的 Connection 不提供 timeout 的 getter，
+     * 想断言只能靠真实发一次慢请求——那是 live 测试，
+     * 不适合放在默认测试集里。
+     */
+    public long getTimeoutMillis() {
+        return timeoutMillis;
+    }
+
+    /**
+     * 当前生效的单页输出上限（字符）。
+     */
+    public int getMaxChars() {
+        return maxChars;
+    }
+
+    /**
+     * 把已解析的页面渲染成给模型的文本。
+     *
+     * 结构：
+     * <pre>
+     * 页面标题：…
+     *
+     * 页面正文：
+     * …
+     *
+     * 页面链接（均来自本页实际链接，可直接引用）：
+     * 1. 文字：https://…
+     * </pre>
+     *
+     * ================== 预算分配：链接优先 ==================
+     *
+     * 总输出受 {@link #maxChars} 约束。空间不够时，
+     * **先保住链接区块，再截断正文尾部**——
+     * 正文尾部通常是页脚/相关推荐，信息密度最低；
+     * 而链接是"回答里能不能给出可信来源"的关键，
+     * 一旦被截掉，模型就只能自己编 URL（真实发生过的幻觉）。
+     *
+     * 单独抽成包级方法是为了能离线测试：
+     * 直接喂一个 Jsoup.parse 出来的 Document，不触网。
+     */
+    String renderPage(Document document) {
+        String title = document.title() == null ? "" : document.title();
+        String bodyText = document.body() == null
+                ? ""
+                : document.body().text();
+
+        String header = "页面标题：" + title + "\n\n页面正文：\n";
+
+        String linksBlock = PageLinkExtractor.render(
+                PageLinkExtractor.extract(document)
+        );
+        String linksSection = linksBlock.isEmpty() ? "" : "\n" + linksBlock;
+
+        /*
+         * 极端情况：链接区块本身就超预算（maxChars 配得很小）。
+         * 先裁链接，再算正文预算，保证总长度不超上限。
+         */
+        int linksBudget = maxChars - header.length();
+        if (linksSection.length() > linksBudget) {
+            linksSection = trimLinksSection(linksSection, Math.max(0, linksBudget));
+        }
+
+        int bodyBudget = maxChars - header.length() - linksSection.length();
+        String body = truncateBody(bodyText, bodyBudget);
+
+        return header + body + linksSection;
+    }
+
+    /**
+     * 正文按预算截断，截断处加标记。
+     */
+    private String truncateBody(String bodyText, int budget) {
+        if (budget <= 0) {
+            return "";
+        }
+        if (bodyText.length() <= budget) {
+            return bodyText;
+        }
+        // 预算连标记都放不下时，宁可不加标记也不要超上限。
+        if (budget <= TRUNCATED_MARKER.length()) {
+            return bodyText.substring(0, budget);
+        }
+        int keep = budget - TRUNCATED_MARKER.length();
+        return bodyText.substring(0, keep) + TRUNCATED_MARKER;
+    }
+
+    /**
+     * 链接区块超预算时按行裁剪：保留区块标题与前若干条链接。
+     */
+    private String trimLinksSection(String linksSection, int budget) {
+        if (budget <= 0) {
+            return "";
+        }
+        if (linksSection.length() <= budget) {
+            return linksSection;
+        }
+
+        StringBuilder builder = new StringBuilder();
+        for (String line : linksSection.split("\n")) {
+            // +1 是换行符本身
+            if (builder.length() + line.length() + 1 > budget) {
+                break;
+            }
+            builder.append(line).append('\n');
+        }
+        return builder.toString();
     }
 
     @Tool(
@@ -92,7 +283,7 @@ public class WebScrapingTool {
              * 由下方状态码分支统一处理（错误页正文一律不返回）。
              */
             Connection.Response response = Jsoup.connect(uri.toString())
-                    .timeout(10_000)
+                    .timeout((int) timeoutMillis)
                     .maxBodySize(1_000_000)
                     .followRedirects(false)
                     .ignoreHttpErrors(true)
@@ -126,22 +317,7 @@ public class WebScrapingTool {
 
             Document document = response.parse();
 
-            String title = document.title();
-            String bodyText = document.body() == null
-                    ? ""
-                    : document.body().text();
-
-            if (bodyText.length() > 12_000) {
-                bodyText = bodyText.substring(0, 12_000)
-                        + "\n\n[内容过长，已截断]";
-            }
-
-            return """
-                    页面标题：%s
-
-                    页面正文：
-                    %s
-                    """.formatted(title, bodyText);
+            return renderPage(document);
 
         } catch (IllegalArgumentException e) {
             /*

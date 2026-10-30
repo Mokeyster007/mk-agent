@@ -103,8 +103,48 @@ class RetryableToolCallbackUnitTest {
                 "失败文案应触发重试：第 1 次失败 + 第 2 次成功");
     }
 
+    /**
+     * 默认行为（on-exhausted=return）：耗尽后**不抛异常**，
+     * 而是把一条脱敏的失败文案作为工具结果交还给模型。
+     *
+     * 这正是真实运行里 web_scrape 因 GitHub 超时重试耗尽的场景：
+     * 旧实现会抛异常，把整个任务判成 FAILED；
+     * 新实现让模型看到"这条路走不通"，自己换地址或收尾。
+     */
     @Test
-    void exhaustedRetriesThrowFinalFailure() {
+    void exhaustedRetriesReturnFailureMessageInsteadOfThrowing() {
+        AtomicInteger delegateCalls = new AtomicInteger(0);
+
+        ToolCallback alwaysFail = simpleCallback("web_scrape", input -> {
+            delegateCalls.incrementAndGet();
+            throw new RuntimeException("Read timed out");
+        });
+
+        ToolCallback retryable = wrapper.wrapIfNeeded(alwaysFail);
+
+        // 关键断言：不抛异常，正常返回。
+        String result = retryable.call("{}");
+
+        assertTrue(result.contains("web_scrape"),
+                "失败文案必须点明是哪个工具失败，实际：" + result);
+        assertTrue(result.contains("多次尝试仍失败"),
+                "失败文案必须说明重试已耗尽，实际：" + result);
+        assertTrue(result.contains("Read timed out"),
+                "失败文案必须带简短原因，实际：" + result);
+        assertTrue(result.contains("terminate_task"),
+                "失败文案必须给出下一步选项（换方式 / 收尾），实际：" + result);
+
+        assertEquals(3, delegateCalls.get(),
+                "maxAttempts=3 后必须停止，绝不无限重试");
+        assertEquals(3, ((RetryableToolCallback) retryable).getRetryCount());
+    }
+
+    /**
+     * on-exhausted=throw：保留旧行为（向上抛异常，任务 FAILED），
+     * 用于需要回滚时通过配置切回。
+     */
+    @Test
+    void exhaustedRetriesThrowFinalFailureInThrowMode() {
         AtomicInteger delegateCalls = new AtomicInteger(0);
 
         ToolCallback alwaysFail = simpleCallback("web_search", input -> {
@@ -112,7 +152,7 @@ class RetryableToolCallbackUnitTest {
             throw new RuntimeException("持续故障");
         });
 
-        ToolCallback retryable = wrapper.wrapIfNeeded(alwaysFail);
+        ToolCallback retryable = throwModeWrapper().wrapIfNeeded(alwaysFail);
 
         RuntimeException thrown = assertThrows(
                 RuntimeException.class,
@@ -120,9 +160,62 @@ class RetryableToolCallbackUnitTest {
         );
 
         assertEquals("持续故障", thrown.getMessage(),
-                "重试耗尽后应抛出最终失败原因");
+                "throw 模式下重试耗尽应抛出最终失败原因");
         assertEquals(3, delegateCalls.get(),
                 "maxAttempts=3 后必须停止，绝不无限重试");
+    }
+
+    /**
+     * 耗尽文案本身必须是单行、限长的：
+     * 它要进模型上下文，堆栈刷进去既贵又没用。
+     */
+    @Test
+    void exhaustedMessageIsSingleLineAndBounded() {
+        ToolCallback alwaysFail = simpleCallback("web_scrape", input -> {
+            // 模拟一个带换行的多行异常信息
+            throw new RuntimeException(
+                    "第一行\n第二行\n" + "x".repeat(500)
+            );
+        });
+
+        String result = wrapper.wrapIfNeeded(alwaysFail).call("{}");
+
+        assertFalse(result.contains("\n"),
+                "耗尽文案必须折叠为单行，实际：" + result);
+        assertTrue(result.length() < 400,
+                "耗尽文案必须限长，实际长度：" + result.length());
+    }
+
+    /**
+     * 失败文案经 JSON 字符串序列化（带引号、转义 \n）后，
+     * 仍然必须被识别为失败并触发重试。
+     */
+    @Test
+    void exhaustedDetectionWorksOnJsonEncodedFailureText() {
+        FlakySearchTool flakyTool = new FlakySearchTool(99);
+        ToolCallback callback = ToolCallbacks.from(flakyTool)[0];
+
+        String result = wrapper.wrapIfNeeded(callback).call("{\"query\":\"x\"}");
+
+        assertTrue(result.contains("多次尝试仍失败"),
+                "失败文案（内部被序列化为带引号字符串）也应被识别为失败并最终耗尽，实际：" + result);
+        assertEquals(3, flakyTool.getCallCount(),
+                "三次尝试后停止");
+    }
+
+    /**
+     * 构造 on-exhausted=throw 的包装器。
+     */
+    private ToolRetryWrapper throwModeWrapper() {
+        return new ToolRetryWrapper(
+                true,
+                3,
+                1,
+                2.0,
+                "web_search,web_scrape",
+                "web_search:搜索工具执行失败,web_scrape:网页抓取失败",
+                "throw"
+        );
     }
 
     @Test

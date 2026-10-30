@@ -3,6 +3,7 @@ package com.example.mkagent.resilience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -24,7 +25,8 @@ import java.util.Set;
  *
  * 配置项（见 application.yml）：
  * mkagent.tool-retry.enabled / max-attempts / initial-backoff-millis /
- * multiplier / retryable-tools / failure-markers。
+ * multiplier / retryable-tools / failure-markers / on-exhausted /
+ * max-exhausted-per-target。
  */
 @Component
 public class ToolRetryWrapper {
@@ -50,6 +52,52 @@ public class ToolRetryWrapper {
      */
     private final Map<String, List<String>> failureMarkersByTool;
 
+    /**
+     * 重试耗尽后的行为：return（默认，返回失败文案） / throw（抛异常）。
+     */
+    private final RetryableToolCallback.ExhaustedStrategy onExhausted;
+
+    /**
+     * 同一工具 + 同一目标主机允许连续重试耗尽的次数。
+     *
+     * 达到后该目标的后续调用不再真正执行（站点级熔断）。
+     */
+    private final int maxExhaustedPerTarget;
+
+    /**
+     * 测试入口：默认 on-exhausted=return、站点级熔断阈值 2。
+     */
+    public ToolRetryWrapper(
+            boolean enabled,
+            int maxAttempts,
+            long initialBackoffMillis,
+            double multiplier,
+            String retryableToolsCsv,
+            String failureMarkersCsv
+    ) {
+        this(enabled, maxAttempts, initialBackoffMillis, multiplier,
+                retryableToolsCsv, failureMarkersCsv, "return",
+                RetryableToolCallback.DEFAULT_MAX_EXHAUSTED_PER_TARGET);
+    }
+
+    /**
+     * 测试入口：可指定 on-exhausted，熔断阈值用默认值。
+     */
+    public ToolRetryWrapper(
+            boolean enabled,
+            int maxAttempts,
+            long initialBackoffMillis,
+            double multiplier,
+            String retryableToolsCsv,
+            String failureMarkersCsv,
+            String onExhaustedValue
+    ) {
+        this(enabled, maxAttempts, initialBackoffMillis, multiplier,
+                retryableToolsCsv, failureMarkersCsv, onExhaustedValue,
+                RetryableToolCallback.DEFAULT_MAX_EXHAUSTED_PER_TARGET);
+    }
+
+    @Autowired
     public ToolRetryWrapper(
             @Value("${mkagent.tool-retry.enabled:true}") boolean enabled,
             @Value("${mkagent.tool-retry.max-attempts:3}") int maxAttempts,
@@ -61,7 +109,11 @@ public class ToolRetryWrapper {
             @Value("${mkagent.tool-retry.failure-markers:"
                     + "web_search:搜索工具执行失败,"
                     + "web_scrape:网页抓取失败}")
-            String failureMarkersCsv
+            String failureMarkersCsv,
+            @Value("${mkagent.tool-retry.on-exhausted:return}")
+            String onExhaustedValue,
+            @Value("${mkagent.tool-retry.max-exhausted-per-target:2}")
+            int maxExhaustedPerTarget
     ) {
         this.enabled = enabled;
         this.maxAttempts = maxAttempts;
@@ -69,10 +121,15 @@ public class ToolRetryWrapper {
         this.multiplier = multiplier;
         this.retryableTools = parseCsvToSet(retryableToolsCsv);
         this.failureMarkersByTool = parseFailureMarkers(failureMarkersCsv);
+        this.onExhausted = RetryableToolCallback.ExhaustedStrategy
+                .parse(onExhaustedValue);
+        this.maxExhaustedPerTarget = maxExhaustedPerTarget;
 
         log.info(
-                "工具重试包装器初始化：enabled={}, maxAttempts={}, backoff={}ms, multiplier={}, retryableTools={}",
-                enabled, maxAttempts, initialBackoffMillis, multiplier, retryableTools
+                "工具重试包装器初始化：enabled={}, maxAttempts={}, backoff={}ms, multiplier={}, "
+                        + "onExhausted={}, maxExhaustedPerTarget={}, retryableTools={}",
+                enabled, maxAttempts, initialBackoffMillis, multiplier,
+                onExhausted, maxExhaustedPerTarget, retryableTools
         );
     }
 
@@ -111,7 +168,9 @@ public class ToolRetryWrapper {
                 maxAttempts,
                 initialBackoff,
                 multiplier,
-                failureMarkersByTool.getOrDefault(name, List.of())
+                failureMarkersByTool.getOrDefault(name, List.of()),
+                onExhausted,
+                maxExhaustedPerTarget
         );
     }
 
@@ -157,5 +216,9 @@ public class ToolRetryWrapper {
 
     public Set<String> getRetryableTools() {
         return retryableTools;
+    }
+
+    public int getMaxExhaustedPerTarget() {
+        return maxExhaustedPerTarget;
     }
 }

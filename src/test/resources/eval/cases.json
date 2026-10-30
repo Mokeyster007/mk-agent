@@ -318,5 +318,15 @@
     "maxSteps": 2,
     "maxToolCalls": 1,
     "expectedKeywords": []
+  },
+  {
+    "id": "CITATION-01",
+    "category": "CITATION",
+    "userPrompt": "查找 Spring AI 1.0.0 关于 Tool Calling 的官方文档页面，给出官方文档链接，并总结其中两点。回答中的链接必须来自工具实际返回的结果。",
+    "expectedTools": ["web_search"],
+    "forbiddenTools": [],
+    "maxSteps": 4,
+    "maxToolCalls": 3,
+    "expectedKeywords": ["Tool"]
   }
 ]

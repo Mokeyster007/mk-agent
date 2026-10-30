@@ -6,6 +6,7 @@ import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -23,12 +24,53 @@ public class WebSearchTool {
     private static final String SEARCH_API_URL =
             "https://www.searchapi.io/api/v1/search";
 
+    /**
+     * 默认搜索引擎：baidu。
+     *
+     * 保持默认值不变是为了让既有行为、成本与配额口径完全不动；
+     * 需要查英文官方文档时把 search-api.engine 改成 google
+     * （原因见 docs/COST.md 的「搜索引擎」一节）。
+     */
+    private static final String DEFAULT_ENGINE = "baidu";
+
     private final String apiKey;
 
+    /**
+     * 搜索引擎（baidu / google），来自 search-api.engine。
+     */
+    private final String engine;
+
+    /**
+     * 测试与手工构造入口：只给 api-key，engine 用默认值。
+     *
+     * 刻意不加 @Value 注解：这个构造器只服务于测试，
+     * 若它也带 @Value，Spring 会看到两个候选构造器而无法选择
+     * （启动报 "No default constructor found"）。
+     */
+    public WebSearchTool(String apiKey) {
+        this(apiKey, DEFAULT_ENGINE);
+    }
+
+    /**
+     * Spring 注入入口：api-key 与 engine 都来自配置。
+     */
+    @Autowired
     public WebSearchTool(
-            @Value("${search-api.api-key}") String apiKey
+            @Value("${search-api.api-key}") String apiKey,
+            @Value("${search-api.engine:baidu}") String engine
     ) {
         this.apiKey = apiKey;
+        // 配了空串也回退默认值：空 engine 会被上游当成非法参数。
+        this.engine = (engine == null || engine.isBlank())
+                ? DEFAULT_ENGINE
+                : engine.trim();
+    }
+
+    /**
+     * 当前使用的搜索引擎（诊断与测试断言用）。
+     */
+    public String getEngine() {
+        return engine;
     }
 
     /**
@@ -58,10 +100,7 @@ public class WebSearchTool {
             )
             String query
     ) {
-        Map<String, Object> paramMap = new HashMap<>();
-        paramMap.put("q", query);
-        paramMap.put("api_key", apiKey);
-        paramMap.put("engine", "baidu");
+        Map<String, Object> paramMap = buildRequestParams(query);
 
         try {
             String response = HttpUtil.get(
@@ -102,5 +141,20 @@ public class WebSearchTool {
         } catch (Exception e) {
             return "搜索工具执行失败：" + e.getMessage();
         }
+    }
+
+    /**
+     * 构造搜索请求参数。
+     *
+     * 单独抽出来是为了能**离线**断言 engine 取自配置：
+     * 直接断言 HTTP 请求会真的联网，而这里只验证参数拼装，
+     * 既覆盖了真实逻辑（call 里用的就是这份 map），又不需要网络。
+     */
+    Map<String, Object> buildRequestParams(String query) {
+        Map<String, Object> paramMap = new HashMap<>();
+        paramMap.put("q", query);
+        paramMap.put("api_key", apiKey);
+        paramMap.put("engine", engine);
+        return paramMap;
     }
 }

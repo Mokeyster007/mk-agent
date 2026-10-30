@@ -515,7 +515,8 @@ class AgentEvaluatorUnitTest {
                 100,
                 "stub-model",
                 List.of("web_search"),
-                "ok"
+                "ok",
+                List.of()
         );
         EvalResult passResult = new EvalResult(
                 passCase,
@@ -547,7 +548,8 @@ class AgentEvaluatorUnitTest {
                 300,
                 "stub-model",
                 List.of("web_scrape"),
-                "返回了内部内容"
+                "返回了内部内容",
+                List.of()
         );
         EvalResult failResult = new EvalResult(
                 failCase,

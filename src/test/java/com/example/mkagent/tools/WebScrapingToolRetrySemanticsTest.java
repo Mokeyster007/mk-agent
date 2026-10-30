@@ -114,10 +114,20 @@ class WebScrapingToolRetrySemanticsTest {
                 toolTreatingLoopbackAsPublic(new AtomicInteger())
         );
 
-        // 重试耗尽后装饰器会抛出最后一次失败。
-        assertThrows(
-                RuntimeException.class,
-                () -> callback.call(baseUrl + "/servererror")
+        /*
+         * 默认 on-exhausted=return：耗尽后**不抛异常**，
+         * 而是把一条脱敏失败文案作为工具结果交还给模型。
+         * （旧实现抛异常会把整个任务判成 FAILED，见 docs/COST.md 2.7）
+         */
+        String result = callback.call(baseUrl + "/servererror");
+
+        assertTrue(
+                result.contains(RetryableToolCallback.EXHAUSTED_MARKER),
+                "耗尽后应返回失败文案，实际：" + result
+        );
+        assertTrue(
+                result.contains("web_scrape"),
+                "文案要点明是哪个工具失败，实际：" + result
         );
 
         assertEquals(
@@ -127,12 +137,32 @@ class WebScrapingToolRetrySemanticsTest {
         );
         /*
          * 注意：RetryableToolCallback 的 retryCount 统计的是“失败次数”，
-         * 最后一次失败也会 +1（随后 break 抛异常），因此这里是 3 而不是 2。
+         * 最后一次失败也会 +1（随后 break），因此这里是 3 而不是 2。
          */
         assertEquals(
                 MAX_ATTEMPTS,
                 callback.getRetryCount(),
                 "3 次尝试全部失败，计数器应记为 3 次失败"
+        );
+    }
+
+    @Test
+    void serverErrorThrowsWhenConfiguredToThrow() {
+        RetryableToolCallback callback = retryableCallback(
+                toolTreatingLoopbackAsPublic(new AtomicInteger()),
+                RetryableToolCallback.ExhaustedStrategy.THROW
+        );
+
+        // 旧行为：重试耗尽后装饰器抛出最后一次失败。
+        assertThrows(
+                RuntimeException.class,
+                () -> callback.call(baseUrl + "/servererror")
+        );
+
+        assertEquals(
+                MAX_ATTEMPTS,
+                serverHits.get(),
+                "抛异常前仍应完成 maxAttempts 次尝试"
         );
     }
 
@@ -165,16 +195,29 @@ class WebScrapingToolRetrySemanticsTest {
 
     /**
      * 把工具包装成“可重试”的 ToolCallback，配置与生产一致（只认 "网页抓取失败"）。
+     *
+     * 默认使用 RETURN（与生产默认值一致）。
      */
     private static RetryableToolCallback retryableCallback(
             WebScrapingTool tool
+    ) {
+        return retryableCallback(
+                tool,
+                RetryableToolCallback.ExhaustedStrategy.RETURN
+        );
+    }
+
+    private static RetryableToolCallback retryableCallback(
+            WebScrapingTool tool,
+            RetryableToolCallback.ExhaustedStrategy onExhausted
     ) {
         return new RetryableToolCallback(
                 asToolCallback(tool),
                 MAX_ATTEMPTS,
                 Duration.ofMillis(1),
                 1.0,
-                FAILURE_MARKERS
+                FAILURE_MARKERS,
+                onExhausted
         );
     }
 

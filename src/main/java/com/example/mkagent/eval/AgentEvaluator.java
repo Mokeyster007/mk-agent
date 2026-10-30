@@ -61,6 +61,14 @@ public class AgentEvaluator {
 
     private final DeterministicChecker deterministicChecker;
 
+    /**
+     * 引用忠实度检查：回答里的 URL 必须能追溯到工具结果或用户输入。
+     *
+     * 独立于 DeterministicChecker，因为它的输入需要"工具结果原文"，
+     * 而 DeterministicChecker 只关心工具名与预算。
+     */
+    private final CitationFaithfulnessChecker citationChecker;
+
     private final LlmJudge judge;
 
     /**
@@ -114,6 +122,7 @@ public class AgentEvaluator {
                 properties, "EvalProperties 不能为空");
         this.caseLoader = new EvalCaseLoader();
         this.deterministicChecker = new DeterministicChecker();
+        this.citationChecker = new CitationFaithfulnessChecker();
         this.judge = new LlmJudge(
                 Objects.requireNonNull(judgeChatModel, "judgeChatModel 不能为空"),
                 properties
@@ -321,6 +330,15 @@ public class AgentEvaluator {
                 deterministicChecker.check(evalCase, execution);
 
         deterministicFailures.addAll(check.failures());
+
+        /*
+         * 引用忠实度：与预算/工具选择无关，只要回答里出现 URL 就校验出处。
+         * 放在这里而不是 DeterministicChecker 内部，是因为它需要工具结果原文。
+         */
+        CitationFaithfulnessChecker.CheckResult citationCheck =
+                citationChecker.check(evalCase, execution);
+
+        deterministicFailures.addAll(citationCheck.failures());
 
         boolean deterministicPassed = deterministicFailures.isEmpty();
 

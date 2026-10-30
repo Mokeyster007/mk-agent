@@ -189,7 +189,8 @@ class EvalBudgetUnitTest {
                         100,
                         "stub-model",
                         List.of(),
-                        "直接回答"
+                        "直接回答",
+                        List.of()
                 ),
                 true,
                 List.of(),

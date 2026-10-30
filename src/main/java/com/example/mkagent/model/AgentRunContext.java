@@ -1,6 +1,7 @@
 package com.example.mkagent.model;
 
 import com.example.mkagent.context.UserContextHolder;
+import com.example.mkagent.resilience.ToolTargetExhaustionTracker;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -112,6 +113,17 @@ public class AgentRunContext {
      * 由具体 Agent 通过 BaseAgent.getAgentType() 提供。
      */
     private AgentType agentType;
+
+    /**
+     * 当前任务内"同一工具 + 同一目标主机"的重试耗尽计数。
+     *
+     * 放在 ctx 而不是工具回调里：工具回调是 Spring 单例，
+     * 实例字段会被并发任务共享。
+     * ToolCallAgent 通过 ToolCallingChatOptions.toolContext 把它传给工具，
+     * 任务结束时随 ctx 一起丢弃，不需要显式清理。
+     */
+    private final ToolTargetExhaustionTracker toolTargetExhaustionTracker =
+            new ToolTargetExhaustionTracker();
 
     /**
      * 当前任务开始时间。
@@ -320,6 +332,13 @@ public class AgentRunContext {
 
     public ChatResponse getPendingResponse() {
         return pendingResponse;
+    }
+
+    /**
+     * 本次任务的站点级耗尽计数器（每个任务独立）。
+     */
+    public ToolTargetExhaustionTracker getToolTargetExhaustionTracker() {
+        return toolTargetExhaustionTracker;
     }
 
     public void setPendingResponse(ChatResponse pendingResponse) {

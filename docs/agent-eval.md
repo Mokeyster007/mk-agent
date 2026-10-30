@@ -60,7 +60,7 @@ EvalExecution（state / step / toolCallCount / token / toolTrace / 耗时）
 
 ## 3. 用例覆盖
 
-`src/test/resources/eval/cases.json` 当前提供 32 条用例，覆盖六类场景：
+`src/test/resources/eval/cases.json` 当前提供 33 条用例，覆盖七类场景：
 
 | 类别 | 说明 | 数量 |
 | --- | --- | ---: |
@@ -70,6 +70,12 @@ EvalExecution（state / step / toolCallCount / token / toolTrace / 耗时）
 | `SSRF` | 本机 / 内网 / 云元数据地址应被拒绝 | 4 |
 | `PROMPT_INJECTION` | 网页内容中的注入指令不得执行 | 5 |
 | `INSUFFICIENT_INFO` | 信息不足应拒答或要求补充 | 4 |
+| `CITATION` | 要求给出官方文档链接，回答里的 URL 必须来自工具结果 | 1 |
+
+`CITATION` 类用例由 `CitationFaithfulnessChecker` 兜底：
+它从最终回答里抽出所有 URL，逐个断言"在本任务的工具结果或用户输入中出现过"，
+命中不了就判失败。这条检查是确定性的（不依赖 LLM judge），
+专门用来防"模型根据页面标题自己拼链接"这类引用幻觉。
 
 用例字段：
 
@@ -104,7 +110,7 @@ EvalExecution（state / step / toolCallCount / token / toolTrace / 耗时）
 mvn -Dtest=AgentEvaluatorUnitTest test
 ```
 
-覆盖：用例集数量/分类、工具命中、禁用工具、预算、关键词、judge 解析、报告指标、toolTrace 脱敏。
+覆盖：用例集数量/分类、工具命中、禁用工具、预算、关键词、引用真实性（`CitationFaithfulnessChecker`）、judge 解析、报告指标、toolTrace 脱敏。
 
 ### 5.2 运行真实 MkManus 离线评测（会调用真实模型与搜索 API）
 
@@ -150,7 +156,7 @@ mkagent:
 
 ### 5.4 整轮预算保护
 
-单条用例的 `maxSteps` / `maxToolCalls` 只能约束单条，管不住"32 条用例 × 多轮模型调用 × LLM judge"的整轮成本。
+单条用例的 `maxSteps` / `maxToolCalls` 只能约束单条，管不住"33 条用例 × 多轮模型调用 × LLM judge"的整轮成本。
 `EvalBudget` 在每条用例开始前检查三个上限：
 
 | 上限 | 配置项 | 默认 | 统计口径 |
@@ -182,7 +188,7 @@ Markdown 报告包含：
 
 ## 7. 简历表述参考
 
-> 为 MkManus 构建 32 条离线评测集，覆盖搜索、无工具、URL 抓取、SSRF、提示词注入、信息不足 6 类场景；
+> 为 MkManus 构建 33 条离线评测集，覆盖搜索、无工具、URL 抓取、SSRF、提示词注入、信息不足、引用真实性 7 类场景；
 > 实现确定性检查 + LLM-as-judge 双层评审，输出总/分类通过率、平均步数、平均 Token、P50/P95 耗时；
 > 评测使用独立并发闸门且不写 `agent_run`，保证与线上链路隔离。
 

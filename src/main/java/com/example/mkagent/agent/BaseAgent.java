@@ -734,6 +734,29 @@ public abstract class BaseAgent {
     }
 
     /**
+     * 预算耗尽后的收尾钩子：由子类决定要不要"再问模型一次"。
+     *
+     * 触发条件（严格）：
+     * 1. 终态是 {@link AgentState#MAX_STEPS_REACHED}——步数或工具次数耗尽；
+     * 2. 到这时仍然没有最终回答（模型一直在调工具，从没写过结论）。
+     *
+     * 为什么要有它：
+     * 预算耗尽时用户拿到的是"安全停止：达到最大步骤数……"这类过程摘要，
+     * 而模型在上下文里其实已经积累了搜索/抓取结果——
+     * 再给一次**不带工具**的调用，让它把已有信息总结成回答，
+     * 用户至少能得到"尽力而为的答案"，而不是一句系统提示。
+     *
+     * 默认空实现：BaseAgent 不持有 ChatModel，
+     * 由 ToolCallAgent 覆盖实现真正的收尾调用。
+     *
+     * 实现约束：
+     * - **不得修改终态**（必须保持 MAX_STEPS_REACHED，这是成本事实）；
+     * - 失败时保持 ctx.finalAnswer 为空，让调用方回退到步骤摘要。
+     */
+    protected void onBudgetExhausted(AgentRunContext ctx) {
+    }
+
+    /**
      * 异常分支的状态判定：
      * 1. 当前线程已被中断，或异常链中包含 InterruptedException → CANCELLED；
      * 2. 其余真实异常 → FAILED。
