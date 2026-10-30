@@ -7,6 +7,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
@@ -65,12 +66,18 @@ public class AgentEvaluator {
     /**
      * Spring 注入入口：
      * 业务 Agent 使用生产 ChatModel；
-     * 评委使用同一个底层模型创建的独立低温度 ChatModel 包装，
-     * 但不注册为 Spring Bean，避免容器中出现多个 ChatModel 造成注入歧义。
+     * 评委优先使用 auxiliary 模型（更便宜），没配置时回退到生产 ChatModel，
+     * 再套一层低温度包装。
+     *
+     * 注意回退的是"用哪个模型"，不是"复用哪个对象"：
+     * auxiliary 未启用时 judge 直接复用 chatModel 实例（同一个对象），
+     * 因为此时没有第二个客户端可用；启用后则是两个独立实例、各自独立的
+     * RetryTemplate（见 OpenAiCompatibleChatModelConfig）。
      */
     @Autowired
     public AgentEvaluator(
             ChatModel chatModel,
+            @Qualifier("auxiliaryChatModel") ObjectProvider<ChatModel> auxiliaryChatModel,
             @Qualifier("mkToolCallbacks") ToolCallback[] tools,
             ToolEventMessageProvider toolEventMessageProvider,
             EvalProperties properties
@@ -78,7 +85,7 @@ public class AgentEvaluator {
         this(
                 chatModel,
                 new LowTemperatureChatModel(
-                        chatModel,
+                        auxiliaryChatModel.getIfAvailable(() -> chatModel),
                         Objects.requireNonNull(properties, "EvalProperties 不能为空")
                                 .getJudgeTemperature()
                 ),
@@ -314,6 +321,7 @@ public class AgentEvaluator {
                 deterministicChecker.check(evalCase, execution);
 
         deterministicFailures.addAll(check.failures());
+
         boolean deterministicPassed = deterministicFailures.isEmpty();
 
         /*

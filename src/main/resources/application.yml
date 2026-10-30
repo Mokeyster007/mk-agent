@@ -5,6 +5,20 @@ spring:
   profiles:
     active: local
 
+  # ===========================================================
+  # 对话模型的装配完全由项目代码负责：
+  #   - 未配 mkagent.model.base-url → DashScopeChatModelConfig
+  #   - 配了 mkagent.model.base-url → OpenAiCompatibleChatModelConfig
+  # 因此排除 DashScope 的对话模型自动配置。否则它会按"类型 DashScopeChatModel
+  # 是否缺失"再创建一个 ChatModel，与项目自己选的实现、以及"谁来决定重试模板"
+  # 纠缠在一起（一次 400 被重试 8 次的根因就出在这条链路上）。
+  #
+  # 只排除"对话"：Embedding / Image 的自动配置保持原样。
+  # ===========================================================
+  autoconfigure:
+    exclude:
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+
   # AgentRun 建表脚本：启动时执行，语句全部幂等（IF NOT EXISTS）。
   sql:
     init:
@@ -69,6 +83,30 @@ mkagent:
   agent:
     # 全局最大并发 Agent 任务数（Semaphore 许可数）。
     max-concurrency: 8
+
+  # ===========================================================
+  # 模型分层（OpenAI 兼容接口）。
+  #
+  # 默认整块注释掉 = 不启用，继续使用 DashScope 原生客户端。
+  # 取消注释并填上 base-url 即切换：
+  #   agent     主推理（Agent 用）
+  #   auxiliary 评测打分 / 查询改写等短调用；name 留空则回退 agent 的模型名
+  #   vision    多模态；name 留空则回退 agent 的模型名
+  #
+  # 三者共用 base-url / api-key，但各自持有**独立的** RetryTemplate 实例，
+  # 不与容器里的 RetryTemplate Bean 共享对象（见 OpenAiCompatibleChatModelConfig）。
+  # ===========================================================
+  # model:
+  #   base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  #   api-key: ${MKAGENT_MODEL_API_KEY:}
+  #   agent:
+  #     name: qwen-plus
+  #     temperature: 0.7
+  #   auxiliary:
+  #     name: qwen-turbo
+  #     temperature: 0.0
+  #   vision:
+  #     name: qwen-vl-plus
 
   # ===========================================================
   # 模型调用重试（DashScopeChatModel 实际使用的 RetryTemplate）。

@@ -158,6 +158,20 @@
             <artifactId>spring-ai-markdown-document-reader</artifactId>
         </dependency>
 
+        <!--
+            Spring AI：OpenAI 兼容接口客户端。
+
+            只引库、不引 starter：starter 会带上 OpenAiChatAutoConfiguration，
+            它会自己造一个 ChatModel 并把容器里的 RetryTemplate 注进去，
+            等于把"重试策略由谁决定"这件事又交回给框架。
+            这里只用 OpenAiApi / OpenAiChatModel 两个类，手工构造、显式传入私有
+            RetryTemplate（见 OpenAiCompatibleChatModelConfig）。
+        -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-openai</artifactId>
+        </dependency>
+
         <!-- Spring AI：RAG 向量库检索 Advisor -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

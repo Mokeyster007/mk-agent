@@ -13,7 +13,9 @@ import org.springframework.ai.model.tool.DefaultToolExecutionEligibilityPredicat
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.model.tool.ToolExecutionEligibilityPredicate;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.retry.support.RetryTemplate;
 import org.springframework.web.client.ResponseErrorHandler;
@@ -21,7 +23,16 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.reactive.function.client.WebClient;
 
 /**
- * 显式构造对话模型，把重试策略钉死在模型实例上。
+ * 显式构造对话模型（DashScope 原生客户端），把重试策略钉死在模型实例上。
+ *
+ * 生效条件：没有配置 `mkagent.model.base-url`（即没切到 OpenAI 兼容客户端）。
+ * 配了 base-url 时本类整体让位给 {@link OpenAiCompatibleChatModelConfig}，
+ * 保证容器里任何时刻只有一个对话模型。
+ *
+ * 注：`DashScopeChatAutoConfiguration` 已在 application.yml 中被排除，
+ * 模型装配完全由项目代码负责——否则第三方自动配置会按"类型是否缺失"决定要不要
+ * 再造一个模型，与"谁来决定重试模板"纠缠在一起。因此这里需要自己声明
+ * `@EnableConfigurationProperties`，把那两个属性类注册回来。
  *
  * 背景（一次真实的线上问题，根因已用反编译确认）：
  * 只在容器里放一个 `RetryTemplate` Bean、指望 DashScope 自动配置把它注入给
@@ -56,6 +67,8 @@ import org.springframework.web.reactive.function.client.WebClient;
  * 即使将来容器里再出现同类型 Bean，模型的重试策略也不会被悄悄替换。
  */
 @Configuration
+@Conditional(OpenAiCompatibleConditions.Disabled.class)
+@EnableConfigurationProperties({DashScopeChatProperties.class, DashScopeConnectionProperties.class})
 public class DashScopeChatModelConfig {
 
     private static final Logger log =

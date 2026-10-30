@@ -107,24 +107,50 @@ public class ModelRetryDiagnostics implements ApplicationRunner {
     }
 
     /**
-     * 确认模型实际持有的重试模板。
+     * 逐个确认容器里每个对话模型实际持有的重试模板。
+     *
+     * 为什么是"逐个"而不是"看那个唯一的 ChatModel"：
+     * 按用途分层之后，容器里会有 agent / auxiliary / vision 多个模型，
+     * 每个都必须持有自己的私有模板。只抽查一个，等于放过了另外两个。
      */
-    private void checkModelRetryTemplate(Map<String, RetryTemplate> beans) {
-        RetryTemplate held = readModelRetryTemplate();
+    private void checkModelRetryTemplate(Map<String, RetryTemplate> retryBeans) {
+        Map<String, ChatModel> models = new LinkedHashMap<>(
+                applicationContext.getBeansOfType(ChatModel.class));
+
+        if (models.isEmpty()) {
+            /*
+             * 兜底：单元测试里模型往往不是注册的 Bean，而是直接构造传入。
+             * 此时至少把注入进来的这个检查一遍。
+             */
+            models.put(
+                    chatModel.getClass().getSimpleName() + "（注入实例）",
+                    chatModel
+            );
+        }
+
+        models.forEach((name, model) -> inspectModel(name, model, retryBeans));
+    }
+
+    private void inspectModel(
+            String name,
+            ChatModel model,
+            Map<String, RetryTemplate> retryBeans
+    ) {
+        RetryTemplate held = readRetryTemplate(model);
         if (held == null) {
             log.info(
                     "重试策略自检：{} 未暴露 retryTemplate 字段，跳过实例级校验",
-                    chatModel.getClass().getSimpleName()
+                    name
             );
             return;
         }
 
         RetryTemplateSnapshot snapshot = RetryTemplateSnapshot.of(held);
-        String beanName = RetryTemplateSnapshot.nameOf(beans, held);
+        String beanName = RetryTemplateSnapshot.nameOf(retryBeans, held);
 
         log.info(
                 "重试策略自检：{} 实际持有的 RetryTemplate = [{}]，来源={}",
-                chatModel.getClass().getSimpleName(),
+                name,
                 snapshot,
                 beanName.isEmpty()
                         ? "模型私有实例（预期：与容器 Bean 隔离，库代码改不到）"
@@ -133,18 +159,20 @@ public class ModelRetryDiagnostics implements ApplicationRunner {
 
         if (snapshot.isFixedBackOff()) {
             log.warn(
-                    "重试策略自检异常：模型正在使用 FixedBackOffPolicy（{}）。"
+                    "重试策略自检异常：{} 正在使用 FixedBackOffPolicy（{}）。"
                             + "已知成因：spring-ai-alibaba 的 DashScopeImageModel 构造器会原地改写"
                             + "传进去的 RetryTemplate（setRetryPolicy(SimpleRetryPolicy(10)) + "
                             + "FixedBackOffPolicy(15000ms)），从而连 400 都会被重试。"
                             + "对话模型应持有私有模板（见 DashScopeChatModelConfig）。",
+                    name,
                     snapshot.getBackOffDescription()
             );
         }
 
         if (snapshot.getMaxAttempts() > 5) {
             log.warn(
-                    "重试策略自检异常：maxAttempts={}，交互式 Agent 不应重试这么多次",
+                    "重试策略自检异常：{} 的 maxAttempts={}，交互式 Agent 不应重试这么多次",
+                    name,
                     snapshot.getMaxAttempts()
             );
         }
@@ -152,16 +180,28 @@ public class ModelRetryDiagnostics implements ApplicationRunner {
 
     /**
      * 读取模型内部的 RetryTemplate；读不到返回 null。
+     *
+     * 沿类继承链查找 `getDeclaredField`：`DashScopeChatModel` 的字段是
+     * `public final`，而 `OpenAiChatModel` 的是 `private final`，
+     * 只认 public 会漏掉后者。
      */
-    private RetryTemplate readModelRetryTemplate() {
-        try {
-            Field field = chatModel.getClass()
-                    .getField(MODEL_RETRY_FIELD);
-            Object value = field.get(chatModel);
-            return value instanceof RetryTemplate template ? template : null;
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            return null;
+    private RetryTemplate readRetryTemplate(ChatModel model) {
+        Class<?> type = model.getClass();
+
+        while (type != null && type != Object.class) {
+            try {
+                Field field = type.getDeclaredField(MODEL_RETRY_FIELD);
+                field.setAccessible(true);
+                Object value = field.get(model);
+                return value instanceof RetryTemplate template ? template : null;
+            } catch (NoSuchFieldException e) {
+                type = type.getSuperclass();
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
         }
+
+        return null;
     }
 
     /**
