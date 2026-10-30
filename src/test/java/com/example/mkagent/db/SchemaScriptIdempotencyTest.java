@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -97,14 +98,39 @@ class SchemaScriptIdempotencyTest {
                         """);
             }
 
+            /*
+             * 先证明模拟的存量表确实"旧"：
+             * 新版本新增的 Usage / 轨迹列必须都不存在，
+             * 否则后面的"升级补齐"断言就是空转。
+             */
+            List<String> legacyColumns = columnNames(connection, "agent_run");
+            for (String newColumn : List.of(
+                    "tool_trace",
+                    "model",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens"
+            )) {
+                assertFalse(legacyColumns.contains(newColumn),
+                        "模拟的旧表不应包含新增列 " + newColumn
+                                + "，实际列：" + legacyColumns);
+            }
+
             ScriptUtils.executeSqlScript(
                     connection, new ClassPathResource("db/schema.sql"));
 
             List<String> columns = columnNames(connection, "agent_run");
-            assertTrue(columns.contains("tool_trace"),
-                    "存量表必须被 ALTER 补上 tool_trace，实际列：" + columns);
-            assertTrue(columns.contains("final_answer"),
-                    "其它 TEXT 列同样应被补齐，实际列：" + columns);
+            for (String newColumn : List.of(
+                    "tool_trace",
+                    "model",
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens"
+            )) {
+                assertTrue(columns.contains(newColumn),
+                        "存量表必须被 ALTER 补齐 " + newColumn
+                                + "，实际列：" + columns);
+            }
         }
     }
 

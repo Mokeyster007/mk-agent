@@ -29,7 +29,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * 线程安全：工具调用可能并发（模型一轮里同时请求多个工具），
  * 计数使用 ConcurrentHashMap 原子累加。
- */public final class ToolTargetExhaustionTracker {
+ */
+public final class ToolTargetExhaustionTracker {
 
     /**
      * 当前线程正在执行的工具所属任务的计数器。

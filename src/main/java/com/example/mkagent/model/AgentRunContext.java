@@ -119,8 +119,10 @@ public class AgentRunContext {
      *
      * 放在 ctx 而不是工具回调里：工具回调是 Spring 单例，
      * 实例字段会被并发任务共享。
-     * ToolCallAgent 通过 ToolCallingChatOptions.toolContext 把它传给工具，
-     * 任务结束时随 ctx 一起丢弃，不需要显式清理。
+     * ToolCallAgent.act() 在工具执行前通过
+     * ToolTargetExhaustionTracker.bind(...) 绑定到当前线程的 ThreadLocal，
+     * 工具执行完在 finally 中 unbind() 清除；
+     * 计数器本身任务结束时随 ctx 一起丢弃，不需要显式清理。
      */
     private final ToolTargetExhaustionTracker toolTargetExhaustionTracker =
             new ToolTargetExhaustionTracker();
