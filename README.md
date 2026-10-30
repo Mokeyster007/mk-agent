@@ -173,9 +173,13 @@ event:done       [DONE]
 
 ## 测试
 
-测试全部隔离真实模型与外部服务（DashScope 自动配置被排除，模型由可控的假实现替换）：
+默认 `mvn test` 不触网、不花钱：需要真实模型 / 真实搜索 / 真实数据库的测试统一标了
+`@Tag("live")`，由 surefire 默认排除（`mkagent.test.excluded-groups=live`）。
 
 ```bash
+# 默认：只跑确定性测试（桩模型 / 假工具）
+./mvnw test
+
 # 状态机单元测试（11 个：成功/超时/取消/预算/清理幂等/注册移除）
 ./mvnw test "-Dtest=AgentStateMachineUnitTest"
 
@@ -184,6 +188,9 @@ event:done       [DONE]
 
 # 异步 SSE 工具调用全链路集成测试
 ./mvnw test "-Dtest=MkManusAsyncSseIntegrationTest"
+
+# live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
+./mvnw -Plive test "-Dtest=MkManusTest"
 ```
 
 ---
@@ -194,6 +201,12 @@ event:done       [DONE]
 
 - `02-agent-state-and-task-cancel.md`：Agent 状态机、任务注册表、主动取消与超时处理
   （含状态流转图、四条路径时序图、面试题与常见问题排查表）
+
+其它专题文档：
+
+- [`docs/agent-eval.md`](docs/agent-eval.md)：离线评测（32 条用例、确定性检查 + LLM-as-judge、整轮预算保护）
+- [`docs/SECURITY.md`](docs/SECURITY.md)：安全加固（SSRF 校验、密钥管理、会话 ID 校验）
+- [`docs/COST.md`](docs/COST.md)：成本控制（RAG 延迟初始化、模型重试策略与取舍、评测预算）
 
 ---
 

@@ -1,12 +1,17 @@
 package com.example.mkagent.tools;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
+/**
+ * 真实搜索 API 冒烟测试（live 分组，默认不执行）。
+ */
 @SpringBootTest
+@Tag("live")
 class WebSearchToolTest {
 
     @Value("${search-api.api-key}")

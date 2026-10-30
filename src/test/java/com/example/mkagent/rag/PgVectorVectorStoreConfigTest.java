@@ -2,6 +2,7 @@ package com.example.mkagent.rag;
 
 import jakarta.annotation.Resource;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
@@ -13,7 +14,13 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * 真实 pgvector + 真实 Embedding 的联调测试（live 分组，默认不执行）。
+ *
+ * 依赖本地 PostgreSQL（含 vector 扩展）与 DashScope Embedding 额度。
+ */
 @SpringBootTest
+@Tag("live")
 class PgVectorVectorStoreConfigTest {
 
     @Resource

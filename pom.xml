@@ -35,6 +35,14 @@
 
         <!-- Spring AI Alibaba / DashScope 组件版本 -->
         <spring-ai-alibaba.version>1.0.0.2</spring-ai-alibaba.version>
+
+        <!--
+            默认被排除的测试分组。
+            live = 需要真实模型 / 真实搜索 / 真实数据库的测试：
+            默认 mvn test 一律不跑，避免误消耗额度。
+            需要跑 live 测试时用 -Plive 把该值覆盖成 none（见 build/profiles）。
+        -->
+        <mkagent.test.excluded-groups>live</mkagent.test.excluded-groups>
     </properties>
 
     <dependencyManagement>
@@ -239,7 +247,35 @@
                 </configuration>
             </plugin>
 
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <!--
+                        @Tag("live") 的测试默认被排除。
+                        这类测试会调用真实模型 / 搜索 API / 真实数据库，属于付费且有外部依赖的测试，
+                        不能因为"顺手跑了全量测试"就默默花钱。
+                    -->
+                    <excludedGroups>${mkagent.test.excluded-groups}</excludedGroups>
+                </configuration>
+            </plugin>
+
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <!--
+                显式开启 live 测试：
+                  mvn -Plive -Dtest=AgentEvalRunnerTest -Dmkagent.eval.enabled=true test
+                excludedGroups 用哨兵值 none（不存在同名分组），
+                等价于"不排除任何分组"，同时避免空字符串被 surefire 当成非法值。
+            -->
+            <id>live</id>
+            <properties>
+                <mkagent.test.excluded-groups>none</mkagent.test.excluded-groups>
+            </properties>
+        </profile>
+    </profiles>
 
 </project>

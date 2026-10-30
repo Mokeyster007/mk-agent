@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -38,7 +39,8 @@ import java.util.Objects;
  * - 评测 Agent 不注入 AgentTaskRegistry，不进入线上取消链路；
  * - 评测使用独立的 AgentConcurrencyGuard，
  *   与线上 mkagent.agent.max-concurrency 不是同一个 Semaphore；
- * - 评测串行执行，避免并发负载影响 P50/P95 延迟统计。
+ * - 评测串行执行，避免并发负载影响 P50/P95 延迟统计；
+ * - 整轮预算（Token / 时长 / 条数）耗尽即停止，避免一次误跑烧掉大量额度。
  */
 @Component
 public class AgentEvaluator {
@@ -122,24 +124,42 @@ public class AgentEvaluator {
         }
 
         List<EvalCase> cases = loadCases();
-        List<EvalResult> results = evaluate(cases);
+        EvalRun run = evaluateWithBudget(cases);
 
         EvalReport report = new EvalReport(
-                results,
-                resolveModel(results),
-                properties.getMaxConcurrency()
+                run.results(),
+                resolveModel(run.results()),
+                properties.getMaxConcurrency(),
+                LocalDateTime.now(),
+                run.budget()
         );
 
         Path reportPath = writeReport(report);
 
         log.info(
-                "离线评测完成：total={}, passed={}, passRate={}%, judgeUsed={}, report={}",
+                "离线评测完成：total={}, passed={}, passRate={}%, judgeUsed={}, tokens={}, report={}",
                 report.getTotalCount(),
                 report.getPassedCount(),
                 String.format(Locale.ROOT, "%.1f", report.getPassRate() * 100.0),
                 report.getJudgeUsedCount(),
+                run.budget().consumedTokens(),
                 reportPath.toAbsolutePath()
         );
+
+        /*
+         * 预算触发时明确告警：本轮指标只覆盖已执行的部分用例，
+         * 不能当作全量评测结论使用。
+         */
+        if (run.budgetStopped()) {
+            log.warn(
+                    "评测因预算提前结束：reason={}, detail={}, executed={}, skipped={}, report={}",
+                    run.budget().stopReason().label(),
+                    run.budget().stopDetail(),
+                    run.budget().executedCases(),
+                    run.budget().skippedCases(),
+                    reportPath.toAbsolutePath()
+            );
+        }
 
         return report;
     }
@@ -152,7 +172,14 @@ public class AgentEvaluator {
     }
 
     /**
-     * 执行一组用例。
+     * 执行一组用例，只返回用例结果（便于单测与旧调用方）。
+     */
+    public List<EvalResult> evaluate(List<EvalCase> cases) {
+        return evaluateWithBudget(cases).results();
+    }
+
+    /**
+     * 执行一组用例，并返回本轮预算快照。
      *
      * 串行执行，保证：
      * 1. 单条用例的耗时不被其他用例争抢模型/网络资源干扰；
@@ -160,8 +187,11 @@ public class AgentEvaluator {
      *
      * 即便是串行，评测 Agent 仍会经过独立并发闸门，
      * 从而验证闸门配置不会与线上限流互相影响。
+     *
+     * 预算保护：每条用例开始前检查整轮预算（条数 / 时长 / Token），
+     * 一旦耗尽立即停止，剩余用例记为"预算跳过"而不是执行后失败。
      */
-    public List<EvalResult> evaluate(List<EvalCase> cases) {
+    public EvalRun evaluateWithBudget(List<EvalCase> cases) {
         if (cases == null || cases.isEmpty()) {
             throw new IllegalArgumentException("评测用例不能为空");
         }
@@ -186,10 +216,22 @@ public class AgentEvaluator {
         );
         agent.setTimeout(Duration.ofSeconds(properties.getCaseTimeoutSeconds()));
 
+        EvalBudget budget = EvalBudget.from(properties);
+
         List<EvalResult> results = new ArrayList<>(cases.size());
 
         for (EvalCase evalCase : cases) {
-            EvalResult result = evaluateCase(agent, evalCase);
+            if (!budget.allowsNextCase()) {
+                log.warn(
+                        "[eval] 预算用尽，跳过剩余用例：reason={}, detail={}, executed={}",
+                        budget.getStopReason().label(),
+                        budget.getStopDetail(),
+                        budget.getExecutedCases()
+                );
+                break;
+            }
+
+            EvalResult result = evaluateCase(agent, evalCase, budget);
             results.add(result);
 
             log.info(
@@ -219,15 +261,20 @@ public class AgentEvaluator {
             );
         }
 
-        return List.copyOf(results);
+        return new EvalRun(results, budget.summary(cases.size()));
     }
 
     /**
      * 执行单条用例。
      *
      * 任何异常都收敛为该用例失败，不中断整轮评测。
+     * 执行结束后把 Agent Token + judge Token 记入整轮预算。
      */
-    private EvalResult evaluateCase(EvalAgent agent, EvalCase evalCase) {
+    private EvalResult evaluateCase(
+            EvalAgent agent,
+            EvalCase evalCase,
+            EvalBudget budget
+    ) {
         List<String> deterministicFailures = new ArrayList<>();
 
         /*
@@ -276,6 +323,7 @@ public class AgentEvaluator {
         boolean judgeUsed = false;
         boolean judgePassed = false;
         String judgeReason = "";
+        long judgeTokens = 0L;
 
         if (deterministicPassed && evalCase.requiresJudge()) {
             judgeUsed = true;
@@ -283,7 +331,13 @@ public class AgentEvaluator {
             LlmJudge.JudgeVerdict verdict = judge.judge(evalCase, execution);
             judgePassed = verdict.passed();
             judgeReason = verdict.reason();
+            judgeTokens = verdict.totalTokens();
         }
+
+        /*
+         * 整轮预算口径：Agent 模型 Token + judge Token（两者都是付费调用）。
+         */
+        budget.record(execution.totalTokens() + judgeTokens);
 
         return new EvalResult(
                 evalCase,

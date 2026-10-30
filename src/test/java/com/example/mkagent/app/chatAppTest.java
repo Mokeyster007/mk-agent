@@ -2,6 +2,7 @@ package com.example.mkagent.app;
 
 import jakarta.annotation.Resource;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
@@ -9,7 +10,14 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+/**
+ * chatApp 真实模型联调测试（live 分组，默认不执行）。
+ *
+ * 覆盖对话记忆、结构化报告、RAG 与 MCP 四条真实链路，
+ * 会调用 DashScope、Embedding、搜索 API 与 MCP 服务。
+ */
 @SpringBootTest
+@Tag("live")
 class chatAppTest {
 
     @Resource

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -39,10 +40,13 @@ public class LlmJudge {
 
     /**
      * 对一条用例的执行结果做语义评审。
+     *
+     * 返回的 JudgeVerdict 带本次评委调用的 Token 用量，
+     * 供整轮预算统计（judge 调用同样花钱）。
      */
     public JudgeVerdict judge(EvalCase evalCase, EvalExecution execution) {
         if (!properties.isJudgeEnabled()) {
-            return new JudgeVerdict(false, "LLM-as-judge 已禁用");
+            return new JudgeVerdict(false, "LLM-as-judge 已禁用", 0L);
         }
 
         try {
@@ -50,8 +54,15 @@ public class LlmJudge {
                     new Prompt(buildPrompt(evalCase, execution))
             );
 
+            long tokens = totalTokens(response);
             String content = extractText(response);
-            return parseVerdict(content);
+            JudgeVerdict parsed = parseVerdict(content);
+
+            return new JudgeVerdict(
+                    parsed.passed(),
+                    parsed.reason(),
+                    tokens
+            );
 
         } catch (Exception e) {
             /*
@@ -65,9 +76,24 @@ public class LlmJudge {
             );
             return new JudgeVerdict(
                     false,
-                    "judge 调用失败：" + e.getClass().getSimpleName()
+                    "judge 调用失败：" + e.getClass().getSimpleName(),
+                    0L
             );
         }
+    }
+
+    /**
+     * 读取评委响应的 Token 用量；模型未返回 usage 时按 0 处理。
+     */
+    private long totalTokens(ChatResponse response) {
+        if (response == null || response.getMetadata() == null) {
+            return 0L;
+        }
+        Usage usage = response.getMetadata().getUsage();
+        if (usage == null || usage.getTotalTokens() == null) {
+            return 0L;
+        }
+        return Math.max(0L, usage.getTotalTokens().longValue());
     }
 
     /**
@@ -276,13 +302,25 @@ public class LlmJudge {
 
     /**
      * 评委判定结果。
+     *
+     * totalTokens 是本次评委调用的 Token 用量，用于整轮预算统计；
+     * 只影响成本核算，不影响判定结果。
      */
     public record JudgeVerdict(
             boolean passed,
-            String reason
+            String reason,
+            long totalTokens
     ) {
         public JudgeVerdict {
             reason = reason == null ? "" : reason;
+            totalTokens = Math.max(0L, totalTokens);
+        }
+
+        /**
+         * 兼容不需要 Token 用量的场景（如“judge 已禁用”）。
+         */
+        public JudgeVerdict(boolean passed, String reason) {
+            this(passed, reason, 0L);
         }
     }
 }

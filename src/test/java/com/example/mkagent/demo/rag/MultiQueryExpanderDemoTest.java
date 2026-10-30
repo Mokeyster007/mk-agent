@@ -2,6 +2,7 @@ package com.example.mkagent.demo.rag;
 
 import jakarta.annotation.Resource;
 import lombok.extern.slf4j.Slf4j;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.rag.Query;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -10,8 +11,12 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * MultiQueryExpander 真实模型演示测试（live 分组，默认不执行）。
+ */
 @Slf4j
 @SpringBootTest
+@Tag("live")
 class MultiQueryExpanderDemoTest {
 
     @Resource

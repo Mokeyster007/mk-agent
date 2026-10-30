@@ -20,6 +20,9 @@ import java.util.Map;
  *
  * 报告只包含聚合指标与失败用例摘要，
  * 不包含工具参数、API Key、系统提示词等敏感信息。
+ *
+ * 若本轮评测因预算提前结束，报告会额外注明"只覆盖已执行用例"，
+ * 避免把部分结果当成全量结论。
  */
 public class EvalReport {
 
@@ -57,12 +60,17 @@ public class EvalReport {
 
     private final LocalDateTime generatedAt;
 
+    /**
+     * 整轮预算快照；为 null 表示该报告不记录预算信息（如单测直接构造）。
+     */
+    private final EvalBudgetSummary budget;
+
     public EvalReport(
             List<EvalResult> results,
             String agentModel,
             int evalMaxConcurrency
     ) {
-        this(results, agentModel, evalMaxConcurrency, LocalDateTime.now());
+        this(results, agentModel, evalMaxConcurrency, LocalDateTime.now(), null);
     }
 
     public EvalReport(
@@ -71,16 +79,31 @@ public class EvalReport {
             int evalMaxConcurrency,
             LocalDateTime generatedAt
     ) {
+        this(results, agentModel, evalMaxConcurrency, generatedAt, null);
+    }
+
+    public EvalReport(
+            List<EvalResult> results,
+            String agentModel,
+            int evalMaxConcurrency,
+            LocalDateTime generatedAt,
+            EvalBudgetSummary budget
+    ) {
         this.results = results == null ? List.of() : List.copyOf(results);
         this.agentModel = agentModel == null ? "" : agentModel;
         this.evalMaxConcurrency = evalMaxConcurrency;
         this.generatedAt = generatedAt == null
                 ? LocalDateTime.now()
                 : generatedAt;
+        this.budget = budget;
     }
 
     public List<EvalResult> getResults() {
         return results;
+    }
+
+    public EvalBudgetSummary getBudget() {
+        return budget;
     }
 
     public int getTotalCount() {
@@ -192,6 +215,10 @@ public class EvalReport {
                 .append("模型未返回 usage 时按 0 计入平均 Token。\n");
         markdown.append("- 耗时口径：P50 / P95 只统计 Agent run() 执行耗时，不含 LLM judge 调用。\n\n");
 
+        if (budget != null) {
+            appendBudgetSection(markdown);
+        }
+
         markdown.append("## 总体指标\n\n");
         markdown.append("| 指标 | 数值 |\n");
         markdown.append("| --- | --- |\n");
@@ -289,6 +316,57 @@ public class EvalReport {
         }
 
         return markdown.toString();
+    }
+
+    /**
+     * 渲染预算执行情况。
+     *
+     * 预算触发时，报告里的通过率只覆盖"已执行用例"，
+     * 必须显式写清楚，避免被当成全量结论引用。
+     */
+    private void appendBudgetSection(StringBuilder markdown) {
+        markdown.append("## 预算执行情况\n\n");
+        markdown.append("| 项 | 上限 | 已用 |\n");
+        markdown.append("| --- | ---: | ---: |\n");
+        markdown.append("| Token（Agent + LLM judge） | ")
+                .append(formatLimit(budget.maxTotalTokens(), "Token"))
+                .append(" | ")
+                .append(budget.consumedTokens())
+                .append(" |\n");
+        markdown.append("| 墙钟时长 | ")
+                .append(formatLimit(
+                        budget.maxDurationMillis() <= 0
+                                ? 0
+                                : budget.maxDurationMillis() / 1000,
+                        "s"))
+                .append(" | ")
+                .append(budget.consumedDurationMillis() / 1000)
+                .append(" s |\n");
+        markdown.append("| 用例条数 | ")
+                .append(budget.maxCases() == 0
+                        ? "不限"
+                        : String.valueOf(budget.maxCases()))
+                .append(" | ")
+                .append(budget.executedCases())
+                .append(" |\n\n");
+
+        if (budget.stopped()) {
+            markdown.append("> **预算已触发**：")
+                    .append(budget.stopReason().label())
+                    .append("（")
+                    .append(budget.stopDetail())
+                    .append("）。本轮已执行 ")
+                    .append(budget.executedCases())
+                    .append(" 条，剩余 ")
+                    .append(budget.skippedCases())
+                    .append(" 条未执行；上述指标只覆盖已执行用例，不能当作全量评测结论。\n\n");
+        } else {
+            markdown.append("本轮未触发预算上限。\n\n");
+        }
+    }
+
+    private String formatLimit(long value, String unit) {
+        return value <= 0 ? "不限" : value + " " + unit;
     }
 
     /**

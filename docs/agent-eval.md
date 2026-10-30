@@ -92,7 +92,9 @@ EvalExecution（state / step / toolCallCount / token / toolTrace / 耗时）
 2. **不进入线上取消链路**：`EvalAgent` 不注入 `AgentTaskRegistry`；
 3. **独立并发闸门**：评测使用 `mkagent.eval.max-concurrency` 创建自己的 `Semaphore`，与线上 `mkagent.agent.max-concurrency` 不是同一个实例；
 4. **串行执行**：默认逐条执行，避免并发争抢模型/网络影响 P50/P95；
-5. **AgentType=EVAL**：即使未来接入记录器，也有独立类型标识，便于与线上 MANUS 数据区分。
+5. **AgentType=EVAL**：即使未来接入记录器，也有独立类型标识，便于与线上 MANUS 数据区分；
+6. **默认不花钱**：真实评测 runner 标了 `@Tag("live")`，surefire 默认排除该分组，
+   再加 `mkagent.eval.enabled=true` 才真正执行（见 5.2）。
 
 ## 5. 运行方式
 
@@ -106,9 +108,16 @@ mvn -Dtest=AgentEvaluatorUnitTest test
 
 ### 5.2 运行真实 MkManus 离线评测（会调用真实模型与搜索 API）
 
+真实评测属于 **live 分组**，默认被 surefire 排除，需要两道门同时打开：
+
 ```bash
-mvn -Dtest=AgentEvalRunnerTest -Dmkagent.eval.enabled=true test
+mvn -Plive -Dtest=AgentEvalRunnerTest -Dmkagent.eval.enabled=true test
 ```
+
+- `-Plive`：把 `excludedGroups` 从 `live` 覆盖成 `none`（见 `pom.xml` 的 `live` profile）；
+- `-Dmkagent.eval.enabled=true`：`AgentEvalRunnerTest` 自身的系统属性开关。
+
+漏掉任意一个都不会真正执行，也就不会产生费用。
 
 报告输出：
 
@@ -133,7 +142,32 @@ mkagent:
     judge-temperature: 0.0
     judge-max-answer-chars: 4000
     case-timeout-seconds: 120
+    # 整轮预算：任一项超限即停止启动新用例，0 = 不限
+    max-total-tokens: 2000000
+    max-duration-seconds: 1800
+    max-cases: 0
 ```
+
+### 5.4 整轮预算保护
+
+单条用例的 `maxSteps` / `maxToolCalls` 只能约束单条，管不住"32 条用例 × 多轮模型调用 × LLM judge"的整轮成本。
+`EvalBudget` 在每条用例开始前检查三个上限：
+
+| 上限 | 配置项 | 默认 | 统计口径 |
+| --- | --- | --- | --- |
+| Token | `max-total-tokens` | 2000000 | Agent 模型调用 + LLM judge 调用 |
+| 墙钟时长 | `max-duration-seconds` | 1800 | 从 `evaluate()` 开始，含 judge 耗时 |
+| 用例条数 | `max-cases` | 0（不限） | 已执行条数，主要用于冒烟跑 |
+
+触发后是**软停止**：
+
+- 已执行用例的结果照常计入报告与通过率；
+- 未执行用例记为"预算跳过"，不伪造失败；
+- 报告出现 `## 预算执行情况` 段，并明确写出"指标只覆盖已执行用例，不能当作全量评测结论"；
+- 日志 WARN 一行记录停止原因、已执行条数、跳过条数。
+
+预算行为由 `EvalBudgetUnitTest` 用桩模型覆盖（含 judge Token 计入预算、时长预算用注入时钟验证），
+不需要真实调用。
 
 ## 6. 报告字段
 

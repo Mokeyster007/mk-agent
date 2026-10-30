@@ -1,5 +1,6 @@
 package com.example.mkagent.agent;
 
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -20,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  *
  * AgentRun 持久化使用 H2 内存库（PostgreSQL 兼容模式），
  * 避免真实模型测试污染生产数据库。
+ *
+ * 本类属于 live 分组（真实模型 + 真实搜索），默认 mvn test 不执行。
  */
 @SpringBootTest(
         properties = {
@@ -34,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
                 "mkagent.rag.pgvector.enabled=false"
         }
 )
+@Tag("live")
 class MkManusTest {
 
     @Autowired
