@@ -2,6 +2,7 @@ package com.example.mkagent;
 
 import com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatProperties;
 import com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeConnectionProperties;
+import com.example.mkagent.agent.MkManus;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.tool.ToolCallback;
@@ -13,6 +14,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -57,8 +59,23 @@ class MkAgentApplicationTests {
     @Autowired
     private Environment environment;
 
+    @Autowired
+    private MkManus mkManus;
+
     @Test
     void contextLoads() {
+    }
+
+    /**
+     * 默认上下文必须保持线上既有预算：8 步 / 12 次工具 / 2 分钟。
+     *
+     * 配置项可覆盖，但默认值一旦漂移，线上成本与任务时长会静默变化。
+     */
+    @Test
+    void manusBudgetDefaultsStayUnchanged() {
+        assertThat(mkManus.getMaxSteps()).isEqualTo(8);
+        assertThat(mkManus.getMaxToolCalls()).isEqualTo(12);
+        assertThat(mkManus.getTimeout()).isEqualTo(Duration.ofMinutes(2));
     }
 
     /**
