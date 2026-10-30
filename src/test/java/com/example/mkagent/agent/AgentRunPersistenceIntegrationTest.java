@@ -6,9 +6,12 @@ import com.example.mkagent.controller.AgentRunController;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.entity.AgentRunEntity;
 import com.example.mkagent.exception.BusinessException;
+import com.example.mkagent.model.AgentRunContext;
+import com.example.mkagent.model.AgentState;
 import com.example.mkagent.model.vo.AgentRunVO;
 import com.example.mkagent.model.vo.PageResult;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
+import com.example.mkagent.service.AgentRunRecorder;
 import com.example.mkagent.service.AgentRunService;
 import com.example.mkagent.support.FakeChatModel;
 import com.example.mkagent.tools.DemoInventoryTool;
@@ -172,6 +175,9 @@ class AgentRunPersistenceIntegrationTest {
 
     @Autowired
     private AgentRunController agentRunController;
+
+    @Autowired
+    private AgentRunRecorder agentRunRecorder;
 
     /**
      * 替换 RAG 内存向量库，避免测试触网调用 Embedding API。
@@ -445,8 +451,69 @@ class AgentRunPersistenceIntegrationTest {
         }
     }
 
-    // ===== HTTP 辅助方法 =====
+    /**
+     * 工具轨迹落库：
+     * 按实际执行顺序记录工具名（逗号分隔），不包含任何参数或结果原文；
+     * AgentRunVO 同步返回该字段。
+     */
+    @Test
+    void runPersistsToolTraceInExecutionOrder() throws Exception {
+        String userId = "user-persist-tool-trace";
 
+        requestAgentSseSync(userId, PROMPT);
+
+        awaitUntil(() -> {
+            AgentRunEntity latest = latestRunOf(userId);
+            return latest != null && "SUCCEEDED".equals(latest.getState());
+        });
+
+        AgentRunEntity finished = latestRunOf(userId);
+
+        /*
+         * 本次任务恰好调用一次 demo_inventory_check：
+         * 轨迹应只有这一个名字，且与 tool_call_count 对得上。
+         */
+        assertThat(finished.getToolTrace())
+                .as("应按执行顺序落库工具名序列")
+                .isEqualTo("demo_inventory_check");
+        assertThat(finished.getToolCallCount()).isEqualTo(1);
+
+        // 轨迹里绝不能出现参数原文（SKU 属于工具参数）。
+        assertThat(finished.getToolTrace())
+                .as("轨迹只存工具名，不含参数")
+                .doesNotContain("MK-2026-001");
+
+        // VO 同步返回。
+        UserContextHolder.set(userId);
+        try {
+            AgentRunVO view = agentRunController.getRun(finished.getRunId());
+            assertThat(view.getToolTrace()).isEqualTo("demo_inventory_check");
+        } finally {
+            UserContextHolder.clear();
+        }
+    }
+
+    /**
+     * 没有执行过工具时，tool_trace 保持 NULL
+     * （区分"没调过工具"与"空字符串"）。
+     */
+    @Test
+    void emptyToolTraceStaysNull() {
+        AgentRunContext ctx = new AgentRunContext();
+        ctx.setUserId("user-empty-trace");
+        ctx.transitionTo(AgentState.RUNNING);
+
+        agentRunRecorder.recordStart(ctx, "直接回答，不需要工具");
+        ctx.setFinalAnswer("答案");
+        ctx.transitionTo(AgentState.SUCCEEDED);
+        agentRunRecorder.recordFinish(ctx, null, 1L);
+
+        AgentRunEntity saved = findRun(ctx.getRunId().toString());
+        assertThat(saved).isNotNull();
+        assertThat(saved.getToolTrace()).isNull();
+    }
+
+    // ===== HTTP 辅助方法 =====
     private CompletableFuture<HttpResponse<String>> requestAgentSseAsync(
             String userId,
             String message

@@ -23,6 +23,14 @@ public class AgentRunVO {
 
     private Integer toolCallCount;
 
+    /**
+     * 工具名执行序列（逗号分隔，按执行顺序，不含参数与结果原文）。
+     *
+     * 前端可据此画出任务轨迹，例如：
+     * web_search → web_search → web_scrape → terminate_task。
+     */
+    private String toolTrace;
+
     private String finalAnswer;
 
     private String errorMessage;
@@ -58,6 +66,7 @@ public class AgentRunVO {
         vo.state = entity.getState();
         vo.currentStep = entity.getCurrentStep();
         vo.toolCallCount = entity.getToolCallCount();
+        vo.toolTrace = entity.getToolTrace();
         vo.finalAnswer = entity.getFinalAnswer();
         vo.errorMessage = entity.getErrorMessage();
         vo.model = entity.getModel();
@@ -97,6 +106,10 @@ public class AgentRunVO {
 
     public Integer getToolCallCount() {
         return toolCallCount;
+    }
+
+    public String getToolTrace() {
+        return toolTrace;
     }
 
     public String getFinalAnswer() {

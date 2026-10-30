@@ -84,7 +84,7 @@
 
 ```text
 ctx.transitionTo(RUNNING)  ──recordStart──▶   DB insert RUNNING
-每轮 step 结束            ──recordProgress──▶ DB update current_step / tool_call_count
+每轮 step 结束            ──recordProgress──▶ DB update current_step / tool_call_count / tool_trace
 finally（任务线程）        ──recordFinish──▶   DB update 终态 + finished_at + total_cost_millis
 ```
 
@@ -129,7 +129,7 @@ sequenceDiagram
     loop 每轮 step
         B->>B: think + act（工具调用计数）
         B->>R: recordProgress(ctx)
-        R->>DB: update current_step / tool_call_count
+        R->>DB: update current_step / tool_call_count / tool_trace
     end
     B->>B: finally
     B->>R: recordFinish(ctx, errorMessage, cost)
@@ -200,6 +200,7 @@ CREATE TABLE IF NOT EXISTS agent_run
     state             VARCHAR(32)  NOT NULL,
     current_step      INT          NOT NULL DEFAULT 0,
     tool_call_count   INT          NOT NULL DEFAULT 0,
+    tool_trace        TEXT,
     final_answer      TEXT,
     error_message     TEXT,
     started_at        TIMESTAMP,
@@ -209,6 +210,13 @@ CREATE TABLE IF NOT EXISTS agent_run
     updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pk_agent_run PRIMARY KEY (id)
 );
+
+-- 存量表增量升级（幂等）：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS model VARCHAR(64);
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS prompt_tokens BIGINT;
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS completion_tokens BIGINT;
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS total_tokens BIGINT;
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS tool_trace TEXT;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_run_run_id ON agent_run (run_id);
 CREATE INDEX IF NOT EXISTS idx_agent_run_user_id ON agent_run (user_id);
@@ -225,6 +233,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_run_created_at ON agent_run (created_at);
 | `user_prompt` | 用户输入，截断 4000 字符 | **不保存系统提示词** |
 | `state` | 与 `AgentState` 枚举名一致 | — |
 | `current_step` / `tool_call_count` | 进度指标，每轮 step 更新 | — |
+| `tool_trace` | 工具名执行序列（逗号分隔，如 `web_search,web_scrape,terminate_task`），进度与终态各写一次 | **不含参数与结果原文**；失败的工具调用同样记录 |
 | `final_answer` | 最终回答，截断 20000 字符 | — |
 | `error_message` | 脱敏异常摘要（异常类型 + 消息，无堆栈），截断 2000 字符 | **不含堆栈 / 敏感信息** |
 | `started_at` / `finished_at` / `total_cost_millis` | 起止时间与总耗时 | — |

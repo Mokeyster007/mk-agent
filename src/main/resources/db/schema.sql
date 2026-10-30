@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS agent_run
     state             VARCHAR(32)  NOT NULL,
     current_step      INT          NOT NULL DEFAULT 0,
     tool_call_count   INT          NOT NULL DEFAULT 0,
+    tool_trace        TEXT,
     final_answer      TEXT,
     error_message     TEXT,
     model             VARCHAR(64),
@@ -48,6 +49,11 @@ ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS prompt_tokens BIGINT;
 ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS completion_tokens BIGINT;
 ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS total_tokens BIGINT;
 
+-- 工具轨迹：按执行顺序的工具名序列（逗号分隔），
+-- 例如 "web_search,web_search,web_scrape,terminate_task"。
+-- 只存工具名，绝不存参数或结果原文（避免搜索词、路径、密钥入库）。
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS tool_trace TEXT;
+
 -- run_id 唯一索引：按业务键查询任务（幂等）。
 CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_run_run_id
     ON agent_run (run_id);
@@ -72,6 +78,7 @@ COMMENT ON COLUMN agent_run.user_prompt IS '用户输入的任务（不保存系
 COMMENT ON COLUMN agent_run.state IS '任务状态：RUNNING / SUCCEEDED / FAILED / CANCELLED / TIMED_OUT / MAX_STEPS_REACHED';
 COMMENT ON COLUMN agent_run.current_step IS '已执行的 Agent Loop 轮数';
 COMMENT ON COLUMN agent_run.tool_call_count IS '累计工具调用次数';
+COMMENT ON COLUMN agent_run.tool_trace IS '工具名执行序列（逗号分隔，如 web_search,web_scrape,terminate_task；不含参数与结果）';
 COMMENT ON COLUMN agent_run.final_answer IS '模型最终回答';
 COMMENT ON COLUMN agent_run.error_message IS '脱敏后的失败原因摘要（不含堆栈）';
 COMMENT ON COLUMN agent_run.model IS '本次任务实际使用的模型名（来自模型响应 metadata）';

@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 /**
  * AgentRun 生命周期记录器：把 Agent 任务关键节点写入 agent_run 表。
@@ -22,7 +23,8 @@ import java.time.LocalDateTime;
  *    - recordProgress：每完成一轮 step（每轮一次，不是每个 token）
  *    - recordFinish：任务终态（一次）
  * 3. 不保存 API Key、系统提示词、Cookie、敏感工具原始结果；
- *    userPrompt 只保存用户输入，errorMessage 只保存脱敏摘要。
+ *    userPrompt 只保存用户输入，errorMessage 只保存脱敏摘要；
+ *    toolTrace 只保存工具名序列（不含参数与结果原文）。
  */
 @Component
 public class AgentRunRecorder {
@@ -38,6 +40,15 @@ public class AgentRunRecorder {
     private static final int MAX_FINAL_ANSWER_LENGTH = 20000;
 
     private static final int MAX_ERROR_MESSAGE_LENGTH = 2000;
+
+    /**
+     * 工具轨迹最大长度。
+     *
+     * 正常轨迹很短（maxToolCalls 默认 12 个工具名 ≈ 200 字符），
+     * 这里的上限只是防御：万一将来放开工具次数，
+     * 也不会让一行 TEXT 无限增长。
+     */
+    private static final int MAX_TOOL_TRACE_LENGTH = 2000;
 
     private final AgentRunMapper agentRunMapper;
 
@@ -75,19 +86,27 @@ public class AgentRunRecorder {
     }
 
     /**
-     * 每完成一轮 step：同步 current_step / tool_call_count / state。
+     * 每完成一轮 step：同步 current_step / tool_call_count / tool_trace / state。
      *
      * 注意：只在每轮 step 结束后调用一次，
      * 绝不在 token / chunk 级别调用，避免高频写库。
      */
     public void recordProgress(AgentRunContext ctx) {
         try {
+            String toolTrace = toolTraceOf(ctx);
+
             LambdaUpdateWrapper<AgentRunEntity> wrapper =
                     new LambdaUpdateWrapper<AgentRunEntity>()
                             .eq(AgentRunEntity::getRunId, ctx.getRunId().toString())
                             .set(AgentRunEntity::getState, ctx.getState().name())
                             .set(AgentRunEntity::getCurrentStep, ctx.getCurrentStep())
                             .set(AgentRunEntity::getToolCallCount, ctx.getToolCallCount())
+                            /*
+                             * 轨迹为空时不写：保持 NULL，
+                             * 与"还没调用过工具"语义一致（区分空串与未发生）。
+                             */
+                            .set(toolTrace != null,
+                                    AgentRunEntity::getToolTrace, toolTrace)
                             .set(AgentRunEntity::getUpdatedAt, LocalDateTime.now());
 
             agentRunMapper.update(null, wrapper);
@@ -118,6 +137,7 @@ public class AgentRunRecorder {
                     ctx.getFinalAnswer(), MAX_FINAL_ANSWER_LENGTH);
             String safeErrorMessage = truncate(
                     errorMessage, MAX_ERROR_MESSAGE_LENGTH);
+            String toolTrace = toolTraceOf(ctx);
 
             LambdaUpdateWrapper<AgentRunEntity> wrapper =
                     new LambdaUpdateWrapper<AgentRunEntity>()
@@ -125,6 +145,12 @@ public class AgentRunRecorder {
                             .set(AgentRunEntity::getState, ctx.getState().name())
                             .set(AgentRunEntity::getCurrentStep, ctx.getCurrentStep())
                             .set(AgentRunEntity::getToolCallCount, ctx.getToolCallCount())
+                            /*
+                             * 终态也写一次轨迹：最后一轮 step 之后不会再触发
+                             * recordProgress，漏写会丢掉"最后一个工具"。
+                             */
+                            .set(toolTrace != null,
+                                    AgentRunEntity::getToolTrace, toolTrace)
                             .set(finalAnswer != null,
                                     AgentRunEntity::getFinalAnswer, finalAnswer)
                             .set(safeErrorMessage != null,
@@ -166,6 +192,22 @@ public class AgentRunRecorder {
 
     private String agentTypeName(AgentType agentType) {
         return agentType == null ? "UNKNOWN" : agentType.name();
+    }
+
+    /**
+     * 把 ctx 上的工具轨迹拼成逗号分隔的一行。
+     *
+     * 数据源就是 {@code AgentRunContext.toolTrace}（只含工具名），
+     * 因此这里不可能泄露参数或结果原文。
+     *
+     * @return 轨迹为空时返回 null（调用方据此不写列，保持 NULL）
+     */
+    private String toolTraceOf(AgentRunContext ctx) {
+        List<String> trace = ctx.getToolTrace();
+        if (trace == null || trace.isEmpty()) {
+            return null;
+        }
+        return truncate(String.join(",", trace), MAX_TOOL_TRACE_LENGTH);
     }
 
     private String truncate(String value, int maxLength) {

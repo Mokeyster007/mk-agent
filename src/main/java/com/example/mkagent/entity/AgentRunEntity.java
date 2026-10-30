@@ -62,6 +62,19 @@ public class AgentRunEntity {
     private Integer toolCallCount;
 
     /**
+     * 工具名执行序列（逗号分隔），按实际执行顺序记录。
+     *
+     * 例如 {@code "web_search,web_search,web_scrape,terminate_task"}。
+     * 只记录工具名，**不包含任何参数或结果原文**——
+     * 搜索词、文件路径、密钥不会因此进入数据库。
+     *
+     * 数据来源：{@code AgentRunContext.toolTrace}，
+     * 由 ToolCallAgent.act() 每执行完一个工具追加一次，
+     * 失败的工具调用同样记录（模型看到了失败结果，也是轨迹的一部分）。
+     */
+    private String toolTrace;
+
+    /**
      * 模型最终回答。
      */
     private String finalAnswer;
@@ -163,6 +176,14 @@ public class AgentRunEntity {
 
     public void setToolCallCount(Integer toolCallCount) {
         this.toolCallCount = toolCallCount;
+    }
+
+    public String getToolTrace() {
+        return toolTrace;
+    }
+
+    public void setToolTrace(String toolTrace) {
+        this.toolTrace = toolTrace;
     }
 
     public String getFinalAnswer() {
