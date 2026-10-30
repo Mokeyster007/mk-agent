@@ -3,6 +3,7 @@ package com.example.mkagent.resilience;
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.support.FakeChatModel;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -21,7 +22,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.net.URI;
@@ -56,28 +56,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 可重试工具在临时失败后被自动重试并成功，
  * 任务最终正常产出 final_answer，模型无感知（不需要重新决策）。
  */
-@SpringBootTest(
+@HermeticSpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {
-                "spring.autoconfigure.exclude=com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                "spring.main.allow-bean-definition-overriding=true",
-                "spring.datasource.url=jdbc:h2:mem:mk_agent_retry;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1",
-                "spring.datasource.driver-class-name=org.h2.Driver",
-                "spring.datasource.username=sa",
-                "spring.datasource.password=",
-                "spring.sql.init.mode=always",
-                "spring.sql.init.schema-locations=classpath:db/schema.sql",
-                "mkagent.rag.pgvector.enabled=false",
-                // 重试退避调为 1ms，测试不被等待拖慢。
-                "mkagent.tool-retry.initial-backoff-millis=1"
-        }
+        // 重试退避调为 1ms，测试不被等待拖慢。
+        properties = "mkagent.tool-retry.initial-backoff-millis=1"
 )
-@ActiveProfiles("local")
 @Timeout(60)
 class ToolRetryIntegrationTest {
 

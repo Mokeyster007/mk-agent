@@ -5,6 +5,7 @@ import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.mockito.Mockito;
@@ -22,7 +23,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.net.URI;
@@ -59,33 +59,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 6. SSE 收到 cancelled 事件；
  * 7. 取消不存在 / 已结束的任务返回明确业务错误。
  */
-@SpringBootTest(
-        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {
-                "spring.autoconfigure.exclude=com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        // 排除 MCP 客户端自动配置：启动时会真实连接外部 MCP 服务，
-                        // 测试环境不依赖 MCP，chatApp 需要的 ToolCallbackProvider 由测试桩提供。
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                // 测试配置需要覆盖用户配置类的同名 Bean（如 chatAppDocumentLoader）
-                "spring.main.allow-bean-definition-overriding=true",
-                // AgentRun 持久化使用 H2 内存库（PostgreSQL 兼容模式），
-                // 测试不依赖外部数据库，也不触碰生产 RDS。
-                "spring.datasource.url=jdbc:h2:mem:mk_agent_cancel;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1",
-                "spring.datasource.driver-class-name=org.h2.Driver",
-                "spring.datasource.username=sa",
-                "spring.datasource.password=",
-                "spring.sql.init.mode=always",
-                "spring.sql.init.schema-locations=classpath:db/schema.sql",
-                // 禁用 pgvector 向量库：PgVectorStore 初始化会执行 PostgreSQL 专用的
-                // CREATE EXTENSION IF NOT EXISTS vector，H2 不支持该语法。
-                "mkagent.rag.pgvector.enabled=false"
-        }
+@HermeticSpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT
 )
-@ActiveProfiles("local")
 @Timeout(60)
 class AgentTaskCancelIntegrationTest {
 

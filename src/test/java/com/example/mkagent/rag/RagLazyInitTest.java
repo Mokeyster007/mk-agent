@@ -1,6 +1,7 @@
 package com.example.mkagent.rag;
 
 import com.example.mkagent.app.chatApp;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import com.example.mkagent.support.RagTestDoubles;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -10,11 +11,9 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -39,33 +38,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *
  * 模型与 Embedding 均为内存桩，不联网。
  */
-@SpringBootTest(
-        properties = {
-                "spring.autoconfigure.exclude="
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeEmbeddingAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                "spring.main.allow-bean-definition-overriding=true",
-                "spring.datasource.url=jdbc:h2:mem:mk_agent_rag_lazy;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1",
-                "spring.datasource.driver-class-name=org.h2.Driver",
-                "spring.datasource.username=sa",
-                "spring.datasource.password=",
-                "spring.sql.init.mode=always",
-                "spring.sql.init.schema-locations=classpath:db/schema.sql",
-                "mkagent.rag.pgvector.enabled=false",
-                "mkagent.rag.enabled=true",
-                "mkagent.rag.init-mode=lazy",
-                "spring.ai.dashscope.api-key=test-key",
-                "spring.ai.dashscope.chat.options.model=qwen-test",
-                "search-api.api-key=test-key"
-        }
-)
+@HermeticSpringBootTest(properties = {
+        "mkagent.rag.enabled=true",
+        "mkagent.rag.init-mode=lazy"
+})
 @AutoConfigureMockMvc
-@ActiveProfiles("test")
 class RagLazyInitTest {
 
     private static final AtomicInteger EMBEDDING_CALLS = new AtomicInteger();

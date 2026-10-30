@@ -14,6 +14,7 @@ import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.service.AgentRunRecorder;
 import com.example.mkagent.service.AgentRunService;
 import com.example.mkagent.support.FakeChatModel;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import com.example.mkagent.tools.DemoInventoryTool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -32,7 +33,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.net.URI;
@@ -74,35 +74,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 7. 模型 Token Usage（model / prompt / completion / total tokens）
  *    随终态持久化到 agent_run。
  */
-@SpringBootTest(
+@HermeticSpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {
-                "spring.autoconfigure.exclude=com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        // 排除 MCP 客户端自动配置：启动时会真实连接外部 MCP 服务，
-                        // 测试环境不依赖 MCP，chatApp 需要的 ToolCallbackProvider 由测试桩提供。
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                // 测试配置需要覆盖用户配置类的同名 Bean（如 chatAppDocumentLoader）
-                "spring.main.allow-bean-definition-overriding=true",
-                // AgentRun 持久化使用 H2 内存库（PostgreSQL 兼容模式）。
-                "spring.datasource.url=jdbc:h2:mem:mk_agent_persist;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1",
-                "spring.datasource.driver-class-name=org.h2.Driver",
-                "spring.datasource.username=sa",
-                "spring.datasource.password=",
-                "spring.sql.init.mode=always",
-                "spring.sql.init.schema-locations=classpath:db/schema.sql",
-                // 禁用 pgvector 向量库：PgVectorStore 初始化会执行 PostgreSQL 专用的
-                // CREATE EXTENSION IF NOT EXISTS vector，H2 不支持该语法。
-                "mkagent.rag.pgvector.enabled=false",
-                // 故意设成非默认值：验证 @Value 方法注入真的把配置灌进了 MkManus
-                // （不是只有字段默认值生效）。本类任务只有 2 步，不会触发收尾提示。
-                "mkagent.agent.budget-warning-steps=5"
-        }
+        // 故意设成非默认值：验证 @Value 方法注入真的把配置灌进了 MkManus
+        // （不是只有字段默认值生效）。本类任务只有 2 步，不会触发收尾提示。
+        properties = "mkagent.agent.budget-warning-steps=5"
 )
-@ActiveProfiles("local")
 @Timeout(90)
 class AgentRunPersistenceIntegrationTest {
 

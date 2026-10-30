@@ -2,6 +2,7 @@ package com.example.mkagent.agent;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.mockito.Mockito;
@@ -11,11 +12,9 @@ import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.util.Arrays;
@@ -41,21 +40,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *    获取不到 FileOperationTool；
  * 3. fileToolCallbacks（FILE 类型）只包含文件类工具。
  */
-@SpringBootTest(
-        properties = {
-                "spring.autoconfigure.exclude=com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        // 排除 MCP 客户端自动配置：启动时会真实连接外部 MCP 服务，
-                        // 测试环境不依赖 MCP，chatApp 需要的 ToolCallbackProvider 由测试桩提供。
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                // 测试配置需要覆盖用户配置类的同名 Bean（如 chatAppDocumentLoader）
-                "spring.main.allow-bean-definition-overriding=true"
-        }
-)
-@ActiveProfiles("local")
+@HermeticSpringBootTest
 @Timeout(60)
 class AgentToolWhitelistIntegrationTest {
 

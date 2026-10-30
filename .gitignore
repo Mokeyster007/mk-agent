@@ -12,6 +12,8 @@ tmp/
 .env.*
 # AI 助手在本项目内的记忆/会话数据，属于本机工作数据
 .workbuddy-ai/
+# 本地测试日志输出（可能包含完整堆栈与请求内容），不进版本库
+test-output.log
 
 HELP.md
 target/

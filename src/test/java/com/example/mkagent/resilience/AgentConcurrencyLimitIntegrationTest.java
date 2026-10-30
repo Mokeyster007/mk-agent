@@ -6,6 +6,7 @@ import com.example.mkagent.agent.BaseAgent;
 import com.example.mkagent.model.AgentState;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
+import com.example.mkagent.support.HermeticSpringBootTest;
 import com.example.mkagent.tools.DemoInventoryTool;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,7 +30,6 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.net.URI;
@@ -74,28 +74,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 并发任务会触发"被意外调用超过 2 轮"异常，因此这里用专用的
  * HoldingChatModel（无共享计数，天然并发安全）。
  */
-@SpringBootTest(
+@HermeticSpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {
-                "spring.autoconfigure.exclude=com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration,"
-                        + "com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration,"
-                        + "org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration",
-                "spring.main.allow-bean-definition-overriding=true",
-                "spring.datasource.url=jdbc:h2:mem:mk_agent_concurrency;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1",
-                "spring.datasource.driver-class-name=org.h2.Driver",
-                "spring.datasource.username=sa",
-                "spring.datasource.password=",
-                "spring.sql.init.mode=always",
-                "spring.sql.init.schema-locations=classpath:db/schema.sql",
-                "mkagent.rag.pgvector.enabled=false",
-                // 并发上限调低为 2，方便用小流量复现"并发已满"。
-                "mkagent.agent.max-concurrency=2"
-        }
+        // 并发上限调低为 2，方便用小流量复现"并发已满"。
+        properties = "mkagent.agent.max-concurrency=2"
 )
-@ActiveProfiles("local")
 @Timeout(60)
 class AgentConcurrencyLimitIntegrationTest {
 

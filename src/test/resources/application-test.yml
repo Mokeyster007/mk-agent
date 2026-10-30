@@ -1,0 +1,70 @@
+# =============================================================
+# 封闭式测试配置（由 @HermeticSpringBootTest → @ActiveProfiles("test") 激活）。
+#
+# 默认测试必须能在以下环境下通过：
+#   1. 本地 Docker PostgreSQL 未启动；
+#   2. 8127 MCP 服务未启动；
+#   3. 无外网。
+#
+# 这里只提供内存数据库与占位密钥，**绝不包含任何真实密钥**。
+# 真实的 application-local.yml 不参与测试：
+# application.yml 里的 spring.profiles.active=local 会被测试的
+# ActiveProfiles/inlined properties 覆盖为 test。
+# =============================================================
+spring:
+  # 覆盖 application.yml 的同名列表（该属性整体替换，不合并），
+  # 因此必须把生产已经排除的 DashScopeChatAutoConfiguration 一并列出。
+  autoconfigure:
+    exclude:
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration
+      # 真实 Embedding 模型会与 RAG 测试里的同名桩 Bean 冲突并被覆盖，
+      # 进而用占位密钥发起真实请求（401）。测试统一使用桩或 mock。
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeEmbeddingAutoConfiguration
+      # MCP 客户端自动配置会真实连接 mcp-servers.json / 8127。
+      - org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration
+      # Spring AI 自带的 pgvector 自动配置会创建 vectorStore Bean，
+      # 在 H2 下既无意义又会强制要求 EmbeddingModel；测试一律关闭。
+      - org.springframework.ai.vectorstore.pgvector.autoconfigure.PgVectorStoreAutoConfiguration
+
+  ai:
+    mcp:
+      client:
+        # 双保险：即使自动配置被排除，也不允许尝试建立 MCP 连接。
+        enabled: false
+    dashscope:
+      # 占位密钥：只用于满足 @Value / 属性绑定，不会发起真实模型调用。
+      api-key: test-key
+      chat:
+        options:
+          model: qwen-test
+
+  datasource:
+    url: jdbc:h2:mem:mk_agent_test;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  sql:
+    init:
+      # 每个上下文启动时执行幂等建表脚本。
+      mode: always
+      schema-locations: classpath:db/schema.sql
+
+  main:
+    # 测试配置需要覆盖生产配置类的同名 Bean（如 chatAppDocumentLoader）。
+    allow-bean-definition-overriding: true
+
+mkagent:
+  rag:
+    pgvector:
+      # H2 没有 vector 扩展；测试统一使用内存向量库或 mock。
+      enabled: false
+
+search-api:
+  # 占位密钥：搜索工具在测试中不会被真正调用。
+  api-key: test-key
+  engine: baidu
