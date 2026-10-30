@@ -27,11 +27,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * FileBasedChatMemory 单元测试。
  *
- * 覆盖四类风险（全部离线，使用临时目录）：
+ * 覆盖六类风险（全部离线，使用临时目录）：
  * 1. 并发写同一会话不丢消息（Kryo 线程安全 + 会话级锁）；
  * 2. 非法 conversationId 被拒绝（路径穿越防护）；
  * 3. 写入中途失败不破坏原文件（临时文件 + 原子替换）；
- * 4. get() 返回副本，调用方修改不影响已持久化内容。
+ * 4. get() 返回副本，调用方修改不影响已持久化内容；
+ * 5. 损坏的 .kryo 文件读取失败时抛 500 业务异常且不回显路径；
+ * 6. clear() 删除失败时抛 500 业务异常且原目标保持完好。
  */
 class FileBasedChatMemoryUnitTest {
 
@@ -214,5 +216,70 @@ class FileBasedChatMemoryUnitTest {
         // clear 后为空。
         memory.clear(conversationId);
         assertTrue(memory.get(conversationId).isEmpty());
+    }
+
+    @Test
+    void corruptedKryoFileFailsWithBusinessExceptionWithoutLeakingPath()
+            throws IOException {
+        Path memoryDir = tempDir.resolve("memory");
+        FileBasedChatMemory memory = new FileBasedChatMemory(memoryDir.toString());
+
+        String conversationId = "conv-corrupted";
+        Path file = memoryDir.resolve(conversationId + ".kryo");
+
+        /*
+         * 非 Kryo 格式的字节：readObject 必然失败。
+         * 这里验证的是“反序列化异常被收敛为 500 业务异常”，
+         * 而不是把 KryoException 直接抛给调用方。
+         */
+        Files.writeString(file, "not-a-kryo-payload");
+
+        BusinessException e = assertThrows(
+                BusinessException.class,
+                () -> memory.get(conversationId),
+                "损坏的 .kryo 必须被转换为业务异常"
+        );
+
+        assertEquals(500, e.getHttpStatus());
+        assertEquals("会话记忆读写失败", e.getMessage());
+        assertFalse(
+                e.getMessage().contains(memoryDir.toString()),
+                "异常信息不得包含文件绝对路径"
+        );
+    }
+
+    @Test
+    void clearFailurePropagatesBusinessExceptionWithoutBreakingTarget()
+            throws IOException {
+        Path memoryDir = tempDir.resolve("memory");
+        FileBasedChatMemory memory = new FileBasedChatMemory(memoryDir.toString());
+
+        String conversationId = "conv-clear-fails";
+
+        /*
+         * 把目标做成“非空目录”：
+         * deleteIfExists 会因目录非空而失败，
+         * 从而稳定复现删除异常（不依赖操作系统权限差异）。
+         */
+        Path target = memoryDir.resolve(conversationId + ".kryo");
+        Files.createDirectories(target);
+        Path sentinel = target.resolve("keep.txt");
+        Files.writeString(sentinel, "原有内容");
+
+        BusinessException e = assertThrows(
+                BusinessException.class,
+                () -> memory.clear(conversationId)
+        );
+
+        assertEquals(500, e.getHttpStatus());
+        assertEquals("会话记忆读写失败", e.getMessage());
+        assertFalse(
+                e.getMessage().contains(memoryDir.toString()),
+                "异常信息不得包含文件绝对路径"
+        );
+
+        // 删除失败后目标应保持原样，不能出现“半删除”。
+        assertTrue(Files.isDirectory(target));
+        assertEquals("原有内容", Files.readString(sentinel));
     }
 }
