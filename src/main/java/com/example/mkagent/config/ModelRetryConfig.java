@@ -4,8 +4,10 @@ import com.example.mkagent.resilience.ModelRetryLoggingListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.retry.TransientAiException;
+import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Scope;
 import org.springframework.retry.backoff.BackOffPolicy;
 import org.springframework.retry.backoff.ExponentialBackOffPolicy;
 import org.springframework.retry.support.RetryTemplate;
@@ -36,6 +38,34 @@ import org.springframework.web.client.ResourceAccessException;
  * 注意：429 默认会被 ResponseErrorHandler 归为 4xx → NonTransientAiException，
  * 所以 application.yml 里额外配置了 spring.ai.retry.on-http-codes: 429，
  * 让 429 归类为 TransientAiException，与 5xx 走同一条可重试路径。
+ *
+ * ================== 为什么这个 Bean 是 prototype ==================
+ *
+ * 真实故障复盘（400 被重试 8 次、每次间隔 15 秒）的根因不在本类，
+ * 而在 spring-ai-alibaba 的 DashScopeImageModel 构造器里——它会把传进来的
+ * RetryTemplate **原地改写**（反编译 1.0.0.2 得到，非猜测）：
+ *
+ * <pre>
+ * SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy(10);
+ * FixedBackOffPolicy backOffPolicy = new FixedBackOffPolicy();
+ * backOffPolicy.setBackOffPeriod(15000L);
+ * retryTemplate.setRetryPolicy(retryPolicy);      // ← 改的是共享 Bean
+ * retryTemplate.setBackOffPolicy(backOffPolicy);  // ← 改的是共享 Bean
+ * </pre>
+ *
+ * 于是"容器里只有一个 RetryTemplate Bean"这件事本身成了 bug 的放大器：
+ * 对话模型先创建、图片模型后创建，图片模型一构造，
+ * 对话模型手里的模板（同一个对象）就变成了"10 次 + 固定 15 秒 + 连 Exception 都重试"。
+ * 启动日志仍然打印着 maxAttempts=3，因为它打印的是构建时的快照。
+ *
+ * 两道防线：
+ * 1. 对话模型不再注入本 Bean，而是在 DashScopeChatModelConfig 里自行构建
+ *    （模型实例与容器彻底解耦，见该类注释）；
+ * 2. 本 Bean 改为 prototype：每个消费方（Embedding、Image 等）各拿一个实例，
+ *    谁改写都不影响别人。策略仍然统一来自 mkagent.model-retry.*，
+ *    差别只是"不再共享同一个可变对象"。
+ *
+ * 对应的回归测试：DashScopeImageModelRetryPoisoningTest。
  */
 @Configuration
 public class ModelRetryConfig {
@@ -44,12 +74,17 @@ public class ModelRetryConfig {
             LoggerFactory.getLogger(ModelRetryConfig.class);
 
     /**
-     * 全局模型调用重试模板。
+     * 模型调用重试模板。
      *
-     * 同时被 DashScope 的对话模型与 Embedding 模型使用，
-     * 因此策略必须是"对交互式调用友好"的有限重试。
+     * 作用域是 prototype，不是 singleton —— 原因见类注释：
+     * DashScopeImageModel 会原地 setRetryPolicy/setBackOffPolicy 改写传进去的模板，
+     * 共享单例会让"图片模型一构造，对话模型的重试策略就被改掉"。
+     *
+     * 每个消费方拿到的策略仍然完全一致（都来自 mkagent.model-retry.*），
+     * 只是不再共享同一个可变对象。
      */
     @Bean
+    @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
     public RetryTemplate retryTemplate(ModelRetryProperties properties) {
         RetryTemplate retryTemplate = build(properties);
 

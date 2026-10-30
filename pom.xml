@@ -43,6 +43,24 @@
             需要跑 live 测试时用 -Plive 把该值覆盖成 none（见 build/profiles）。
         -->
         <mkagent.test.excluded-groups>live</mkagent.test.excluded-groups>
+
+        <!--
+            测试 JVM 参数（surefire argLine）。
+
+            为什么要固化：可用物理内存偏紧时，默认参数的 forked VM 会直接崩溃
+            （"Native memory allocation (malloc) failed ... for Chunk::new"、
+            "The forked VM terminated without properly saying goodbye"），
+            整轮测试中途中断，看起来像测试失败，其实是环境问题。
+
+            - -Xmx512m：压小堆，给原生内存留空间；
+            - -XX:+UseSerialGC：不预留 G1 的分区虚拟空间；
+            - -XX:TieredStopAtLevel=1：只用 C1，不启用 C2。崩溃点是 C2 编译器的
+              原生内存池（Chunk::new），测试场景不需要 C2 的极致优化。
+
+            需要更大堆时用属性覆盖（不要用 -DargLine，见 docs/COST.md）：
+              ./mvnw test -Dmkagent.test.jvm-args="-Xmx1g"
+        -->
+        <mkagent.test.jvm-args>-Xmx512m -XX:+UseSerialGC -XX:TieredStopAtLevel=1</mkagent.test.jvm-args>
     </properties>
 
     <dependencyManagement>
@@ -85,6 +103,19 @@
             <groupId>com.alibaba</groupId>
             <artifactId>dashscope-sdk-java</artifactId>
             <version>2.19.1</version>
+            <exclusions>
+                <!--
+                    dashscope-sdk-java 会把 slf4j-simple 作为 compile 依赖带进来。
+                    classpath 上同时存在 logback 与 slf4j-simple 时，SLF4J 会在启动时打印
+                    "Class path contains multiple SLF4J providers" 警告，
+                    且绑定结果取决于加载顺序（可能变成 simple 输出、丢掉 logback 配置）。
+                    这里排除掉，只保留 Spring Boot 默认的 logback。
+                -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-simple</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
 
         <!-- Spring AI Alibaba：自动配置 DashScope ChatModel、EmbeddingModel 等 -->
@@ -257,6 +288,12 @@
                         不能因为"顺手跑了全量测试"就默默花钱。
                     -->
                     <excludedGroups>${mkagent.test.excluded-groups}</excludedGroups>
+
+                    <!--
+                        堆参数走属性（mkagent.test.jvm-args），便于按机器覆盖；
+                        用属性而不是直接写死，避免每次在命令行手敲一长串。
+                    -->
+                    <argLine>${mkagent.test.jvm-args}</argLine>
                 </configuration>
             </plugin>
 

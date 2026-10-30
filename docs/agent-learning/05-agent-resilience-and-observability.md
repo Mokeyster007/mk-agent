@@ -692,8 +692,10 @@ DashScopeChatAutoConfiguration#dashscopeChatModel(RetryTemplate retryTemplate, .
 
 > 若日志里出现 `FixedBackOffPolicy`、间隔约 15 秒，那不是 Spring AI 1.0.0 的默认值
 > （默认构造的是 `ExponentialBackOffPolicy`；`RetryUtils.SHORT_RETRY_TEMPLATE`
-> 是固定 100ms）。它只能来自本地覆盖（`spring.ai.retry.*`）或本地自定义 Bean。
-> 本次改造后项目显式持有 `RetryTemplate`，并在启动时打印生效策略，这类"隐形覆盖"不会再发生。
+> 是固定 100ms）。它来自 `DashScopeImageModel` 的构造器——该构造器会对传进来的
+> `RetryTemplate` **原地**调用 `setRetryPolicy(new SimpleRetryPolicy(10))` 与
+> `setBackOffPolicy(fixedBackOff(15000))`，把共享实例改成"10 次 + 15 秒 + 连
+> `Exception` 都重试"。第一次修复之所以没生效，就是因为这一点，见 13.7。
 
 ### 13.2 现在的策略：只重试"可能自愈"的失败
 
@@ -761,7 +763,7 @@ Spring MVC 视为"已处理、无需响应体"，只记一行 WARN。
 ### 13.6 验证
 
 ```bash
-./mvnw -o test -Dtest='ModelRetryPolicyTest,ModelRetryWiringTest,ModelRetryLoggingListenerTest,ToolCallAgentModelFailureTest,GlobalExceptionHandlerAsyncTimeoutTest'
+./mvnw -o test -Dtest='ModelRetryPolicyTest,ModelRetryWiringTest,ModelRetryLoggingListenerTest,ToolCallAgentModelFailureTest,GlobalExceptionHandlerAsyncTimeoutTest,DashScopeChatModelRetryWiringTest,DashScopeImageModelRetryPoisoningTest,ModelRetryProductionWiringTest'
 ```
 
 | 测试类 | 覆盖 |
@@ -771,3 +773,55 @@ Spring MVC 视为"已处理、无需响应体"，只记一行 WARN。
 | `ModelRetryLoggingListenerTest` | 单行摘要、截断、密钥打码 |
 | `ToolCallAgentModelFailureTest` | 400 → 1 次调用、FAILED、脱敏 error 事件、耗时远小于超时 |
 | `GlobalExceptionHandlerAsyncTimeoutTest` | 异步超时不写响应体、不触碰已 committed 响应 |
+
+### 13.7 复盘：为什么第一版修复没生效
+
+第一版只做了一件事：定义同名 `RetryTemplate` Bean，指望
+`DashScopeChatAutoConfiguration` 通过 `@ConditionalOnMissingBean` 让位后把它注入给模型。
+启动日志也打印了 `maxAttempts=3, exponential`。但真实运行仍然是
+"400 被重试 8 次、每次间隔 15 秒、`FixedBackOffPolicy`"。
+
+定位过程（顺序很重要，值得复用）：
+
+1. **先怀疑"注入错了"，但枚举 Bean 后发现只有一个** `retryTemplate`，
+   且 Bean 定义确实来自项目的 `ModelRetryConfig`；
+2. **再怀疑"我读到的策略不是模型手里的那份"** —— 用反射读
+   `DashScopeChatModel.retryTemplate` 字段，拿到实例快照；
+3. **关键一步：在 `BeanPostProcessor#postProcessAfterInitialization` 里打快照**。
+   同一个对象（`identityHashCode` 相同）在初始化完成时是
+   `3 次 / exponential`，测试运行时却变成 `10 次 / 固定 15 秒` ——
+   说明它是在**初始化之后被别的代码改掉的**，而不是创建时就错了；
+4. 于是在 classpath 上搜"谁会调 `setRetryPolicy` / `setBackOffPolicy`"，
+   唯一命中 `DashScopeImageModel`，反编译其构造器后完全对上：
+
+```java
+SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy(10);
+FixedBackOffPolicy backOffPolicy = new FixedBackOffPolicy();
+backOffPolicy.setBackOffPeriod(15000L);
+retryTemplate.setRetryPolicy(retryPolicy);      // ← 改的是传进来的实例，不是副本
+retryTemplate.setBackOffPolicy(backOffPolicy);
+```
+
+图片模型 Bean 在对话模型之后创建，一构造就把共享模板改掉了。
+启动日志打印的是构建时的快照，所以"日志看起来完全正确"。
+
+**教训**
+
+- "配置正确" ≠ "运行时对象正确"。日志要打印**实例**状态，且最好在启动后
+  （`ApplicationRunner`）再打印一次，而不是只在构造时打印；
+- 一个可变的共享对象 + 第三方库"借用即改写"= 隐形的全局状态污染。
+  `RetryTemplate` 只有 setter、没有 getter，天生适合被这样误改；
+- 修复要选"结构性"的，而不是"再调一次参数"：
+  1. 对话模型不再注入容器 Bean，改为 `ModelRetryConfig.build(...)` 构建私有实例，
+     经 `DashScopeChatModel.Builder#retryTemplate(...)` 显式传入；
+  2. 容器 Bean 改为 **prototype**，Embedding / Image 各拿一个实例，谁改都不影响别人；
+  3. 启动自检 `ModelRetryDiagnostics` 在发现 `FixedBackOffPolicy` 或
+     `maxAttempts > 5` 时直接 WARN，并点名这个已知成因。
+
+**对应的回归测试**
+
+| 测试类 | 覆盖 |
+| --- | --- |
+| `DashScopeImageModelRetryPoisoningTest` | 复现库的原地改写；断言对话模型私有模板不受影响 |
+| `DashScopeChatModelRetryWiringTest` | 加载 DashScope 对话自动配置 + `MockRestServiceServer` 返回 400：请求只发 1 次、`ToolCallAgent` 秒级 FAILED |
+| `ModelRetryProductionWiringTest` | 完整上下文：容器 Bean 仍为 `3 次 / 指数`，且对话模型持有另一个实例 |
