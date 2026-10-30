@@ -204,9 +204,9 @@ event:done       [DONE]
 
 其它专题文档：
 
-- [`docs/agent-eval.md`](docs/agent-eval.md)：离线评测（32 条用例、确定性检查 + LLM-as-judge、整轮预算保护）
+- [`docs/agent-eval.md`](docs/agent-eval.md)：离线评测（33 条用例、确定性检查 + 引用真实性校验 + LLM-as-judge、整轮预算保护）
 - [`docs/SECURITY.md`](docs/SECURITY.md)：安全加固（SSRF 校验、密钥管理、会话 ID 校验）
-- [`docs/COST.md`](docs/COST.md)：成本控制（RAG 延迟初始化、模型重试策略与取舍、评测预算）
+- [`docs/COST.md`](docs/COST.md)：成本控制（RAG 延迟初始化、模型重试策略与取舍、工具重试耗尽与站点级熔断、评测预算、模型分层、工具配置/输出上限/日志治理、任务轨迹落库与预算耗尽收尾）
 
 ---
 

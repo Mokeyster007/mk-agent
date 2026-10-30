@@ -7,6 +7,7 @@ import com.example.mkagent.tools.ToolEventMessageProvider;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -108,4 +109,26 @@ public class MkManus extends ToolCallAgent {
     protected AgentType getAgentType() {
         return AgentType.MANUS;
     }
+
+    /**
+     * 剩余步数提示阈值（配置项 mkagent.agent.budget-warning-steps，默认 2）。
+     *
+     * 用 @Value 方法注入而不是加构造参数：
+     * EvalAgent 通过 super(...) 手动创建，加参数会逼它传一份硬编码值，
+     * 而评测希望复用生产的默认值。方法注入只对 Spring Bean 生效，
+     * 因此 EvalAgent 不受影响（保持 ToolCallAgent 的默认值）。
+     */
+    @Value("${mkagent.agent.budget-warning-steps:2}")
+    public void applyBudgetWarningSteps(int budgetWarningSteps) {
+        setBudgetWarningSteps(budgetWarningSteps);
+    }
+
+    /**
+     * 预算耗尽后是否强制收尾（配置项 mkagent.agent.force-final-answer，默认 true）。
+     */
+    @Value("${mkagent.agent.force-final-answer:true}")
+    public void applyForceFinalAnswer(boolean forceFinalAnswer) {
+        setForceFinalAnswer(forceFinalAnswer);
+    }
+
 }

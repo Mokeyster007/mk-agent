@@ -249,6 +249,13 @@ public abstract class BaseAgent {
              */
             finishIfStillRunning(ctx);
 
+            /*
+             * 预算耗尽且没有最终回答时，给子类一次"不带工具再问一次"的机会。
+             * 必须在 finishIfStillRunning 之后调用：终态已经确定，
+             * 收尾只补 finalAnswer，不改状态。
+             */
+            applyBudgetFallback(ctx);
+
             if (ctx.getState() == AgentState.MAX_STEPS_REACHED) {
                 stepResults.add(
                         "安全停止：达到最大步骤数或最大工具调用次数限制。"
@@ -486,9 +493,22 @@ public abstract class BaseAgent {
                 }
 
                 /*
-                 * 仅在成功完成且有最终回答时推送 final_answer。
+                 * 预算耗尽且无最终回答：给子类一次不带工具的收尾调用。
+                 * 放在状态事件之后、final_answer 事件之前，
+                 * 保证前端先看到"为什么停止"，再看到"尽力而为的答案"。
                  */
-                if (ctx.getState() == AgentState.SUCCEEDED
+                applyBudgetFallback(ctx);
+
+                /*
+                 * 推送 final_answer 事件。
+                 *
+                 * 除了 SUCCEEDED，MAX_STEPS_REACHED 也要推：
+                 * 强制收尾会在预算耗尽时补一个 finalAnswer，
+                 * 不推的话用户只能看到"安全停止"，答案永远到不了前端。
+                 * 失败/取消/超时不推（这些情况下没有可信答案）。
+                 */
+                if ((ctx.getState() == AgentState.SUCCEEDED
+                        || ctx.getState() == AgentState.MAX_STEPS_REACHED)
                         && ctx.getFinalAnswer() != null
                         && !ctx.getFinalAnswer().isBlank()) {
                     sendEvent(
@@ -754,6 +774,19 @@ public abstract class BaseAgent {
      * - 失败时保持 ctx.finalAnswer 为空，让调用方回退到步骤摘要。
      */
     protected void onBudgetExhausted(AgentRunContext ctx) {
+    }
+
+    /**
+     * 终态判定之后调用：预算耗尽且无最终回答时，给子类一次强制收尾的机会。
+     */
+    private void applyBudgetFallback(AgentRunContext ctx) {
+        if (ctx.getState() != AgentState.MAX_STEPS_REACHED) {
+            return;
+        }
+        if (ctx.getFinalAnswer() != null && !ctx.getFinalAnswer().isBlank()) {
+            return;
+        }
+        onBudgetExhausted(ctx);
     }
 
     /**

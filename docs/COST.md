@@ -182,6 +182,77 @@ spring:
 但工具失败文案必须与可重试语义对齐（`网页抓取失败：` 可重试、`网页抓取被拒绝：` 不重试），
 否则 SSRF 拒绝也会被当成抖动重试，纯属烧钱。
 
+### 2.7 重试耗尽之后：`return` 而不是 `throw`
+
+`mkagent.tool-retry.on-exhausted` 决定耗尽后的行为，默认 `return`：
+
+| 值 | 行为 | 任务终态 |
+| --- | --- | --- |
+| `return`（默认） | 返回一条脱敏失败文案作为工具结果 | 任务继续，由模型决定下一步 |
+| `throw` | 向上抛异常 | 任务直接 `FAILED`（旧行为，仅用于回滚） |
+
+真实运行里触发过这个问题：`web_scrape` 抓 GitHub 超时，三次尝试耗尽后抛异常，
+异常从 `ToolCallingManager` 一路冒到 Agent Loop，整个任务被判 `FAILED`——
+用户只想要一个页面正文，结果连"换个地址再试"的机会都没有。
+
+`return` 模式下模型看到的是：
+
+```
+工具 web_scrape 多次尝试仍失败：Read timed out。请换用其他方式，或在无法完成时调用 terminate_task
+```
+
+文案有三个要素缺一不可：**哪个工具**失败、**简短原因**（单行、脱敏、截断到 120 字符）、
+**下一步可以怎么做**。少了第三点，模型很容易原地重试同一个工具。
+
+成本口径不受影响：失败的那次调用**仍然计入** `toolCallCount` 与 `maxToolCalls`，
+所以"最多 12 次工具调用"的预算没有被这个改动放大；
+`ERROR` 日志也只记一行（换行与堆栈全部折叠）。
+
+### 2.8 站点级熔断：`mkagent.tool-retry.max-exhausted-per-target`
+
+`return` 解决了"一次失败不要终止任务"，但没有解决**同一个站点被反复撞**。
+真实数据里有一条 `MAX_STEPS_REACHED`、**28308 Token** 的任务：
+模型看到"多次尝试仍失败"后换个路径、换个查询词，继续打同一个打不开的主机，
+把 8 步预算全部烧在一个 URL 上。
+
+因此按 **(工具名, 目标主机)** 统计耗尽次数，默认阈值 2：
+
+| 次数 | 行为 |
+| --- | --- |
+| 第 1、2 次耗尽 | 正常返回失败文案（同 2.7），计数 +1 |
+| 达到阈值后 | **不再执行底层工具**，直接返回熔断文案，`WARN` 记一行 |
+
+模型看到的是：
+
+```
+该站点连续失败，请换用其他来源或在无法完成时调用 terminate_task
+（工具 web_scrape，目标 github.com，已连续重试耗尽 2 次，本次未再执行）
+```
+
+三个设计取舍：
+
+1. **按主机而不是按 URL**：`github.com/a` 与 `github.com/b` 算同一个目标。
+   "站点打不开"是主机级现象，按路径区分会让熔断形同虚设。
+2. **中间成功一次不清零**：目标不是"连续失败次数"，而是"别再撞这个站点"。
+   偶发一次成功不代表站点已恢复。
+3. **解析不出主机时退化为按工具名计数**：`web_search` 的参数只有 `query`，
+   没有主机概念；搜索通道连续两次耗尽，继续搜只是继续失败。
+
+熔断的调用**仍然计入** `toolCallCount`，预算口径不变。
+设成 `0` 或负数可关闭该保护（线上临时回滚用）。
+
+计数存在 `AgentRunContext`（每任务一份），由 `ToolCallAgent.act()`
+在执行工具期间绑定到当前线程。为什么不放在工具回调的成员变量里：
+回调是 Spring 单例，`MkManus` 也是单例，实例字段会让
+"上一个任务抓 GitHub 失败"影响"下一个任务"。
+
+> 为什么不用 `ToolCallingChatOptions.toolContext` 传这个状态：
+> 它是 **Prompt 级** 的，一旦非空，框架会对所有工具回调调用
+> `call(String, ToolContext)`，而该接口的默认实现是"上下文非空就抛
+> `UnsupportedOperationException`（Tool context is not supported!）"。
+> 实测：`call(input, null)` 与 `call(input, 空 Map)` 正常，非空 Map 直接抛。
+> 只实现 `call(String)` 的回调会被打断，因此改用 act() 内的线程绑定。
+
 ---
 
 ## 3. 评测成本：live 隔离 + 整轮预算
@@ -255,21 +326,321 @@ src/test/resources/mockito-extensions/org.mockito.plugins.MockMaker  ->  mock-ma
 
 ---
 
-## 4. 还在计划中的降本项
+## 4. 模型分层：按用途选模型（OpenAI 兼容接口）
+
+### 4.1 为什么要分层
+
+一个 Agent 里不同调用的性价比要求完全不同：
+
+| 用途 | 典型调用 | 模型诉求 | 配置项 |
+| --- | --- | --- | --- |
+| `agent` | 主推理链、工具决策 | 强，贵一点也值 | `mkagent.model.agent` |
+| `auxiliary` | 评测评委、查询改写 | 便宜、够用、快 | `mkagent.model.auxiliary` |
+| `vision` | 看图 | 多模态 | `mkagent.model.vision` |
+
+三者共用一套 `base-url` / `api-key`，只按用途换模型名；
+`auxiliary` / `vision` 的 `name` 留空时**回退到 agent 的模型名**。
+
+### 4.2 开关：一个属性决定用哪套客户端
+
+```yaml
+mkagent:
+  model:
+    base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api-key: ${MKAGENT_MODEL_API_KEY:}
+    agent:     { name: qwen-plus }
+    auxiliary: { name: qwen-turbo, temperature: 0.0 }
+    vision:    { name: qwen-vl-plus }
+```
+
+- **不配** `base-url`：走 `DashScopeChatModelConfig`（DashScope 原生客户端），行为与之前完全一致；
+- **配了** `base-url`：走 `OpenAiCompatibleChatModelConfig`（OpenAI 兼容客户端）。
+
+两者由 `OpenAiCompatibleConditions` 保证互斥，容器里任何时刻只有一个主对话模型，
+Bean 名统一为 `dashscopeChatModel`（历史名字，**实现由配置决定**，看启动日志里的
+`purpose` / `model` / 实现类，不要靠 Bean 名判断用的是哪家）。
+
+> 为此 `application.yml` 排除了 `DashScopeChatAutoConfiguration`：
+> 它会按"类型 `DashScopeChatModel` 是否缺失"再决定要不要造一个模型，
+> 与"谁来决定重试模板"纠缠不清。模型装配现在完全由项目代码负责，
+> 第三方自动配置只保留 Embedding / Image 部分。
+
+### 4.3 成本上的实际收益
+
+- 评测评委从"用主模型打分"换成 `auxiliary` 小模型：单次 judge 成本通常降一个数量级；
+- 一轮评测里 judge 调用次数约等于用例数，这部分省下来是线性的；
+- `vision` 只在多模态场景计费，平时不参与主链路。
+
+### 4.4 一条硬约束：每个模型持有私有 `RetryTemplate`
+
+三个模型各自调用 `ModelRetryConfig.build(...)` 构建自己的模板，**绝不注入容器 Bean**。
+原因见 2.2：`DashScopeImageModel` 会原地改写传进去的 `RetryTemplate`。
+一旦共享，任何"借用即改写"的库都能改掉别处的策略，而启动日志仍然显示正确值。
+
+对应测试（断言实例，而不是只看配置）：
+
+| 测试 | 断言 |
+| --- | --- |
+| `OpenAiChatModelWiringTest` | 三个模型的模板是三个不同对象、都不是容器 Bean；容器模板被原地改写后三者策略不变 |
+| `OpenAiChatModelFallbackTest` | name 回退到 agent，但实例与模板仍独立；一个模型名都没有时启动即失败 |
+| `OpenAiCompatibleBadRequestTest` | 400 只发 1 次请求、秒级抛 `NonTransientAiException` |
+
+---
+
+## 5. 工具配置、输出上限与日志治理
+
+### 5.1 搜索引擎：`search-api.engine`
+
+`WebSearchTool` 构造请求时把 `engine` 传给 searchapi.io，默认 `baidu`。
+
+| 场景 | 建议值 | 原因 |
+| --- | --- | --- |
+| 中文资讯、国内站点、通用查询 | `baidu`（默认） | 中文召回好，配额口径与既有行为一致 |
+| 英文官方文档（Spring AI / OpenAI / MDN / GitHub） | `google` | 百度对英文技术文档的索引覆盖与排序明显偏弱，换 `google` 后同样一条查询的**有效结果更多**，模型少绕弯路 |
+
+为什么这和成本有关：搜不到正确文档 → 模型反复改写关键词重搜 → 每次都是一次
+`web_search` 调用 + 一轮模型调用。选错引擎的代价不是单价，而是**轮数**。
+
+切换方式（不需要改代码）：
+
+```yaml
+search-api:
+  engine: google
+```
+
+`api-key` 属于密钥，只放在 `application-local.yml`，不进版本库。
+
+### 5.2 抓取超时：`mkagent.tools.web-scrape.timeout-ms`
+
+默认 `10000`（10 秒）。GitHub、MDN 这类境外站点首字节返回慢，
+10 秒容易稳定超时，进而触发工具重试耗尽（见 2.7）。
+
+```yaml
+mkagent:
+  tools:
+    web-scrape:
+      timeout-ms: 30000
+```
+
+非正数会被忽略并回退到默认值，避免误配成 `0` 导致每次抓取必然失败。
+
+### 5.3 日志治理：把 INFO 留给"每步都要看"的东西
+
+真实运行里日志被两类内容淹没，两处都改了：
+
+| 位置 | 旧行为 | 新行为 |
+| --- | --- | --- |
+| `当前提供给模型的工具` | 每个 step 都 INFO，8 步 × 3 工具 = 24 行 | 只在**第一步** INFO 打一次摘要，其余 DEBUG |
+| `工具实际执行完成` | INFO 全量打印原始结果（网页正文上千字符） | INFO 截断到 **200 字符**（并标出原始长度），完整内容只在 DEBUG |
+
+工具清单在整个任务期间不会变化，重复打印只是噪声；
+而工具结果的长度与 token 量同阶，按 INFO 全量落盘会让日志体积失控。
+需要排查"模型为什么没选某个工具"或"工具到底返回了什么"时，把
+`com.example.mkagent.agent` 调到 DEBUG 即可。
+
+### 5.4 工具结果必须先解码再分析
+
+`@Tool` 方法的返回值经 `MethodToolCallback` 序列化后是 **JSON 字符串字面量**：
+外层带双引号、内部换行转义成 `\n`。
+
+```
+原始返回值：  标题：A\n链接：B\n---\n标题：C
+responseData："标题：A\n链接：B\n---\n标题：C"   ← 首尾引号 + 两个字面的 \ 和 n
+```
+
+所有对 `responseData` 做 `startsWith` / `split` / `contains` 的代码都会静默失效——
+这就是"搜索结果条数永远是 1"的根因（`split("\n---\n")` 只能得到 1 段）。
+
+统一走 `ToolResultTexts.decode(raw)`：是 JSON 字符串字面量就解码，否则原样返回，
+对两种形态都安全。**新增任何读取 `responseData` 的代码，第一步都是 decode。**
+
+### 5.5 抓取输出上限与"页面链接"区块：`mkagent.tools.web-scrape.max-chars`
+
+默认 `12000` 字符（正文 + 链接区块合计）。
+
+真实运行里出现过**引用幻觉**：`web_scrape` 只返回正文，模型手里没有任何 URL，
+于是按页面标题和导航文字自己拼了一个链接。抓一次 GitHub 页面 ≈ 上万 token，
+拼出来的链接却指向不存在的地址——用户点开是 404。
+
+现在 `web_scrape` 在正文之后追加一个"页面链接"区块：
+
+```
+页面链接（均来自本页实际链接，可直接引用）：
+1. Spring AI Reference：https://docs.spring.io/spring-ai/reference/
+2. ...
+```
+
+| 约束 | 取值 | 原因 |
+| --- | --- | --- |
+| 条数上限 | 50 | 再多也只是把 token 花在导航栏上 |
+| 协议 | 仅 `http` / `https` | 过滤 `javascript:` / `mailto:` / 锚点 |
+| 去重 | 按绝对 URL | 同一目标多处出现只留一条 |
+| 相对路径 | 转成绝对 URL | 模型拿到相对路径没法引用 |
+
+**空间不足时链接优先**：正文超限时先截正文，链接区块整体保留。
+正文尾部丢了不影响"引用是否正确"，链接丢了就直接导致幻觉。
+
+配套的系统提示词规则（`MkManus` 第 5 条）：回答里的任何 URL 必须来自本次
+`web_search` / `web_scrape` 的实际返回结果，不得根据标题或导航文字拼接；
+工具结果里没有可用链接时，明确说"未获得可引用的链接"。
+
+### 5.6 最终回答：`terminate_task` 的 `final_answer`
+
+真实运行里任务 `SUCCEEDED`，用户却只拿到一句"任务结束：任务结束已确认"——
+模型在同一轮既写了说明文字又调用了 `terminate_task`，
+而旧逻辑只把**工具结果摘要**当最终回答，模型写的正文被整段丢掉。
+
+`terminate_task` 现在多了一个 `final_answer` 参数（上限 4000 字符，
+超出截断并标注），`ToolCallAgent` 按四级优先级取值：
+
+| 优先级 | 来源 | 什么时候命中 |
+| ---: | --- | --- |
+| 1 | `terminate_task` 的 `final_answer` 参数 | 模型按提示词规范写入 |
+| 2 | 同一轮 assistant 文本 | 模型把答案写在正文里、工具只用来收尾 |
+| 3 | `ctx` 上已有的 `finalAnswer` | 之前的步骤已经确定过答案，不要被覆盖 |
+| 4 | 工具执行摘要 | 前三级都空时的兜底（旧行为） |
+
+SSE 的 `final_answer` 事件、`agent_run.final_answer` 字段、同步 `run()` 的返回值
+都读同一个 `ctx.getFinalAnswer()`，而写入点只有 `ToolCallAgent.act()` 一处，
+所以三者天然一致——不需要三处各写一份再靠测试对齐。
+
+成本影响：`final_answer` 让模型把"已经写过的说明"复述一次，
+多花一次输出 token；但换来的是**用户真的拿到答案**，
+省掉的是"再问一遍"的整轮成本。
+
+### 5.7 引用真实性检查：`CitationFaithfulnessChecker`
+
+评测侧的确定性检查（不依赖 LLM judge）：从最终回答里抽出所有 URL，
+逐个断言"在本任务的工具结果或用户输入中出现过"，命中不了直接判失败。
+
+失败文案会列出具体是哪些 URL 凭空出现：
+
+```
+最终回答引用了工具结果与用户输入中都不存在的 URL：https://example.com/fake
+```
+
+配套用例 `CITATION-01`（要求给出官方文档链接）。这条检查的价值在于：
+它把"引用幻觉"从"看起来像真的"变成"可复现的失败"，
+而不是等用户点开 404 才发现。
+
+---
+
+## 6. 任务轨迹与预算收尾
+
+### 6.1 工具轨迹落库：`agent_run.tool_trace`
+
+`agent_run` 新增一列 `tool_trace TEXT`，内容是**按执行顺序**的工具名序列，
+逗号分隔：
+
+```
+web_search,web_search,web_scrape,terminate_task
+```
+
+用途：回答"这个任务到底做了什么"，而不用把整段对话捞出来看。
+成本排查时能一眼看出"8 步里有 6 步都在 web_scrape 同一个站点"。
+
+四条约束：
+
+| 约束 | 说明 |
+| --- | --- |
+| 只存工具名 | **不含任何参数或结果原文**——搜索词、文件路径、密钥不会进库 |
+| 按执行顺序 | 复用 `AgentRunContext.toolTrace`，`ToolCallAgent.act()` 每执行完一个工具追加一次 |
+| 失败也记 | 失败的工具调用同样产生 `ToolResponseMessage`，模型看到了失败结果，它就是轨迹的一部分；一次调用只记一条，不按重试次数重复 |
+| 进度与终态都写 | 最后一轮 step 之后不会再触发 `recordProgress`，只在终态写会丢掉"最后一个工具" |
+
+幂等升级（存量表必须靠 ALTER，`CREATE TABLE IF NOT EXISTS` 不会补列）：
+
+```sql
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS tool_trace TEXT;
+```
+
+`SchemaScriptIdempotencyTest` 连续执行两次 `schema.sql`，
+并模拟"旧版表 + 新脚本"的升级路径，保证应用启动（`sql.init.mode=always`）不会因为列已存在而起不来。
+
+`AgentRunVO` 同步返回该字段，前端可直接画出任务轨迹。
+
+### 6.2 剩余步数提示：`mkagent.agent.budget-warning-steps`
+
+默认 `2`。剩余步数 ≤ 该值时，在**发送给模型的副本**里追加一条系统提示：
+
+```
+剩余步数不足，请基于已有信息给出最终回答并调用 terminate_task，不要再搜索新资料
+```
+
+剩余步数 = `maxSteps - 当前步 + 1`（含当前这一步）。以 `maxSteps=8` 为例，
+第 7 步（剩 2）和第 8 步（剩 1）会提示，正好覆盖最后两步。
+
+**只追加到副本，不修改 `ctx.messages`**，理由有三：
+
+1. 这是"本轮策略"，不是任务事实；写进历史会污染后续所有轮次；
+2. 评测会读取 ctx 的消息做断言，历史必须保持干净；
+3. 模型看到的历史与实际发生过的对话不一致时，问题极难排查。
+
+设为 `0` 或负数关闭。
+
+### 6.3 预算耗尽后的强制收尾：`mkagent.agent.force-final-answer`
+
+默认 `true`。预算耗尽（`MAX_STEPS_REACHED` / 工具次数上限）且**尚无最终回答**时，
+额外执行一次**不带工具**的模型调用，让模型基于已有上下文写一个尽力而为的回答：
+
+```
+(因步数预算耗尽，以下为基于已获取信息的尽力回答)
+根据已抓到的页面，Spring AI 的 ChatClient 支持……
+```
+
+为什么值得多花这一次调用：预算耗尽时模型手里通常已经有搜索结果和网页正文，
+只是没来得及写结论。旧行为返回的是"安全停止：达到最大步骤数……"这句系统摘要，
+用户等于什么答案都没拿到——上下文里的信息全白攒了。
+
+四条硬约束：
+
+| 约束 | 说明 |
+| --- | --- |
+| 状态不变 | 仍是 `MAX_STEPS_REACHED`，这是成本事实，不能伪装成 `SUCCEEDED` |
+| 不带工具 | options 里没有 `toolCallbacks`，模型没有工具可用 |
+| Token 计入 Usage | 这次调用确实花钱，必须出现在 `agent_run` 的 Token 统计里 |
+| 失败必须降级 | 任何异常只记 WARN，保持 `finalAnswer` 为空，由 `BaseAgent` 回退到步骤摘要 |
+
+SSE 侧配套改动：`final_answer` 事件不再只对 `SUCCEEDED` 发送，
+`MAX_STEPS_REACHED` 且有答案时也发——否则强制收尾的答案永远到不了前端。
+
+关闭（`false`）则完全保持旧行为。
+
+---
+
+## 7. 还在计划中的降本项
 
 以下尚未实现，先留位置，避免把"计划"写成"已完成"：
 
-- Token 降本：网页抓取正文截断（`mkagent.tools.web-scrape.max-chars`）、
-  工具结果裁剪（`ToolResultTrimmer`，默认关闭）；
+- Token 降本：工具结果裁剪（`ToolResultTrimmer`，默认关闭）——
+  网页抓取正文截断（`max-chars`）已经实现，见 5.5；
 - 搜索缓存 + 评测 RECORD/REPLAY（同一用例重复跑时不重复调用搜索 API）。
 
 ---
 
-## 5. 自查清单
+## 8. 自查清单
 
 - [ ] 新增调用模型的测试，是否标了 `@Tag("live")` 并加入 `LiveTestIsolationUnitTest` 清单？
 - [ ] 新增模型调用，是否走容器里的 `RetryTemplate` Bean 或 `ModelRetryConfig.build(...)`（而不是自己 `new` 一个默认策略）？
 - [ ] 新增模型客户端时，是否确认它**不会原地改写**传入的 `RetryTemplate`（`DashScopeImageModel` 就是反例）？
+- [ ] 新增模型 Bean，是否给了它**独立的** `RetryTemplate` 实例（而不是共享某个可变对象）？
+- [ ] 新增"短调用/低价值"模型调用，是否优先用 `auxiliary` 而不是主模型（见第 4 节）？
 - [ ] 新增 4xx 语义（如 408/425），是否需要补进 `spring.ai.retry.on-http-codes`？
 - [ ] 新增批量模型调用，是否会被"3 次 × 2s"放大成不可接受的启动/请求耗时？
 - [ ] 新增工具失败文案，是否落在"可重试"与"不可重试"两个前缀之一？
+- [ ] 新增读取 `ToolResponse.responseData` 的代码，是否先经过 `ToolResultTexts.decode`（见 5.4）？
+- [ ] 新增对 `responseData` 的 `startsWith` / `split` / `contains`，是否在解码后的字符串上做？
+- [ ] 新增工具，是否确认重试耗尽后返回失败文案（而不是抛异常终止任务）？失败调用是否仍计入 `toolCallCount`？
+- [ ] 新增日志，是否按"每步都要看 → INFO / 仅排查时看 → DEBUG"分级？工具原始结果是否截断？
+- [ ] 需要查英文官方文档的任务，是否把 `search-api.engine` 调成了 `google`（见 5.1）？
+- [ ] 新增工具失败文案，是否区分了"这次试了但失败"（`多次尝试仍失败`）与"根本没再执行"（`该站点连续失败`，见 2.8）？
+- [ ] 新增可能耗尽重试的工具，是否确认它走 `RetryableToolCallback`（否则站点级熔断对它不生效）？
+- [ ] 改动 `ToolCallAgent.act()` 的工具执行段，是否保留 `bind` / `finally` 成对出现的站点计数器绑定？
+- [ ] 新增工具返回值字段，是否仍在 `max-chars` 上限内（正文 + 链接区块合计，见 5.5）？
+- [ ] 新增"给用户的最终回答"路径，是否写入 `ctx.setFinalAnswer(...)` 而不是另起一个返回通道（见 5.6）？
+- [ ] 新增提示词规则要求模型输出 URL 时，是否同时确认 `CitationFaithfulnessChecker` 能覆盖（见 5.7）？
+- [ ] 新增落库字段，是否确认 `schema.sql` 里既有 CREATE 也有幂等 `ALTER ... ADD COLUMN IF NOT EXISTS`（见 6.1）？
+- [ ] 新增落库内容，是否只存工具名/枚举/脱敏摘要，不含参数、结果原文或密钥（见 6.1）？
+- [ ] 新增"发送给模型的临时上下文"（提示、约束、few-shot），是否只加在副本上，没有污染 `ctx.messages`（见 6.2）？
+- [ ] 新增提前终止路径，是否考虑"预算耗尽但已有信息可用"时给用户一个尽力回答（见 6.3）？
+- [ ] 新增收尾/补答逻辑，是否保持真实终态（如 `MAX_STEPS_REACHED`）而不是改成 `SUCCEEDED`？

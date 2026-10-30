@@ -96,7 +96,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
                 "spring.sql.init.schema-locations=classpath:db/schema.sql",
                 // 禁用 pgvector 向量库：PgVectorStore 初始化会执行 PostgreSQL 专用的
                 // CREATE EXTENSION IF NOT EXISTS vector，H2 不支持该语法。
-                "mkagent.rag.pgvector.enabled=false"
+                "mkagent.rag.pgvector.enabled=false",
+                // 故意设成非默认值：验证 @Value 方法注入真的把配置灌进了 MkManus
+                // （不是只有字段默认值生效）。本类任务只有 2 步，不会触发收尾提示。
+                "mkagent.agent.budget-warning-steps=5"
         }
 )
 @ActiveProfiles("local")
@@ -178,6 +181,9 @@ class AgentRunPersistenceIntegrationTest {
 
     @Autowired
     private AgentRunRecorder agentRunRecorder;
+
+    @Autowired
+    private MkManus mkManus;
 
     /**
      * 替换 RAG 内存向量库，避免测试触网调用 Embedding API。
@@ -511,6 +517,22 @@ class AgentRunPersistenceIntegrationTest {
         AgentRunEntity saved = findRun(ctx.getRunId().toString());
         assertThat(saved).isNotNull();
         assertThat(saved.getToolTrace()).isNull();
+    }
+
+    /**
+     * 预算相关配置是否真的灌进了 MkManus。
+     *
+     * 放在本类里是为了复用同一个隔离上下文（不额外启动一个 Spring 容器）。
+     */
+    @Test
+    void budgetSettingsAreWiredFromConfiguration() {
+        assertThat(mkManus.getBudgetWarningSteps())
+                .as("mkagent.agent.budget-warning-steps 应被注入")
+                .isEqualTo(5);
+        assertThat(mkManus.isForceFinalAnswer())
+                .as("mkagent.agent.force-final-answer 默认 true")
+                .isTrue();
+        assertThat(mkManus.getMaxSteps()).isEqualTo(8);
     }
 
     // ===== HTTP 辅助方法 =====
