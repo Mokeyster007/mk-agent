@@ -1,5 +1,6 @@
 package com.example.mkagent.agent;
 
+import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
@@ -918,15 +919,19 @@ public class ToolCallAgent extends ReActAgent {
         /*
          * 真正执行模型请求的 Java 工具。
          *
-         * 执行前把**本次任务**的站点级耗尽计数器绑定到当前线程，
-         * 执行后立刻解除：
-         * 1. 工具回调（RetryableToolCallback）是 Spring 单例，
-         *    不能持有任务状态，只能通过线程绑定拿到当前任务的计数器；
+         * 执行前把**本次任务**的上下文与站点级耗尽计数器绑定到当前线程，
+         * 执行后立刻恢复：
+         * 1. 工具回调（RetryableToolCallback / MusicQueryTool）是 Spring 单例，
+         *    不能持有任务状态，只能通过线程绑定拿到当前任务的 ctx；
+         *    - 站点熔断读 ToolTargetExhaustionTracker；
+         *    - 音乐类工具读 AgentRunContextHolder 取 userId
+         *      （userId 绝不作为工具参数，见 docs/music-agent.md）；
          * 2. 只在 executeToolCalls 期间绑定——工具执行是同步的，
          *    不存在跨线程读不到的问题；
-         * 3. finally 解除是硬要求：agent 线程来自线程池，
-         *    不解除会让下一个任务继承上一个任务的计数。
+         * 3. finally 恢复是硬要求：agent 线程来自线程池，
+         *    不恢复会让下一个任务继承上一个任务的上下文（越权风险）。
          */
+        AgentRunContext previousRunContext = AgentRunContextHolder.bind(ctx);
         ToolTargetExhaustionTracker previousTracker =
                 ToolTargetExhaustionTracker.current();
         ToolTargetExhaustionTracker.bind(ctx.getToolTargetExhaustionTracker());
@@ -940,6 +945,7 @@ public class ToolCallAgent extends ReActAgent {
         } finally {
             // 恢复而不是无脑清除：嵌套执行时不能把外层绑定弄丢。
             ToolTargetExhaustionTracker.bind(previousTracker);
+            AgentRunContextHolder.restore(previousRunContext);
         }
 
         /*

@@ -1,8 +1,11 @@
 package com.example.mkagent.tools;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 默认工具事件消息提供者。
@@ -16,17 +19,33 @@ public class DefaultToolEventMessageProvider
         implements ToolEventMessageProvider {
 
     /**
+     * 音乐只读工具：完成文案需要读信封里的 meta.count，不能只查表。
+     */
+    private static final Set<String> MUSIC_TOOLS = Set.of(
+            "search_songs",
+            "get_song_detail",
+            "get_user_playlists",
+            "get_playlist_songs"
+    );
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    /**
      * 工具名称 → 调用开始文案。
      */
-    private static final Map<String, String> START_MESSAGES = Map.of(
-            "web_search", "正在搜索互联网公开资料",
-            "web_scrape", "正在抓取网页正文",
-            "read_file", "正在读取文件内容",
-            "write_file", "正在写入文件",
-            "generate_pdf", "正在生成 PDF 文件",
-            "download_resource", "正在下载公开资源",
-            "terminate_task", "任务收尾中",
-            "demo_inventory_check", "正在查询库存信息"
+    private static final Map<String, String> START_MESSAGES = Map.ofEntries(
+            Map.entry("web_search", "正在搜索互联网公开资料"),
+            Map.entry("web_scrape", "正在抓取网页正文"),
+            Map.entry("read_file", "正在读取文件内容"),
+            Map.entry("write_file", "正在写入文件"),
+            Map.entry("generate_pdf", "正在生成 PDF 文件"),
+            Map.entry("download_resource", "正在下载公开资源"),
+            Map.entry("terminate_task", "任务收尾中"),
+            Map.entry("demo_inventory_check", "正在查询库存信息"),
+            Map.entry("search_songs", "正在检索歌曲"),
+            Map.entry("get_song_detail", "正在读取歌曲详情"),
+            Map.entry("get_user_playlists", "正在读取我的歌单"),
+            Map.entry("get_playlist_songs", "正在读取歌单曲目")
     );
 
     /**
@@ -34,6 +53,7 @@ public class DefaultToolEventMessageProvider
      *
      * web_scrape 不在此表中：它的完成文案必须结合返回值判断
      * （成功 / 可重试失败 / 被拒绝 / 重定向），见 webScrapeResultMessage。
+     * 音乐类工具同理：文案要带条数，见 musicResultMessage。
      */
     private static final Map<String, String> RESULT_MESSAGES = Map.of(
             "read_file", "文件读取完成",
@@ -72,7 +92,55 @@ public class DefaultToolEventMessageProvider
             return webScrapeResultMessage(result);
         }
 
+        if (MUSIC_TOOLS.contains(toolName)) {
+            return musicResultMessage(toolName, result);
+        }
+
         return RESULT_MESSAGES.getOrDefault(toolName, "工具调用完成");
+    }
+
+    /**
+     * 音乐只读工具的完成文案：只暴露"条数"，不暴露内容。
+     *
+     * 信封是 {@link ToolResponseEnvelope} 产出的 JSON：
+     * ok=false 说明业务上没拿到数据（关键词无结果 / 歌单无权查看），
+     * 不能显示成"完成"，否则前端会以为查到了。
+     */
+    private String musicResultMessage(String toolName, String rawResult) {
+        if (rawResult == null || rawResult.isBlank()) {
+            return "工具调用完成";
+        }
+
+        try {
+            JsonNode root = OBJECT_MAPPER.readTree(rawResult);
+
+            if (!root.path("ok").asBoolean(false)) {
+                return switch (toolName) {
+                    case "search_songs" -> "歌曲检索未获得结果";
+                    case "get_song_detail" -> "未获取到歌曲详情";
+                    case "get_user_playlists" -> "未获取到歌单";
+                    default -> "未获取到歌单曲目";
+                };
+            }
+
+            int count = root.path("meta").path("count").asInt(0);
+            boolean truncated =
+                    root.path("meta").path("truncated").asBoolean(false);
+            String suffix = truncated ? "（结果已截断）" : "";
+
+            return switch (toolName) {
+                case "search_songs" -> "找到 " + count + " 首歌曲" + suffix;
+                case "get_user_playlists" -> "找到 " + count + " 个歌单" + suffix;
+                case "get_playlist_songs" -> "歌单中有 " + count + " 首歌" + suffix;
+                default -> "已获取歌曲详情";
+            };
+        } catch (Exception e) {
+            /*
+             * 解析失败只可能是"工具没按信封返回"（编程错误）。
+             * 退回通用文案，绝不把原始 JSON 推给前端。
+             */
+            return "工具调用完成";
+        }
     }
 
     /**

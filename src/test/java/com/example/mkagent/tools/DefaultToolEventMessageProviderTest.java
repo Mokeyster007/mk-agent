@@ -1,6 +1,11 @@
 package com.example.mkagent.tools;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -236,5 +241,165 @@ class DefaultToolEventMessageProviderTest {
                 "该站点连续失败，已跳过本次搜索",
                 provider.resultMessage("web_search", raw)
         );
+    }
+
+    // ==================== 音乐只读工具（M2b） ====================
+
+    /**
+     * 开始文案：四个音乐工具都要有专属文案，
+     * 不能退化成"正在调用工具：search_songs"（把工具名暴露给用户）。
+     */
+    @Test
+    void musicToolsHaveReadableStartMessages() {
+        assertEquals("正在检索歌曲", provider.startMessage("search_songs"));
+        assertEquals("正在读取歌曲详情", provider.startMessage("get_song_detail"));
+        assertEquals("正在读取我的歌单", provider.startMessage("get_user_playlists"));
+        assertEquals("正在读取歌单曲目", provider.startMessage("get_playlist_songs"));
+    }
+
+    /**
+     * 检索结果的条数来自信封的 meta.count，不是自己数 JSON 数组。
+     */
+    @Test
+    void musicSearchShowsSongCountFromEnvelope() {
+        String envelope = ToolResponseEnvelope.okList(List.of(
+                song(1001L, "夜航西飞", "林知夏"),
+                song(1002L, "无声电台", "陈以安"),
+                song(1003L, "雾中列车", "苏迟")
+        ));
+
+        assertEquals("找到 3 首歌曲", provider.resultMessage("search_songs", envelope));
+    }
+
+    /**
+     * 真实链路里 @Tool 的返回值会被 MethodToolCallback 再序列化成
+     * JSON 字符串字面量（首尾加引号、内部引号转义）。
+     * 不解码就解析不出信封，文案会退化成"工具调用完成"。
+     */
+    @Test
+    void musicEnvelopeIsParsedAfterJsonStringLiteralEncoding() throws Exception {
+        String envelope = ToolResponseEnvelope.okList(List.of(
+                song(1001L, "夜航西飞", "林知夏"),
+                song(1002L, "无声电台", "陈以安")
+        ));
+        String encoded = new ObjectMapper().writeValueAsString(envelope);
+
+        assertEquals(
+                "找到 2 首歌曲",
+                provider.resultMessage("search_songs", encoded)
+        );
+    }
+
+    /**
+     * ok=false（关键词无结果）不是"完成"，
+     * 否则前端会以为这次检索有数据。
+     */
+    @Test
+    void musicSearchFailureIsNotReportedAsSuccess() {
+        String envelope = ToolResponseEnvelope.error("没有找到匹配「zzz」的歌曲");
+
+        String message = provider.resultMessage("search_songs", envelope);
+
+        assertEquals("歌曲检索未获得结果", message);
+        assertFalse(message.contains("完成"), "失败时不能出现“完成”字样");
+        assertFalse(message.contains("找到"), "失败时不能说“找到”");
+    }
+
+    /**
+     * 歌单类工具的失败文案各自独立，不能共用"未获得结果"这种含糊说法。
+     */
+    @Test
+    void musicPlaylistFailuresUseDistinctMessages() {
+        String envelope = ToolResponseEnvelope.error("当前用户还没有创建任何歌单");
+
+        assertEquals(
+                "未获取到歌单",
+                provider.resultMessage("get_user_playlists", envelope)
+        );
+        assertEquals(
+                "未获取到歌单曲目",
+                provider.resultMessage("get_playlist_songs", envelope)
+        );
+        assertEquals(
+                "未获取到歌曲详情",
+                provider.resultMessage("get_song_detail", envelope)
+        );
+    }
+
+    /**
+     * 截断必须在文案上体现：模型拿到的是被砍过的结果，
+     * 用户看到"找到 50 首"却以为这就是全部，会误判。
+     */
+    @Test
+    void truncatedMusicResultCarriesSuffix() {
+        // 每条都塞满长文本，逼 okList 从尾部丢弃并标记 truncated。
+        String filler = "x".repeat(900);
+        String envelope = ToolResponseEnvelope.okList(List.of(
+                song(1001L, filler, filler),
+                song(1002L, filler, filler),
+                song(1003L, filler, filler)
+        ));
+
+        String message = provider.resultMessage("search_songs", envelope);
+
+        assertTrue(message.contains("结果已截断"), "实际：" + message);
+        assertTrue(message.startsWith("找到 "), "实际：" + message);
+    }
+
+    /**
+     * 详情类只有一条，count=1，文案不应带条数（"找到 1 首"很怪）。
+     */
+    @Test
+    void musicDetailDoesNotShowCount() {
+        String envelope = ToolResponseEnvelope.okSingle(song(1001L, "夜航西飞", "林知夏"));
+
+        assertEquals("已获取歌曲详情", provider.resultMessage("get_song_detail", envelope));
+    }
+
+    /**
+     * 脱敏：事件文案会经 SSE 推给前端，
+     * 不允许出现歌曲标题、歌手、userId 或原始 JSON。
+     */
+    @Test
+    void musicEventTextLeaksNoContent() {
+        String envelope = ToolResponseEnvelope.okList(List.of(
+                song(1001L, "夜航西飞", "林知夏")
+        ));
+
+        String message = provider.resultMessage("search_songs", envelope);
+
+        assertFalse(message.contains("夜航西飞"), "不得回显歌曲标题");
+        assertFalse(message.contains("林知夏"), "不得回显歌手名");
+        assertFalse(message.contains("1001"), "不得回显歌曲 ID");
+        assertFalse(message.contains("{" ), "不得回显原始 JSON");
+        assertFalse(message.contains("music-user"), "不得回显 userId");
+    }
+
+    /**
+     * 信封解析失败（工具没按约定返回）时退回通用文案，
+     * 绝不能把原始 JSON 推给前端。
+     */
+    @Test
+    void musicMalformedEnvelopeFallsBackToGenericMessage() {
+        assertEquals(
+                "工具调用完成",
+                provider.resultMessage("search_songs", "not a json at all")
+        );
+        assertEquals(
+                "工具调用完成",
+                provider.resultMessage("search_songs", null)
+        );
+    }
+
+    private static Map<String, Object> song(Long id, String title, String artist) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", id);
+        row.put("title", title);
+        row.put("artist", artist);
+        row.put("album", "示例专辑");
+        row.put("durationSeconds", 215);
+        row.put("genre", "流行");
+        row.put("releaseYear", 2021);
+        return row;
     }
 }
