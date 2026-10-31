@@ -25,7 +25,9 @@ public class DefaultToolEventMessageProvider
             "search_songs",
             "get_song_detail",
             "get_user_playlists",
-            "get_playlist_songs"
+            "get_playlist_songs",
+            "get_play_stats",
+            "get_top_songs"
     );
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
@@ -45,7 +47,9 @@ public class DefaultToolEventMessageProvider
             Map.entry("search_songs", "正在检索歌曲"),
             Map.entry("get_song_detail", "正在读取歌曲详情"),
             Map.entry("get_user_playlists", "正在读取我的歌单"),
-            Map.entry("get_playlist_songs", "正在读取歌单曲目")
+            Map.entry("get_playlist_songs", "正在读取歌单曲目"),
+            Map.entry("get_play_stats", "正在统计播放数据"),
+            Map.entry("get_top_songs", "正在统计歌曲排行")
     );
 
     /**
@@ -119,6 +123,8 @@ public class DefaultToolEventMessageProvider
                     case "search_songs" -> "歌曲检索未获得结果";
                     case "get_song_detail" -> "未获取到歌曲详情";
                     case "get_user_playlists" -> "未获取到歌单";
+                    case "get_play_stats" -> "未获取到播放统计";
+                    case "get_top_songs" -> "未获取到歌曲排行";
                     default -> "未获取到歌单曲目";
                 };
             }
@@ -132,6 +138,8 @@ public class DefaultToolEventMessageProvider
                 case "search_songs" -> "找到 " + count + " 首歌曲" + suffix;
                 case "get_user_playlists" -> "找到 " + count + " 个歌单" + suffix;
                 case "get_playlist_songs" -> "歌单中有 " + count + " 首歌" + suffix;
+                case "get_play_stats" -> "播放统计已生成";
+                case "get_top_songs" -> "歌曲排行已生成（" + count + " 首）" + suffix;
                 default -> "已获取歌曲详情";
             };
         } catch (Exception e) {

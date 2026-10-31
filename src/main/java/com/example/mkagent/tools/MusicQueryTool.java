@@ -2,7 +2,6 @@ package com.example.mkagent.tools;
 
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.music.MusicCatalogRepository;
-import com.example.mkagent.music.MusicCatalogRepository.PlaylistView;
 import com.example.mkagent.music.MusicCatalogRepository.SongView;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,9 +12,11 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * 音乐业务只读工具（M2b）。
+ * 曲库只读工具（M2b；M2c 拆出歌单类工具）。
  *
- * 四个工具：检索歌曲、歌曲详情、我的歌单、歌单曲目。
+ * 两个工具：检索歌曲、歌曲详情。曲库是**公共数据**，不按用户过滤，
+ * 因此普通用户与管理员都可以持有这个 Bean。
+ * 歌单类工具在 {@link MusicPlaylistQueryTool}——管理员的白名单里没有它。
  *
  * 三条设计约束：
  *
@@ -26,7 +27,7 @@ import java.util.List;
  *
  * 2. **没有上下文就失败关闭**。requireUserId() 在 try 之外调用，
  *    抛出的异常会变成这次工具调用的错误结果；
- *    绝不回落匿名用户——匿名读"我的歌单"只会返回空或别人的数据，
+ *    绝不回落匿名用户——匿名查询只会返回空或别人的数据，
  *    这种静默降级在生产上极难发现。
  *
  * 3. **返回值统一走信封**（{@link ToolResponseEnvelope}）。
@@ -34,7 +35,7 @@ import java.util.List;
  *    不抛异常——异常只留给"不该发生"的情况（无上下文、DB 故障），
  *    模型看到的永远是可读文本。
  *
- * 本批不提供 get_play_history：播放历史属于强隐私数据，
+ * 不提供 get_play_history：播放历史属于强隐私数据，
  * 等 M3 的权限模型落地再开放。
  */
 @Component
@@ -150,75 +151,6 @@ public class MusicQueryTool {
             log.warn("歌曲详情读取失败：songId={}, reason={}",
                     songId, e.getClass().getSimpleName());
             return ToolResponseEnvelope.error("歌曲详情读取失败，请稍后重试");
-        }
-    }
-
-    @Tool(
-            name = "get_user_playlists",
-            description = """
-                    列出当前用户自己创建的歌单（名称、是否公开、歌曲数量）。
-
-                    不需要任何参数：用户身份由服务端提供。
-                    看不到别人的歌单；要查看某个公开歌单的曲目，
-                    需要先用本工具拿到歌单 ID。
-                    """
-    )
-    public String getUserPlaylists() {
-        String userId = AgentRunContextHolder.requireUserId();
-
-        try {
-            List<PlaylistView> playlists =
-                    repository.findUserPlaylists(userId);
-
-            if (playlists.isEmpty()) {
-                return ToolResponseEnvelope.error(
-                        "当前用户还没有创建任何歌单");
-            }
-
-            return ToolResponseEnvelope.okList(playlists);
-        } catch (Exception e) {
-            log.warn("歌单列表读取失败：reason={}",
-                    e.getClass().getSimpleName());
-            return ToolResponseEnvelope.error("歌单列表读取失败，请稍后重试");
-        }
-    }
-
-    @Tool(
-            name = "get_playlist_songs",
-            description = """
-                    按歌单 ID 取歌单内的歌曲（按歌单内顺序返回）。
-
-                    只有自己的歌单或公开歌单能读到；
-                    歌单不存在与无权查看会返回同样的提示，
-                    不要据此推测歌单是否存在。
-                    """
-    )
-    public String getPlaylistSongs(
-            @ToolParam(
-                    description = "歌单 ID（正整数，来自 get_user_playlists 的结果）"
-            )
-            Long playlistId
-    ) {
-        String userId = AgentRunContextHolder.requireUserId();
-
-        if (playlistId == null || playlistId <= 0) {
-            return ToolResponseEnvelope.error("歌单 ID 必须是正整数");
-        }
-
-        try {
-            List<SongView> songs =
-                    repository.findPlaylistSongs(userId, playlistId);
-
-            if (songs.isEmpty()) {
-                return ToolResponseEnvelope.error(
-                        "歌单不存在或无权查看：" + playlistId);
-            }
-
-            return ToolResponseEnvelope.okList(songs);
-        } catch (Exception e) {
-            log.warn("歌单曲目读取失败：playlistId={}, reason={}",
-                    playlistId, e.getClass().getSimpleName());
-            return ToolResponseEnvelope.error("歌单曲目读取失败，请稍后重试");
         }
     }
 

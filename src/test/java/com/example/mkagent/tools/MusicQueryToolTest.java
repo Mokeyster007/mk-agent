@@ -3,7 +3,6 @@ package com.example.mkagent.tools;
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.music.MusicCatalogRepository;
-import com.example.mkagent.music.MusicCatalogRepository.PlaylistView;
 import com.example.mkagent.music.MusicCatalogRepository.SongView;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -64,7 +63,7 @@ class MusicQueryToolTest {
     // ===== 失败关闭 =====
 
     @Test
-    @DisplayName("没有任务上下文：四个工具都抛异常（失败关闭）")
+    @DisplayName("没有任务上下文：曲库工具抛异常（失败关闭）")
     void allToolsFailClosedWithoutContext() {
         AgentRunContextHolder.clear();
 
@@ -72,14 +71,10 @@ class MusicQueryToolTest {
                 () -> tool.searchSongs("夜", 5));
         assertThrows(IllegalStateException.class,
                 () -> tool.getSongDetail(1001L));
-        assertThrows(IllegalStateException.class,
-                tool::getUserPlaylists);
-        assertThrows(IllegalStateException.class,
-                () -> tool.getPlaylistSongs(2001L));
 
         // 失败关闭意味着"根本没查库"，不是"查了但返回空"。
         verify(repository, never()).searchSongs(anyString(), anyInt());
-        verify(repository, never()).findUserPlaylists(anyString());
+        verify(repository, never()).findSong(anyLong());
     }
 
     // ===== search_songs =====
@@ -192,61 +187,5 @@ class MusicQueryToolTest {
         assertTrue(root.path("ok").asBoolean());
         assertEquals(1, root.path("meta").path("count").asInt());
         assertEquals("夜航星", root.path("data").path("artist").asText());
-    }
-
-    // ===== get_user_playlists =====
-
-    @Test
-    @DisplayName("我的歌单：按服务端 userId 查询，参数里没有 userId")
-    void userPlaylistsUseServerSideUserId() throws Exception {
-        when(repository.findUserPlaylists("music-user-1")).thenReturn(List.of(
-                new PlaylistView(2001L, "深夜通勤", "地铁上的四十分钟", false, 8)
-        ));
-
-        JsonNode root = objectMapper.readTree(tool.getUserPlaylists());
-
-        assertTrue(root.path("ok").asBoolean());
-        assertEquals(1, root.path("meta").path("count").asInt());
-        assertFalse(root.path("data").get(0).path("isPublic").asBoolean());
-        verify(repository).findUserPlaylists("music-user-1");
-    }
-
-    @Test
-    @DisplayName("没有歌单：ok=false")
-    void emptyPlaylists() throws Exception {
-        when(repository.findUserPlaylists(anyString())).thenReturn(List.of());
-
-        JsonNode root = objectMapper.readTree(tool.getUserPlaylists());
-
-        assertFalse(root.path("ok").asBoolean());
-    }
-
-    // ===== get_playlist_songs =====
-
-    @Test
-    @DisplayName("歌单无权查看：与'不存在'同一文案，不泄露歌单是否存在")
-    void playlistSongsEmptyMeansNoAccessOrMissing() throws Exception {
-        when(repository.findPlaylistSongs("music-user-1", 2003L))
-                .thenReturn(List.of());
-
-        JsonNode root = objectMapper.readTree(tool.getPlaylistSongs(2003L));
-
-        assertFalse(root.path("ok").asBoolean());
-        assertEquals("歌单不存在或无权查看：2003",
-                root.path("meta").path("hint").asText());
-    }
-
-    @Test
-    @DisplayName("歌单曲目：返回列表并带条数")
-    void playlistSongsReturnEnvelope() throws Exception {
-        when(repository.findPlaylistSongs("music-user-1", 2001L)).thenReturn(List.of(
-                new SongView(1001L, "城市霓虹", "夜航星", "城市霓虹",
-                        214, "synthpop", 2021)
-        ));
-
-        JsonNode root = objectMapper.readTree(tool.getPlaylistSongs(2001L));
-
-        assertTrue(root.path("ok").asBoolean());
-        assertEquals(1, root.path("meta").path("count").asInt());
     }
 }

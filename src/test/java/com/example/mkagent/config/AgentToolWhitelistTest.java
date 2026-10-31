@@ -2,7 +2,10 @@ package com.example.mkagent.config;
 
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.ToolRetryWrapper;
+import com.example.mkagent.tools.AdminAnalyticsTool;
 import com.example.mkagent.tools.FileOperationTool;
+import com.example.mkagent.tools.MusicPlaylistQueryTool;
+import com.example.mkagent.tools.MusicQueryTool;
 import com.example.mkagent.tools.PDFGenerationTool;
 import com.example.mkagent.tools.ResourceDownloadTool;
 import com.example.mkagent.tools.TerminateTool;
@@ -34,6 +37,10 @@ class AgentToolWhitelistTest {
             new FileOperationTool(),
             new ResourceDownloadTool(),
             new PDFGenerationTool(),
+            // 音乐工具只用到方法签名，构造时依赖传 null 即可。
+            new MusicQueryTool(null),
+            new MusicPlaylistQueryTool(null),
+            new AdminAnalyticsTool(null, null),
             // 重试包装器使用与生产一致的默认配置；
             // 包装不改变工具名，白名单断言不受影响。
             new ToolRetryWrapper(
@@ -104,6 +111,42 @@ class AgentToolWhitelistTest {
         assertFalse(names.contains("write_file"));
         assertFalse(names.contains("download_resource"));
         assertFalse(names.contains("generate_pdf"));
+    }
+
+    @Test
+    void musicUserHasReadOnlyCatalogAndPlaylistTools() {
+        Set<String> names = toolNames(provider.getTools(AgentType.MUSIC_USER));
+
+        assertEquals(
+                Set.of("search_songs", "get_song_detail",
+                        "get_user_playlists", "get_playlist_songs",
+                        "terminate_task"),
+                names
+        );
+
+        // 普通用户拿不到管理员统计，也拿不到任何写工具。
+        assertFalse(names.contains("get_play_stats"));
+        assertFalse(names.contains("get_top_songs"));
+        assertFalse(names.contains("create_playlist"));
+        assertFalse(names.contains("add_songs_to_playlist"));
+    }
+
+    @Test
+    void musicAdminHasStatsButNoPlaylistTools() {
+        Set<String> names = toolNames(provider.getTools(AgentType.MUSIC_ADMIN));
+
+        assertEquals(
+                Set.of("search_songs", "get_song_detail",
+                        "get_play_stats", "get_top_songs",
+                        "terminate_task"),
+                names
+        );
+
+        // 管理员不得读取他人歌单。
+        assertFalse(names.contains("get_user_playlists"));
+        assertFalse(names.contains("get_playlist_songs"));
+        assertFalse(names.contains("create_playlist"));
+        assertFalse(names.contains("add_songs_to_playlist"));
     }
 
     private static Set<String> toolNames(ToolCallback[] callbacks) {

@@ -14,6 +14,8 @@ import org.springframework.context.annotation.Configuration;
  * 1. chatToolCallbacks：CHAT 类型（仅 web_search）
  * 2. mkToolCallbacks  ：MANUS 类型（MkManus 使用）
  * 3. fileToolCallbacks：FILE 类型（预留给后续 FILE Agent）
+ * 4. musicUserToolCallbacks ：MUSIC_USER（曲库 + 歌单，只读）
+ * 5. musicAdminToolCallbacks：MUSIC_ADMIN（曲库 + 聚合统计，无歌单）
  *
  * 测试专用工具（DemoInventoryTool）位于 src/test 测试目录，
  * 由集成测试的 @TestConfiguration 单独注册并覆盖
@@ -35,5 +37,23 @@ public class ToolRegistryConfig {
     @Bean("fileToolCallbacks")
     public ToolCallback[] fileToolCallbacks(AgentToolProvider toolProvider) {
         return toolProvider.getTools(AgentType.FILE);
+    }
+
+    /**
+     * 音乐普通用户：曲库只读 + 歌单只读。
+     *
+     * 写工具（建歌单、加歌）**不在这里**，见 docs/music-permissions.md。
+     */
+    @Bean("musicUserToolCallbacks")
+    public ToolCallback[] musicUserToolCallbacks(AgentToolProvider toolProvider) {
+        return toolProvider.getTools(AgentType.MUSIC_USER);
+    }
+
+    /**
+     * 音乐管理员：曲库只读 + 聚合统计（无歌单类工具、无写工具）。
+     */
+    @Bean("musicAdminToolCallbacks")
+    public ToolCallback[] musicAdminToolCallbacks(AgentToolProvider toolProvider) {
+        return toolProvider.getTools(AgentType.MUSIC_ADMIN);
     }
 }

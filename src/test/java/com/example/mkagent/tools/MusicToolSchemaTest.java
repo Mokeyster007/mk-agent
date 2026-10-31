@@ -37,13 +37,19 @@ class MusicToolSchemaTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     /**
-     * 构造工具时仓库传 null：schema 只由方法签名生成，不会碰仓库。
+     * 构造工具时依赖传 null：schema 只由方法签名生成，不会碰仓库。
+     *
+     * 曲库工具与歌单工具是两个 Bean（管理员的白名单里没有后者），
+     * 所以这里也要分两次注册——顺带证明拆分没有漏掉任何工具。
      */
-    private final ToolCallback[] callbacks =
-            ToolCallbacks.from(new MusicQueryTool(null));
+    private final ToolCallback[] callbacks = concat(
+            ToolCallbacks.from(new MusicQueryTool(null)),
+            ToolCallbacks.from(new MusicPlaylistQueryTool(null)),
+            ToolCallbacks.from(new AdminAnalyticsTool(null, null))
+    );
 
     @Test
-    @DisplayName("四个音乐工具都注册成功，工具名与设计一致")
+    @DisplayName("六个音乐只读工具都注册成功，工具名与设计一致")
     void toolNamesMatchDesign() {
         Set<String> names = Arrays.stream(callbacks)
                 .map(callback -> callback.getToolDefinition().name())
@@ -51,7 +57,8 @@ class MusicToolSchemaTest {
 
         assertEquals(
                 Set.of("search_songs", "get_song_detail",
-                        "get_user_playlists", "get_playlist_songs"),
+                        "get_user_playlists", "get_playlist_songs",
+                        "get_play_stats", "get_top_songs"),
                 names
         );
     }
@@ -115,6 +122,34 @@ class MusicToolSchemaTest {
         String playlistSongs = definitionOf("get_playlist_songs").description();
         assertTrue(playlistSongs.contains("公开歌单"),
                 "歌单曲目要说明可见性：" + playlistSongs);
+    }
+
+    @Test
+    @DisplayName("管理员统计工具：days / limit 可选，且描述写明范围")
+    void adminToolSchemaCarriesBounds() throws Exception {
+        JsonNode stats = schemaOf("get_play_stats");
+        assertTrue(stats.path("properties").has("days"), stats.toString());
+
+        JsonNode top = schemaOf("get_top_songs");
+        assertTrue(top.path("properties").has("days"), top.toString());
+        assertTrue(top.path("properties").has("limit"), top.toString());
+
+        List<String> required = objectMapper.convertValue(
+                top.path("required"),
+                objectMapper.getTypeFactory().constructCollectionType(
+                        List.class, String.class));
+        assertFalse(required.contains("days"), "days 可选：" + required);
+        assertFalse(required.contains("limit"), "limit 可选：" + required);
+
+        String schema = definitionOf("get_play_stats").inputSchema();
+        assertTrue(schema.contains("1~90"), "描述要写范围：" + schema);
+        assertTrue(schema.contains("默认 7"), "描述要写默认值：" + schema);
+    }
+
+    private static ToolCallback[] concat(ToolCallback[]... groups) {
+        return Arrays.stream(groups)
+                .flatMap(Arrays::stream)
+                .toArray(ToolCallback[]::new);
     }
 
     private JsonNode schemaOf(String toolName) throws Exception {

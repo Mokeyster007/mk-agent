@@ -2,7 +2,10 @@ package com.example.mkagent.config;
 
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.ToolRetryWrapper;
+import com.example.mkagent.tools.AdminAnalyticsTool;
 import com.example.mkagent.tools.FileOperationTool;
+import com.example.mkagent.tools.MusicPlaylistQueryTool;
+import com.example.mkagent.tools.MusicQueryTool;
 import com.example.mkagent.tools.PDFGenerationTool;
 import com.example.mkagent.tools.ResourceDownloadTool;
 import com.example.mkagent.tools.TerminateTool;
@@ -21,10 +24,19 @@ import java.util.Map;
  * 每个 Agent 只能拿到自己类型对应的工具集合，
  * 而不是默认获得全部工具：
  *
- * CHAT  ：web_search
- * MANUS ：web_search、web_scrape、terminate_task
- * FILE  ：read_file、write_file、download_resource、generate_pdf
- * EVAL  ：评测专用，复用 MANUS 的只读工具集
+ * CHAT       ：web_search
+ * MANUS      ：web_search、web_scrape、terminate_task
+ * FILE       ：read_file、write_file、download_resource、generate_pdf
+ * EVAL       ：评测专用，复用 MANUS 的只读工具集
+ * MUSIC_USER ：search_songs、get_song_detail、get_user_playlists、
+ *              get_playlist_songs、terminate_task
+ * MUSIC_ADMIN：search_songs、get_song_detail、get_play_stats、
+ *              get_top_songs、terminate_task（**没有**歌单类工具）
+ *
+ * 音乐类型的白名单粒度是 **Bean**，所以曲库工具与歌单工具被拆成
+ * MusicQueryTool / MusicPlaylistQueryTool 两个类：
+ * 管理员不该读任何人的歌单，而"减法式白名单"（拿全集再排除）
+ * 在新增工具时会被悄悄突破，拆 Bean 才能让白名单一眼可读。
  *
  * 高风险工具（文件读写、资源下载）不会进入
  * 与文件操作无关的 Agent，
@@ -56,6 +68,9 @@ public class AgentToolProvider {
             FileOperationTool fileOperationTool,
             ResourceDownloadTool resourceDownloadTool,
             PDFGenerationTool pdfGenerationTool,
+            MusicQueryTool musicQueryTool,
+            MusicPlaylistQueryTool musicPlaylistQueryTool,
+            AdminAnalyticsTool adminAnalyticsTool,
             ToolRetryWrapper toolRetryWrapper
     ) {
         this.toolRetryWrapper = toolRetryWrapper;
@@ -81,6 +96,26 @@ public class AgentToolProvider {
                 AgentType.EVAL, List.of(
                         webSearchTool,
                         webScrapingTool,
+                        terminateTool
+                ),
+                /*
+                 * 音乐普通用户：曲库只读 + 歌单只读。
+                 * terminate_task 必须带上，否则 Agent Loop 只能靠
+                 * 步数预算耗尽来结束，每次都要多烧一轮模型调用。
+                 */
+                AgentType.MUSIC_USER, List.of(
+                        musicQueryTool,
+                        musicPlaylistQueryTool,
+                        terminateTool
+                ),
+                /*
+                 * 音乐管理员：曲库只读 + 聚合统计，**不含歌单类工具**。
+                 * 管理员不得读取他人歌单或播放历史，这条规则在这里
+                 * 就体现为"数组里没有 MusicPlaylistQueryTool"。
+                 */
+                AgentType.MUSIC_ADMIN, List.of(
+                        musicQueryTool,
+                        adminAnalyticsTool,
                         terminateTool
                 )
         );

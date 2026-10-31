@@ -1,7 +1,8 @@
 # 音乐业务 Agent（M2）：数据模型与只读工具
 
 > 面向 M2 里程碑：把通用 ReAct Agent「MkManus」演进为音乐业务 Agent。
-> 本文随 M2 分批追加：本批（M2a）数据模型，下一批（M2b）只读工具。
+> 本文随 M2 分批追加：M2a 数据模型、M2b 只读工具、M2c 权限与统计。
+> 权限矩阵单独成文：[`music-permissions.md`](music-permissions.md)。
 >
 > 路线图位置：M0 基线 → M1 修复项 → **M2 音乐工具与权限** → M3 人工确认与断点恢复。
 
@@ -173,6 +174,13 @@ try {
 | `get_song_detail` | `songId` | 单首歌 | ID 必须来自前一次工具结果 |
 | `get_user_playlists` | 无 | 歌单列表（含 `songCount`） | 只返回**自己**创建的歌单 |
 | `get_playlist_songs` | `playlistId` | 歌曲列表（按歌单内顺序） | 自己的歌单或公开歌单；"不存在"与"无权"同一文案 |
+| `get_play_stats` | `days`（可选，默认 7，1~90） | 总次数 + 按日明细 | **管理员专用**；无用户标识 |
+| `get_top_songs` | `days`（同上）、`limit`（可选，默认 10，1~50） | 歌曲排行 | **管理员专用**；无用户标识 |
+
+前四个在 `MusicQueryTool`（曲库）与 `MusicPlaylistQueryTool`（歌单）两个 Bean 里，
+后两个在 `AdminAnalyticsTool`。拆成三个 Bean 不是随意分组：
+白名单粒度就是 Bean，管理员不能读歌单，所以歌单工具必须是独立 Bean
+（详见 [`music-permissions.md`](music-permissions.md)）。
 
 参数 schema 里**不存在** `userId` / `user_id` 属性，
 `MusicToolSchemaTest` 用 Jackson 解析 `ToolCallbacks.from(...)` 的 inputSchema 断言这一点
@@ -186,7 +194,7 @@ try {
 
 ### 4.4 事件文案
 
-`DefaultToolEventMessageProvider` 为四个工具加了开始/完成文案，
+`DefaultToolEventMessageProvider` 为六个工具加了开始/完成文案，
 完成文案读信封的 `meta.count`，**不读原始 JSON**：
 
 | 工具 | 开始 | 完成 |
@@ -195,6 +203,8 @@ try {
 | `get_song_detail` | 正在读取歌曲详情 | 已获取歌曲详情（`ok=false` → 未获取到歌曲详情） |
 | `get_user_playlists` | 正在读取我的歌单 | 找到 N 个歌单（`ok=false` → 未获取到歌单） |
 | `get_playlist_songs` | 正在读取歌单曲目 | 歌单中有 N 首歌（`ok=false` → 未获取到歌单曲目） |
+| `get_play_stats` | 正在统计播放数据 | 播放统计已生成（`ok=false` → 未获取到播放统计） |
+| `get_top_songs` | 正在统计歌曲排行 | 歌曲排行已生成（N 首）（`ok=false` → 未获取到歌曲排行） |
 
 截断时追加"（结果已截断）"：用户看到"找到 50 首"会以为是全部，
 不标出来等于让前端替模型撒谎。
@@ -215,6 +225,30 @@ try {
 | `AgentRunContextHolderBindingTest` | 真的跑一遍 Agent Loop：工具读到本次任务的 userId；`act()` 结束后绑定被清除，第二次任务不继承第一次的用户 |
 | `MusicQueryToolTest` | 四个工具无上下文全部抛异常且不查库；`limit` 归一化；空关键词/无结果/非法 ID 返回 `ok=false`；仓库异常不外泄 SQL |
 | `MusicToolSchemaTest` | 四个工具的 inputSchema 不含 `userId`/`user_id`；`keyword` 必填、`limit` 可选；无参工具 `properties` 为空 |
-| `DefaultToolEventMessageProviderTest` | 音乐工具的 start/result 文案；`ok=false` 不显示"完成"；截断后缀；文案不含标题/歌手/ID/JSON；信封解析失败退回通用文案 |
+| `MusicPlaylistQueryToolTest` | 歌单工具失败关闭；userId 来自上下文；无权与不存在同一文案 |
+| `MusicPlaylistAccessRuleTest` | **真实 SQL**：他人私有拒 / 他人公开可读 / 本人私有可读 / 管理员读他人拒 |
+| `MusicRoleResolverTest` | 未知用户 → UNKNOWN；脏角色值不升权；无上下文 → UNKNOWN |
+| `AdminAnalyticsToolTest` | 非管理员 `ok=false` 且仓库零调用；days/limit 夹取；聚合结果无用户标识 |
+| `MusicToolWhitelistIntegrationTest` | 两种类型的白名单精确相等；桩模型强行请求统计工具零数据访问 |
+| `DefaultToolEventMessageProviderTest` | 音乐工具（含管理员）的 start/result 文案；`ok=false` 不显示"完成"；截断后缀；文案不含标题/歌手/ID/JSON |
 
 全部在 H2 上跑，不需要 Docker 数据库。
+
+---
+
+## 6. 待办
+
+| 事项 | 原因 | 计划 |
+| --- | --- | --- |
+| 事件文案 i18n | 文案硬编码在 `DefaultToolEventMessageProvider`，中英混排界面会露出中文 | 前端接入多语言后统一抽 key |
+| `get_play_history` | 播放历史是强隐私数据 | M3 随权限模型开放 |
+| 管理员统计最小口径 | 数据量极小时聚合可能反推个体 | 需业务方定义（如 n < 5 不返回） |
+| 写工具人工确认 | 写工具已在 M2d 落地但不在白名单 | M3 审批链路 |
+
+## 7. 部署清单（M5）
+
+| 项 | 要求 | 现状 |
+| --- | --- | --- |
+| 反向代理读超时 | `nginx`/LB 的 `proxy_read_timeout` 必须 **> emitter 超时（150s）**，默认 60s 会让 SSE 先被掐断 | ⚠️ 待办：M5 部署时落实 |
+| `mkagent.agent.manus.sse-buffer` | 默认 30s，范围 1s~5m | ✅ 已配置 |
+| 数据库 | PostgreSQL；H2 仅测试 | ✅ |

@@ -176,11 +176,18 @@ public class MusicSeedInitializer implements ApplicationRunner {
     private static final int PLAY_LOG_COUNT = 30;
 
     /**
-     * 播放日志的基准时间：固定值而不是 now()，
-     * 保证种子数据可重复、测试断言可预期。
+     * 种子数据的时间锚点：本次初始化时的整点时间。
+     *
+     * 为什么不再硬编码日期：{@code get_play_stats(days)} 的窗口上限是 90 天，
+     * 写死某一天会让 dev 环境的统计工具在几个月后永远返回 0 条，
+     * 看起来像功能坏了。用"启动时的整点"做锚点，任何时候启动
+     * 种子数据都落在窗口内。
+     *
+     * 为什么每个实例只取一次而不是每次调用 now()：同一批数据必须共用
+     * 一个锚点，否则跨整点执行时会出现"用户创建时间晚于播放时间"。
      */
-    private static final LocalDateTime PLAY_LOG_BASE =
-            LocalDateTime.of(2026, 1, 5, 20, 0, 0);
+    private final LocalDateTime anchor = LocalDateTime.now()
+            .withMinute(0).withSecond(0).withNano(0);
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -278,7 +285,7 @@ public class MusicSeedInitializer implements ApplicationRunner {
     }
 
     private void insertUsers() {
-        Timestamp createdAt = Timestamp.valueOf(PLAY_LOG_BASE.minusDays(30));
+        Timestamp createdAt = Timestamp.valueOf(anchor.minusDays(30));
 
         jdbcTemplate.batchUpdate(
                 "INSERT INTO music_user (user_id, role, created_at) VALUES (?, ?, ?)",
@@ -301,7 +308,7 @@ public class MusicSeedInitializer implements ApplicationRunner {
                     parts[2],
                     parts[3],
                     Boolean.parseBoolean(parts[4]),
-                    Timestamp.valueOf(PLAY_LOG_BASE.minusDays(10))
+                    Timestamp.valueOf(anchor.minusDays(10))
             });
         }
 
@@ -321,7 +328,7 @@ public class MusicSeedInitializer implements ApplicationRunner {
                     row[0],
                     row[1],
                     (int) row[2],
-                    Timestamp.valueOf(PLAY_LOG_BASE.minusDays(9))
+                    Timestamp.valueOf(anchor.minusDays(9))
             });
         }
 
@@ -335,7 +342,8 @@ public class MusicSeedInitializer implements ApplicationRunner {
 
     /**
      * 播放日志：user-1 占 20 条、user-2 占 10 条，
-     * 歌曲在曲库里轮转，时间按分钟递增，便于"最近听过什么"类查询。
+     * 歌曲在曲库里轮转，**每天一条、由近及远回退 30 天**，
+     * 便于"最近听过什么"和"按日统计"两类查询在 dev 环境都有数据。
      */
     private void insertPlayLogs() {
         List<Object[]> rows = new ArrayList<>(PLAY_LOG_COUNT);
@@ -348,7 +356,7 @@ public class MusicSeedInitializer implements ApplicationRunner {
                     alice ? USER_ALICE : USER_BOB,
                     SONG_ID_BASE + (i * 7 % SONG_ROWS.length),
                     sources[i % sources.length],
-                    Timestamp.valueOf(PLAY_LOG_BASE.plusMinutes(i * 17L))
+                    Timestamp.valueOf(anchor.minusDays(29 - i).minusHours(2))
             });
         }
 

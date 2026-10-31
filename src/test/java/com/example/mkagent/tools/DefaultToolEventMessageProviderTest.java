@@ -1,6 +1,7 @@
 package com.example.mkagent.tools;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.LinkedHashMap;
@@ -389,6 +390,69 @@ class DefaultToolEventMessageProviderTest {
                 "工具调用完成",
                 provider.resultMessage("search_songs", null)
         );
+    }
+
+    // ==================== 管理员统计工具（M2c） ====================
+
+    @Test
+    @DisplayName("管理员工具的开始文案独立，不退化成工具名")
+    void adminToolsHaveReadableStartMessages() {
+        assertEquals("正在统计播放数据", provider.startMessage("get_play_stats"));
+        assertEquals("正在统计歌曲排行", provider.startMessage("get_top_songs"));
+    }
+
+    @Test
+    @DisplayName("播放总览：成功时只说“已生成”，不暴露具体数字")
+    void playStatsResultMessage() {
+        String envelope = ToolResponseEnvelope.okSingle(Map.of(
+                "totalPlays", 128,
+                "activeDays", 7,
+                "days", List.of()
+        ));
+
+        assertEquals("播放统计已生成",
+                provider.resultMessage("get_play_stats", envelope));
+    }
+
+    @Test
+    @DisplayName("歌曲排行：带条数，截断时追加标记")
+    void topSongsResultMessage() {
+        String envelope = ToolResponseEnvelope.okList(List.of(
+                Map.of("songId", 1001, "title", "夜航西飞", "artist", "林知夏", "plays", 9)
+        ));
+
+        String message = provider.resultMessage("get_top_songs", envelope);
+
+        assertEquals("歌曲排行已生成（1 首）", message);
+        assertFalse(message.contains("夜航西飞"), "不得回显歌曲标题");
+        assertFalse(message.contains("林知夏"), "不得回显歌手名");
+    }
+
+    @Test
+    @DisplayName("管理员工具失败：各自独立文案，且不显示“完成”")
+    void adminToolFailureMessages() {
+        String envelope = ToolResponseEnvelope.error(
+                AdminAnalyticsTool.NO_PERMISSION_MESSAGE);
+
+        assertEquals("未获取到播放统计",
+                provider.resultMessage("get_play_stats", envelope));
+        assertEquals("未获取到歌曲排行",
+                provider.resultMessage("get_top_songs", envelope));
+
+        assertFalse(
+                provider.resultMessage("get_play_stats", envelope).contains("完成"));
+    }
+
+    @Test
+    @DisplayName("管理员统计文案不含任何用户标识")
+    void adminToolMessagesLeakNoUserIdentity() {
+        String envelope = ToolResponseEnvelope.okSingle(Map.of(
+                "totalPlays", 1, "activeDays", 1, "days", List.of()));
+
+        String message = provider.resultMessage("get_play_stats", envelope);
+
+        assertFalse(message.contains("music-user"), "不得出现 userId");
+        assertFalse(message.contains("music-admin"), "不得出现 userId");
     }
 
     private static Map<String, Object> song(Long id, String title, String artist) {
