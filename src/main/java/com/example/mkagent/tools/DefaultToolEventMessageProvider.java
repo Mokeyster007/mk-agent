@@ -49,7 +49,14 @@ public class DefaultToolEventMessageProvider
             Map.entry("get_user_playlists", "正在读取我的歌单"),
             Map.entry("get_playlist_songs", "正在读取歌单曲目"),
             Map.entry("get_play_stats", "正在统计播放数据"),
-            Map.entry("get_top_songs", "正在统计歌曲排行")
+            Map.entry("get_top_songs", "正在统计歌曲排行"),
+            /*
+             * 写工具：文案里**不出现歌单名与歌曲名**。
+             * 这些是用户输入，可能含个人信息，也可能被塞进注入文本；
+             * 而 SSE 文案会直接推到浏览器。
+             */
+            Map.entry("create_playlist", "正在创建歌单"),
+            Map.entry("add_songs_to_playlist", "正在向歌单添加歌曲")
     );
 
     /**
@@ -65,7 +72,9 @@ public class DefaultToolEventMessageProvider
             "generate_pdf", "PDF 生成完成",
             "download_resource", "资源下载完成",
             "terminate_task", "任务结束已确认",
-            "demo_inventory_check", "库存查询完成"
+            "demo_inventory_check", "库存查询完成",
+            "create_playlist", "歌单创建成功",
+            "add_songs_to_playlist", "歌曲已加入歌单"
     );
 
     @Override

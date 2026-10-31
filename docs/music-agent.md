@@ -53,7 +53,7 @@
 派生方案、冲突分析与已知缺口见
 [`music-idempotency-research.md`](music-idempotency-research.md)：
 Spring AI 1.0.0 的 `ToolCallback` / `ToolCallingManager` **不传递 toolCallId**，
-所以键只能由 `userId + toolName + 规范化参数哈希` 派生。
+所以键只能由 `userId + runId + toolName + 规范化参数哈希` 派生。
 
 ### 2.3 访问层分工
 
@@ -192,7 +192,22 @@ try {
 **本批不提供 `get_play_history`**：播放历史是强隐私数据，
 等 M3 的权限模型（谁可以看自己的、管理员能看什么）落地再开放。
 
-### 4.4 事件文案
+### 4.4 写工具（M2d，未开放）
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `create_playlist` | `name`（1~50 字符）、`songIds`（去重后 1~50） | 建歌单并一次加歌；同名歌单拒绝覆盖 |
+| `add_songs_to_playlist` | `playlistId`、`songIds` | 只能操作自己的歌单；已有的歌跳过并计入 `skipped` |
+
+两个方法都标了 `@RequiresApproval`，**不在任何 AgentType 的白名单里**，
+`WriteToolGuardTest` 反射扫描并交叉验证白名单与重试名单。
+参数校验在工具层（纯语法），归属校验与落库在
+`MusicPlaylistWriteService`（`@Transactional`，要么全成功要么全回滚）。
+
+刻意不做：`rename` / `delete` / `remove_song`（删除类幂等语义未定）、
+`log_play`（播放日志不该由模型写）。
+
+### 4.5 事件文案
 
 `DefaultToolEventMessageProvider` 为六个工具加了开始/完成文案，
 完成文案读信封的 `meta.count`，**不读原始 JSON**：

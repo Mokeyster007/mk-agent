@@ -54,6 +54,16 @@
 但模型在任何 AgentType 下都看不到——这是"能力不存在"级别的防护，
 不是"提示词里说不要用"。
 
+写工具的可验证形式是 `@RequiresApproval` + `WriteToolGuardTest`：
+
+| 检查 | 方式 |
+| --- | --- |
+| 每个写工具都带审批注解 | 反射扫描 `tools` 包，断言 `@Tool` 方法上有 `@RequiresApproval` |
+| 写工具不在任何白名单 | 扫描结果 × `AgentToolProvider.getTools(每种 AgentType)` |
+| 写工具不会被自动重试 | 扫描结果 × `mkagent.tool-retry.retryable-tools` |
+
+新增写工具时忘了上面任何一条，这个测试会直接失败。
+
 ### 3.2 白名单装配位置
 
 | 层 | 位置 | 作用 |
@@ -113,7 +123,8 @@
 | 管理员能看全量聚合 | 数据量极小时，聚合结果可能反推出个体行为 | 需要业务方定义最小统计口径（如 n < 5 不返回） |
 | 播放历史未开放 | 用户暂时无法查"我最近听了什么" | M3 随权限模型一起开放 `get_play_history` |
 | 事件文案未做 i18n | 中英混排界面会露出中文 | 待办，见 `music-agent.md` 第 7 节 |
-| 写工具无人工确认 | 一旦误开放即直接落库 | M3 的审批链路（`@RequiresApproval` 已就位） |
+| 写工具无人工确认 | 一旦误开放即直接落库 | M3 的审批链路（`@RequiresApproval` 与守卫测试已就位） |
+| 歌单 ID 用 `MAX(id)+1` 分配 | 并发创建可能主键冲突（回滚，不会写脏数据） | 正式开放写工具前改为 identity / 序列 |
 
 ---
 
@@ -127,3 +138,6 @@
 | `MusicPlaylistAccessRuleTest` | 他人私有拒 / 他人公开可读 / 本人私有可读 / 管理员读他人拒 |
 | `AdminAnalyticsToolTest` | 非管理员 `ok=false` 且仓库零调用；越界夹取；返回无用户标识 |
 | `MusicToolSchemaTest` | 所有工具 schema 不含 `userId` / `user_id` |
+| `PlaylistWriteToolTest` | 写工具：成功落库、同名拒绝、他人歌单拒、重复歌跳过、参数越界、缺上下文失败关闭 |
+| `WriteToolGuardTest` | 写工具不在任何白名单、不在重试名单、注解不被误用 |
+| `IdempotencyKeysTest` | 键的稳定性与区分度（键序/空白/数字归一；数组顺序参与） |

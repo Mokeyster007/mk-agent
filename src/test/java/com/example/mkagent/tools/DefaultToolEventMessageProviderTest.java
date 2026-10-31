@@ -455,6 +455,48 @@ class DefaultToolEventMessageProviderTest {
         assertFalse(message.contains("music-admin"), "不得出现 userId");
     }
 
+    // ==================== 写工具（M2d） ====================
+
+    /**
+     * 写工具的文案必须与"读"区分开：用户看到"正在创建歌单"才知道
+     * 这次调用会产生副作用（M3 之后前面还会有一次人工确认）。
+     */
+    @Test
+    @DisplayName("写工具的开始与完成文案")
+    void writeToolMessages() {
+        assertEquals("正在创建歌单", provider.startMessage("create_playlist"));
+        assertEquals("正在向歌单添加歌曲",
+                provider.startMessage("add_songs_to_playlist"));
+
+        assertEquals("歌单创建成功",
+                provider.resultMessage("create_playlist", "{\"ok\":true}"));
+        assertEquals("歌曲已加入歌单",
+                provider.resultMessage("add_songs_to_playlist", "{\"ok\":true}"));
+    }
+
+    /**
+     * 写工具的结果文案里绝不能出现歌单名 / 歌曲名：
+     * 那是用户输入，可能含个人信息，也可能被塞进注入文本，
+     * 而 SSE 文案会直接推到浏览器。
+     */
+    @Test
+    @DisplayName("写工具文案不回显歌单名与歌曲名")
+    void writeToolMessagesLeakNoUserInput() throws Exception {
+        String envelope = ToolResponseEnvelope.okSingle(Map.of(
+                "playlistId", 2004,
+                "name", "我的私密歌单-张三",
+                "songCount", 2
+        ));
+        String encoded = new ObjectMapper().writeValueAsString(envelope);
+
+        String message = provider.resultMessage("create_playlist", encoded);
+
+        assertEquals("歌单创建成功", message);
+        assertFalse(message.contains("张三"), "不得回显歌单名");
+        assertFalse(message.contains("私密"), "不得回显歌单名");
+        assertFalse(message.contains("2004"), "不得回显歌单 ID");
+    }
+
     private static Map<String, Object> song(Long id, String title, String artist) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", id);
