@@ -825,3 +825,79 @@ retryTemplate.setBackOffPolicy(backOffPolicy);
 | `DashScopeImageModelRetryPoisoningTest` | 复现库的原地改写；断言对话模型私有模板不受影响 |
 | `DashScopeChatModelRetryWiringTest` | 加载 DashScope 对话自动配置 + `MockRestServiceServer` 返回 400：请求只发 1 次、`ToolCallAgent` 秒级 FAILED |
 | `ModelRetryProductionWiringTest` | 完整上下文：容器 Bean 仍为 `3 次 / 指数`，且对话模型持有另一个实例 |
+
+---
+
+## 14. SSE 连接超时缓冲：emitter 超时 = agent 超时 + buffer
+
+### 14.1 问题：超时事件发不出去
+
+`runStream()` 里 `SseEmitter` 的超时原本就是 `timeout.toMillis()`，
+与 Agent 的 timeout **同一时刻**到期。而 Agent 超时之后还要做三件事：
+
+1. `finishIfStillRunning` 判定 `TIMED_OUT`；
+2. 推送 `status` 事件（"任务运行超时，已强制停止。"）；
+3. 推送 `done` 并 `emitter.complete()`。
+
+容器的异步超时回调（`AsyncContext` 超时）与这三件事是竞态关系：
+一旦容器先到，连接被收掉，后面的事件全部写不进去
+（`sendEvent` 会吞掉 `IOException` / `IllegalStateException`，所以**日志里看不出来**）。
+用户侧表现就是"请求突然断了，什么都没收到"。
+
+### 14.2 方案：把"连接还能活多久"往后推
+
+```
+emitter 超时 = agent timeout + sse-buffer
+```
+
+| 项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mkagent.agent.manus.timeout` | `2m` | Agent 内部**仍然**按它判 `TIMED_OUT`（不变） |
+| `mkagent.agent.manus.sse-buffer` | `30s` | 只放宽连接存活时间 |
+| 合法范围 | `1s ~ 5m` | 越界 WARN 并回退 `30s` |
+
+两个边界值的理由：
+
+- **下限 1s**：缓冲小于一个网络往返时，超时事件仍然会在路上被掐断，等于没加；
+- **上限 5m**：缓冲过大 = 任务早结束了连接还挂着，容器线程与 socket 白占，
+  只是把资源泄漏的时间拉长。
+
+缓冲逻辑放在 `BaseAgent`（`setSseBuffer` + `resolveEmitterTimeout()`），
+`MkManus` 用 `@Value` 方法注入 —— 后续 `MusicAgent` 只要也调 `setSseBuffer` 就能复用，
+不需要在构造器上加参数（`EvalAgent` 是手动 `super(...)` 的，加参数会逼它硬编码）。
+
+`resolveEmitterTimeout()` 单独抽出来的原因：`SseEmitter` **没有**读 timeout 的接口，
+不抽成纯函数就只能靠"真跑一次超时"来验证，慢且不稳定。
+
+溢出保护：`setTimeout` 不校验上限，两个大值相加会溢出成负数，
+而**负数在 `SseEmitter` 里表示"永不过期"** —— 一次配置笔误就变成连接永不释放。
+
+### 14.3 ⚠️ 部署前提：反代超时必须大于 emitter 超时
+
+nginx / 负载均衡的读超时（`proxy_read_timeout`，nginx 默认 **60s**）
+必须**大于** emitter 超时（默认 `2m + 30s = 150s`），否则：
+
+1. 反代先在 60s 掐断连接；
+2. Agent 还在跑，事件全丢；
+3. 表现与"没加缓冲"完全一样，但日志里一切正常——极难排查。
+
+```nginx
+location /api/ai/ {
+    proxy_buffering off;            # SSE 必须关闭缓冲
+    proxy_read_timeout 180s;        # > emitter 超时（150s）
+    proxy_send_timeout 180s;
+}
+```
+
+调整 `manus.timeout` 时，这三个值要一起改。
+
+### 14.4 验证
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `SseEmitterTimeoutTest` | 默认 150s；自定义 buffer / timeout 参与计算；0s / 10m / null 回退；1s 与 5m 边界；溢出不退化为负数 |
+| `SseTimeoutEventDeliveryTest` | 真实容器：`timeout=500ms` + `buffer=5s`，桩模型每次睡 1.2s 且只请求工具 → 断言 `任务运行超时，已强制停止。` 与 `done` 都送达 |
+
+`SseTimeoutEventDeliveryTest` 是**有区分度**的：把 `new SseEmitter(...)` 改回
+`timeout.toMillis()` 后它立刻失败，客户端只收到 `status` + `run_id` 两条事件，
+这正是修复前线上的表现。

@@ -71,6 +71,48 @@ public abstract class BaseAgent {
      */
     private Duration timeout = Duration.ofMinutes(2);
 
+    /**
+     * SSE 缓冲的默认值：30 秒。
+     *
+     * 依据：超时收尾要发 2~3 条事件（STATUS / DONE），
+     * 正常情况下几十毫秒内发完；30 秒足够覆盖"客户端网络抖动 +
+     * 反代缓冲 + 服务端 GC 停顿"，又不会让一个已无用的连接长期占着。
+     */
+    public static final Duration DEFAULT_SSE_BUFFER = Duration.ofSeconds(30);
+
+    /**
+     * SSE 缓冲下限：1 秒。
+     *
+     * 再小就等于没有缓冲——一条事件的网络往返都不止 1 秒的情况很常见，
+     * 缓冲小于一个 RTT 时，超时事件仍然会在路上被掐断。
+     */
+    public static final Duration MIN_SSE_BUFFER = Duration.ofSeconds(1);
+
+    /**
+     * SSE 缓冲上限：5 分钟。
+     *
+     * 缓冲过大意味着"任务早就结束了，连接还挂着"：
+     * 容器线程 / socket 一直被占用，客户端也早已放弃，
+     * 只是把资源泄漏的时间拉长。
+     */
+    public static final Duration MAX_SSE_BUFFER = Duration.ofMinutes(5);
+
+    /**
+     * SSE 连接在 Agent 超时之后**额外保留**的时间（默认 30 秒）。
+     *
+     * 为什么必须有这个缓冲：
+     * SseEmitter 的超时与 Agent 的 timeout 原本是同一个时刻到期的。
+     * Agent 超时后还要做三件事——判定 TIMED_OUT、推送 STATUS 事件、
+     * 推送 DONE 并 complete()——而容器的异步超时回调可能先一步到达，
+     * 结果就是"超时事件永远发不出去"，前端只能看到连接被掐断。
+     *
+     * 加上缓冲之后：
+     *   emitter 超时 = agent timeout + buffer
+     * Agent 内部仍按原来的 timeout 判 TIMED_OUT，
+     * 只是把"连接还能活多久"往后推了一段，给收尾事件留出发送窗口。
+     */
+    private Duration sseBuffer = DEFAULT_SSE_BUFFER;
+
     private final Executor agentExecutor;
 
     /**
@@ -337,10 +379,21 @@ public abstract class BaseAgent {
         try {
 
         /*
-         * SSE HTTP 连接最长存活时间。
-         * 与 Agent 任务 timeout 保持一致。
+         * SSE HTTP 连接最长存活时间 = Agent 超时 + 缓冲。
+         *
+         * 不能让两者相等：Agent 超时后还要发 TIMED_OUT 状态事件与 DONE，
+         * 容器异步超时先到就会把这几条事件吞掉（详见 sseBuffer 的注释）。
+         * Agent 内部仍按 timeout 判定 TIMED_OUT，这里只放宽连接存活时间。
          */
-        SseEmitter emitter = new SseEmitter(timeout.toMillis());
+        long emitterTimeout = resolveEmitterTimeout();
+        log.info(
+                "SSE 连接超时设置：agentTimeout={}ms, buffer={}ms, emitterTimeout={}ms",
+                timeout.toMillis(),
+                sseBuffer.toMillis(),
+                emitterTimeout
+        );
+
+        SseEmitter emitter = new SseEmitter(emitterTimeout);
 
         /*
          * 每次 Agent 请求拥有独立上下文。
@@ -998,6 +1051,57 @@ public abstract class BaseAgent {
 
     public void setTimeout(Duration timeout) {
         this.timeout = timeout;
+    }
+
+    public Duration getSseBuffer() {
+        return sseBuffer;
+    }
+
+    /**
+     * 设置 SSE 缓冲（通用能力，MkManus 通过 @Value 方法注入）。
+     *
+     * 越界（含 null、负数、小于 1 秒、大于 5 分钟）一律 WARN 并回退默认值：
+     * 这个值的意义是"保证超时事件能发出去"，
+     * 配置笔误（例如把 30s 写成 0s 或 30000）不该让线上静默失去保护。
+     */
+    public void setSseBuffer(Duration sseBuffer) {
+        if (sseBuffer == null
+                || sseBuffer.compareTo(MIN_SSE_BUFFER) < 0
+                || sseBuffer.compareTo(MAX_SSE_BUFFER) > 0) {
+            log.warn(
+                    "sse-buffer={} 非法（要求 {}~{}），回退默认值 {}",
+                    sseBuffer, MIN_SSE_BUFFER, MAX_SSE_BUFFER, DEFAULT_SSE_BUFFER
+            );
+            this.sseBuffer = DEFAULT_SSE_BUFFER;
+            return;
+        }
+        this.sseBuffer = sseBuffer;
+    }
+
+    /**
+     * 计算 SseEmitter 的超时时间（毫秒）= Agent 超时 + 缓冲。
+     *
+     * 抽成独立方法是为了能**离线**断言这个数：
+     * SseEmitter 不提供 timeout 的读取接口，
+     * 不抽出来就只能靠"跑一遍真实超时"来间接验证，慢且不稳定。
+     *
+     * 溢出保护：timeout 本身没有上限（setTimeout 不做校验），
+     * 极端值相加会溢出成负数，而负数在 SseEmitter 里表示"永不过期"——
+     * 那会把一次配置笔误变成连接永不释放。
+     */
+    protected long resolveEmitterTimeout() {
+        long agentMillis = timeout == null ? 0L : timeout.toMillis();
+        long bufferMillis = sseBuffer == null ? 0L : sseBuffer.toMillis();
+
+        long total = agentMillis + bufferMillis;
+        if (total < 0) {
+            log.warn(
+                    "SSE 超时计算溢出（agentTimeout={}ms, buffer={}ms），退化为不过期上限",
+                    agentMillis, bufferMillis
+            );
+            return Long.MAX_VALUE;
+        }
+        return total;
     }
 
     /**

@@ -97,6 +97,14 @@ mkagent:
       max-steps: 8
       max-tool-calls: 12
       timeout: 2m
+      # SSE 连接在 Agent 超时之后额外保留的时间（合法范围 1s ~ 5m，越界回退 30s）。
+      # emitter 超时 = timeout + sse-buffer = 150s。
+      # 不能让两者相等：Agent 超时后还要推 TIMED_OUT 状态与 DONE，
+      # 容器异步超时先到会把这几条事件吞掉，前端只看到连接被掐断。
+      #
+      # ⚠️ 前置 nginx / LB 的 proxy_read_timeout（默认 60s）必须大于
+      #    emitter 超时（150s），否则连接会先被反代掐断，本配置等于没生效。
+      sse-buffer: 30s
     # 预算耗尽（MAX_STEPS_REACHED / 工具次数上限）且尚无最终回答时，
     # 额外执行一次"不带工具"的模型调用，让模型基于已有信息总结尽力而为的回答，
     # 并在答案前标注"(因步数预算耗尽，以下为基于已获取信息的尽力回答)"。

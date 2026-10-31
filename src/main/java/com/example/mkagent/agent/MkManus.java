@@ -196,6 +196,24 @@ public class MkManus extends ToolCallAgent {
     }
 
     /**
+     * SSE 连接在 Agent 超时之后额外保留的时间
+     * （配置项 mkagent.agent.manus.sse-buffer，默认 30s）。
+     *
+     * 为什么需要它：
+     * SseEmitter 的超时原本与 agent timeout 同时到期，
+     * Agent 超时后要发 TIMED_OUT 状态事件与 DONE，
+     * 容器异步超时先到就会把这些事件吞掉。
+     *
+     * 合法范围由 BaseAgent 校验（1s ~ 5m），越界 WARN 并回退默认值。
+     * 同样用方法注入：缓冲逻辑放在 BaseAgent 里做成通用能力，
+     * 后续 MusicAgent 只要也调用 setSseBuffer 即可复用。
+     */
+    @Value("${mkagent.agent.manus.sse-buffer:30s}")
+    public void applySseBuffer(Duration sseBuffer) {
+        setSseBuffer(sseBuffer);
+    }
+
+    /**
      * 剩余步数提示阈值（配置项 mkagent.agent.budget-warning-steps，默认 2）。
      *
      * 用 @Value 方法注入而不是加构造参数：
