@@ -112,6 +112,18 @@ mkagent:
     # 关闭（false）则保持旧行为：返回步骤摘要。
     force-final-answer: true
 
+    # 音乐 Agent（MUSIC_USER / MUSIC_ADMIN）的预算。
+    # 校验规则与 manus 完全一致（同一个 AgentBudgetPolicy）：
+    # max-steps ≤ 30、max-tool-calls ≤ 60、timeout ≤ 30m、sse-buffer 1s~5m，
+    # 越界一律 WARN 并回退默认值，不会让非法值进入运行中的任务。
+    music:
+      max-steps: 8
+      max-tool-calls: 12
+      timeout: 2m
+      # emitter 超时 = timeout + sse-buffer = 150s，
+      # 同样要求前置 nginx / LB 的 proxy_read_timeout > 150s（见 M5 部署清单）。
+      sse-buffer: 30s
+
   # ===========================================================
   # 模型分层（OpenAI 兼容接口）。
   #

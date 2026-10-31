@@ -4,8 +4,6 @@ import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
 import com.example.mkagent.tools.ToolEventMessageProvider;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -33,33 +31,17 @@ import java.util.concurrent.Executor;
 @Component
 public class MkManus extends ToolCallAgent {
 
-    private static final Logger log = LoggerFactory.getLogger(MkManus.class);
-
     /**
-     * 预算默认值。
+     * 预算默认值来自 {@link AgentBudgetPolicy}（与 MusicAgent 共用同一套规则）。
      *
      * 同时作为非 Spring 场景（EvalAgent 手动 super(...)，
      * 方法注入不会执行）的初始值，保证手动构造的 Agent
      * 与线上默认配置一致。
      */
-    private static final int DEFAULT_MAX_STEPS = 8;
-    private static final int DEFAULT_MAX_TOOL_CALLS = 12;
-    private static final Duration DEFAULT_TIMEOUT = Duration.ofMinutes(2);
-
-    /**
-     * 配置上限：防止单位/数字笔误（例如多写一个 0）导致单任务成本失控。
-     *
-     * 依据：
-     * - max-steps=30：每一步都是一次模型调用，30 步已覆盖长任务；
-     *   再放大，成本随步数线性增长，收益很低。
-     * - max-tool-calls=60：约为步数上限的 2 倍，覆盖"一轮同时调多个工具"
-     *   的情况，同时限制外部搜索/抓取的调用成本。
-     * - timeout=30m：在线请求超过 30 分钟已无交付意义，
-     *   还会长期占用并发许可；超时后的检索结果用户也未必还等得到。
-     */
-    private static final int MAX_ALLOWED_STEPS = 30;
-    private static final int MAX_ALLOWED_TOOL_CALLS = 60;
-    private static final Duration MAX_ALLOWED_TIMEOUT = Duration.ofMinutes(30);
+    private static final int DEFAULT_MAX_STEPS = AgentBudgetPolicy.DEFAULT_MAX_STEPS;
+    private static final int DEFAULT_MAX_TOOL_CALLS =
+            AgentBudgetPolicy.DEFAULT_MAX_TOOL_CALLS;
+    private static final Duration DEFAULT_TIMEOUT = AgentBudgetPolicy.DEFAULT_TIMEOUT;
 
     public MkManus(
             ChatModel chatModel,
@@ -144,15 +126,8 @@ public class MkManus extends ToolCallAgent {
      */
     @Value("${mkagent.agent.manus.max-steps:8}")
     public void applyMaxSteps(int maxSteps) {
-        if (maxSteps <= 0 || maxSteps > MAX_ALLOWED_STEPS) {
-            log.warn(
-                    "mkagent.agent.manus.max-steps={} 非法（要求 1~{}），回退默认值 {}",
-                    maxSteps, MAX_ALLOWED_STEPS, DEFAULT_MAX_STEPS
-            );
-            setMaxSteps(DEFAULT_MAX_STEPS);
-            return;
-        }
-        setMaxSteps(maxSteps);
+        setMaxSteps(AgentBudgetPolicy.maxSteps(
+                maxSteps, "mkagent.agent.manus.max-steps"));
     }
 
     /**
@@ -162,15 +137,8 @@ public class MkManus extends ToolCallAgent {
      */
     @Value("${mkagent.agent.manus.max-tool-calls:12}")
     public void applyMaxToolCalls(int maxToolCalls) {
-        if (maxToolCalls <= 0 || maxToolCalls > MAX_ALLOWED_TOOL_CALLS) {
-            log.warn(
-                    "mkagent.agent.manus.max-tool-calls={} 非法（要求 1~{}），回退默认值 {}",
-                    maxToolCalls, MAX_ALLOWED_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS
-            );
-            setMaxToolCalls(DEFAULT_MAX_TOOL_CALLS);
-            return;
-        }
-        setMaxToolCalls(maxToolCalls);
+        setMaxToolCalls(AgentBudgetPolicy.maxToolCalls(
+                maxToolCalls, "mkagent.agent.manus.max-tool-calls"));
     }
 
     /**
@@ -181,18 +149,8 @@ public class MkManus extends ToolCallAgent {
      */
     @Value("${mkagent.agent.manus.timeout:2m}")
     public void applyTimeout(Duration timeout) {
-        if (timeout == null
-                || timeout.isZero()
-                || timeout.isNegative()
-                || timeout.compareTo(MAX_ALLOWED_TIMEOUT) > 0) {
-            log.warn(
-                    "mkagent.agent.manus.timeout={} 非法（要求大于 0 且不超过 {}），回退默认值 {}",
-                    timeout, MAX_ALLOWED_TIMEOUT, DEFAULT_TIMEOUT
-            );
-            setTimeout(DEFAULT_TIMEOUT);
-            return;
-        }
-        setTimeout(timeout);
+        setTimeout(AgentBudgetPolicy.timeout(
+                timeout, "mkagent.agent.manus.timeout"));
     }
 
     /**

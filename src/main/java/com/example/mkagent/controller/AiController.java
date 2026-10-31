@@ -3,10 +3,12 @@ package com.example.mkagent.controller;
 import com.example.mkagent.agent.AgentTaskCanceller;
 import com.example.mkagent.agent.AgentTaskRegistry;
 import com.example.mkagent.agent.MkManus;
+import com.example.mkagent.agent.MusicAgent;
 import com.example.mkagent.app.chatApp;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.RunningAgentTask;
+import com.example.mkagent.music.MusicAccessGuard;
 import com.example.mkagent.resilience.AgentRequestRateLimiter;
 import com.example.mkagent.resilience.RateLimitResult;
 import jakarta.annotation.Resource;
@@ -57,6 +59,27 @@ public class AiController {
      */
     @Resource
     private MkManus mkManus;
+
+    /**
+     * 音乐普通用户 Agent（AgentType.MUSIC_USER）。
+     *
+     * 与 MkManus 同为 ToolCallAgent 的具体实例，共用同一套循环与 SSE 逻辑；
+     * 差别只在工具白名单与系统提示词，见 MusicAgentConfig。
+     */
+    @Resource(name = "musicUserAgent")
+    private MusicAgent musicUserAgent;
+
+    /**
+     * 音乐管理员 Agent（AgentType.MUSIC_ADMIN）。
+     */
+    @Resource(name = "musicAdminAgent")
+    private MusicAgent musicAdminAgent;
+
+    /**
+     * 音乐入口访问控制：在启动 Agent **之前**校验身份与角色。
+     */
+    @Resource
+    private MusicAccessGuard musicAccessGuard;
 
     /**
      * 运行中任务注册表：按 runId 查询任务，支撑主动取消接口。
@@ -212,6 +235,44 @@ public class AiController {
         checkAgentRateLimit(request);
 
         return mkManus.runStream(message);
+    }
+
+    /**
+     * 音乐普通用户入口。
+     *
+     * 访问控制先于 Agent 启动：缺身份 401、未知用户 403。
+     * agentType 由**入口**决定（MUSIC_USER），不接受任何请求参数。
+     *
+     * 与 /ai/manus/chat 使用同一套限流；
+     * 该接口本身没有输入长度校验（全项目统一由模型侧截断），
+     * 音乐入口保持一致，不额外加一条只作用于新接口的规则。
+     */
+    @GetMapping("/music/chat")
+    public SseEmitter doChatWithMusic(
+            String message,
+            HttpServletRequest request
+    ) {
+        musicAccessGuard.requireUser();
+        checkAgentRateLimit(request);
+
+        return musicUserAgent.runStream(message);
+    }
+
+    /**
+     * 音乐管理员入口。
+     *
+     * 要求 music_user 表中角色为 ADMIN，否则 403；
+     * agentType 固定为 MUSIC_ADMIN（白名单里没有歌单类工具）。
+     */
+    @GetMapping("/music/admin/chat")
+    public SseEmitter doChatWithMusicAdmin(
+            String message,
+            HttpServletRequest request
+    ) {
+        musicAccessGuard.requireAdmin();
+        checkAgentRateLimit(request);
+
+        return musicAdminAgent.runStream(message);
     }
 
     /**
