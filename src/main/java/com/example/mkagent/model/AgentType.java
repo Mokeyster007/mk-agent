@@ -34,5 +34,25 @@ public enum AgentType {
      * 2. 使用独立的评测并发闸门；
      * 3. 不注入 AgentRunRecorder，因此不会写入 agent_run 表。
      */
-    EVAL
+    EVAL,
+
+    /**
+     * 音乐业务：普通用户。
+     *
+     * 只读音乐工具（检索歌曲 / 歌曲详情 / 我的歌单）。
+     * 写工具（建歌单、加歌等）在 M3 之前不得进入本类型的白名单。
+     *
+     * 追加在枚举末尾：agent_run.agent_type 存的是枚举名（VARCHAR(32)），
+     * 不依赖 ordinal，但保持既有值的相对顺序可以让日志与脚本更好读。
+     */
+    MUSIC_USER,
+
+    /**
+     * 音乐业务：管理员。
+     *
+     * 与 MUSIC_USER 的差别只有"能看到统计类只读数据"，
+     * 且管理员身份必须由服务端查 music_user 表确认，
+     * 绝不接受请求参数或提示词里的自我声明。
+     */
+    MUSIC_ADMIN
 }

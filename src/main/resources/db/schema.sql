@@ -86,3 +86,120 @@ COMMENT ON COLUMN agent_run.prompt_tokens IS '累计输入 Token 数（模型未
 COMMENT ON COLUMN agent_run.completion_tokens IS '累计输出 Token 数';
 COMMENT ON COLUMN agent_run.total_tokens IS '累计总 Token 数（成本统计主键）';
 COMMENT ON COLUMN agent_run.total_cost_millis IS '任务总耗时（毫秒）';
+
+-- =============================================================
+-- 音乐业务表（M2a：数据模型）
+--
+-- 约定与 agent_run 一致：
+-- 1. 主键由应用侧生成（雪花 / 种子固定 ID），不用数据库自增，
+--    便于测试与种子数据幂等；
+-- 2. 全部 IF NOT EXISTS，PostgreSQL 与 H2（PostgreSQL 兼容模式）通用；
+-- 3. 时间列统一 TIMESTAMP + DEFAULT CURRENT_TIMESTAMP。
+--
+-- 权限模型：写工具在 M3 之前不进任何白名单，
+-- 因此本批只有只读工具会用到这些表。
+-- =============================================================
+
+-- 曲库。刻意不建 play_count：
+-- 播放次数是"聚合结果"，应该由 music_play_log 聚合得出，
+-- 冗余计数会在并发写入时产生偏差，且需要额外的补偿任务。
+CREATE TABLE IF NOT EXISTS music_song
+(
+    id               BIGINT       NOT NULL,
+    title            VARCHAR(200) NOT NULL,
+    artist           VARCHAR(200) NOT NULL,
+    album            VARCHAR(200),
+    duration_seconds INT,
+    genre            VARCHAR(64),
+    release_year     INT,
+    CONSTRAINT pk_music_song PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_music_song_title ON music_song (title);
+CREATE INDEX IF NOT EXISTS idx_music_song_artist ON music_song (artist);
+
+-- 歌单。is_public 决定"别人的歌单能不能被看到"，
+-- 私有歌单只有 owner 本人可读（由服务端按 music_playlist.user_id 校验）。
+CREATE TABLE IF NOT EXISTS music_playlist
+(
+    id          BIGINT       NOT NULL,
+    user_id     VARCHAR(64)  NOT NULL,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(500),
+    is_public   BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_playlist PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_music_playlist_user_id ON music_playlist (user_id);
+
+-- 同一用户不允许同名歌单；不同用户之间互不影响。
+CREATE UNIQUE INDEX IF NOT EXISTS uk_music_playlist_user_name
+    ON music_playlist (user_id, name);
+
+-- 歌单-歌曲关联。
+-- 主键 (playlist_id, song_id)：同一首歌在一个歌单里只能出现一次；
+-- position 只表达展示顺序，不参与唯一性约束。
+CREATE TABLE IF NOT EXISTS music_playlist_song
+(
+    playlist_id BIGINT    NOT NULL,
+    song_id     BIGINT    NOT NULL,
+    position    INT       NOT NULL,
+    added_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_playlist_song PRIMARY KEY (playlist_id, song_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_music_playlist_song_playlist
+    ON music_playlist_song (playlist_id, position);
+
+-- 播放日志。只记"谁在什么时候听了哪首歌、从哪来"，
+-- 不记设备指纹、IP 等个人信息。
+CREATE TABLE IF NOT EXISTS music_play_log
+(
+    id         BIGINT      NOT NULL,
+    user_id    VARCHAR(64) NOT NULL,
+    song_id    BIGINT      NOT NULL,
+    source     VARCHAR(32),
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_play_log PRIMARY KEY (id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_music_play_log_user_created
+    ON music_play_log (user_id, created_at);
+
+-- 用户角色。
+-- 管理员身份的唯一可信来源是这张表（服务端查询），
+-- 不接受请求参数、请求头或提示词里的"我是管理员"。
+CREATE TABLE IF NOT EXISTS music_user
+(
+    user_id    VARCHAR(64) NOT NULL,
+    role       VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_user PRIMARY KEY (user_id)
+);
+
+-- 写工具幂等表（M2 只建表，M3 启用）。
+-- 主键 (user_id, idempotency_key)：幂等键由**服务端派生**，不暴露给模型，
+-- 派生方案与取舍见 docs/music-idempotency-research.md。
+CREATE TABLE IF NOT EXISTS music_tool_idempotency
+(
+    user_id         VARCHAR(64)  NOT NULL,
+    idempotency_key VARCHAR(128) NOT NULL,
+    tool_name       VARCHAR(64)  NOT NULL,
+    request_hash    VARCHAR(64)  NOT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    result_json     TEXT,
+    CONSTRAINT pk_music_tool_idempotency PRIMARY KEY (user_id, idempotency_key)
+);
+
+COMMENT ON TABLE music_song IS '曲库（虚构种子数据，不含真实版权内容）';
+COMMENT ON COLUMN music_song.duration_seconds IS '时长（秒）';
+COMMENT ON COLUMN music_song.release_year IS '发行年份';
+COMMENT ON TABLE music_playlist IS '歌单（公开 / 私有）';
+COMMENT ON COLUMN music_playlist.is_public IS '是否公开：TRUE 任何人可读，FALSE 仅 owner 可读';
+COMMENT ON TABLE music_playlist_song IS '歌单-歌曲关联（同一歌单内歌曲不重复）';
+COMMENT ON COLUMN music_playlist_song.position IS '歌单内展示顺序（从 1 开始，不参与唯一性约束）';
+COMMENT ON TABLE music_play_log IS '播放日志（不含设备指纹 / IP 等个人信息）';
+COMMENT ON TABLE music_user IS '用户角色表：管理员身份的唯一可信来源';
+COMMENT ON COLUMN music_user.role IS '角色：USER / ADMIN';
+COMMENT ON TABLE music_tool_idempotency IS '写工具幂等记录（M3 启用；幂等键由服务端派生）';

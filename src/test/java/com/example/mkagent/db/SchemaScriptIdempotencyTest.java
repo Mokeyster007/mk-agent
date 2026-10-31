@@ -134,6 +134,71 @@ class SchemaScriptIdempotencyTest {
         }
     }
 
+    @Test
+    @DisplayName("音乐业务 6 张表：重复执行不报错，列与唯一索引符合设计")
+    void musicTablesAreCreatedIdempotently() throws Exception {
+        String url = "jdbc:h2:mem:schema_music;MODE=PostgreSQL;"
+                + "DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1";
+
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            // 连续执行两次：第二次所有 DDL 都处于"已存在"状态。
+            ScriptUtils.executeSqlScript(
+                    connection, new ClassPathResource("db/schema.sql"));
+            ScriptUtils.executeSqlScript(
+                    connection, new ClassPathResource("db/schema.sql"));
+
+            for (String table : List.of(
+                    "music_song",
+                    "music_playlist",
+                    "music_playlist_song",
+                    "music_play_log",
+                    "music_user",
+                    "music_tool_idempotency"
+            )) {
+                assertTrue(tableExists(connection, table),
+                        "缺少音乐业务表：" + table);
+            }
+
+            List<String> songColumns = columnNames(connection, "music_song");
+            assertTrue(songColumns.contains("duration_seconds"));
+            assertFalse(songColumns.contains("play_count"),
+                    "曲库刻意不建 play_count（由 music_play_log 聚合），实际列："
+                            + songColumns);
+
+            assertTrue(columnNames(connection, "music_playlist_song")
+                            .contains("position"),
+                    "歌单歌曲表需要 position 表达展示顺序");
+            assertTrue(columnNames(connection, "music_user").contains("role"));
+
+            assertTrue(indexNames(connection, "music_playlist")
+                            .contains("uk_music_playlist_user_name"),
+                    "同一用户不允许同名歌单，需要唯一索引 (user_id, name)");
+        }
+    }
+
+    private boolean tableExists(Connection connection, String table)
+            throws Exception {
+        try (ResultSet resultSet = connection.getMetaData().getTables(
+                null, null, table, new String[]{"TABLE"})) {
+            return resultSet.next();
+        }
+    }
+
+    private List<String> indexNames(Connection connection, String table)
+            throws Exception {
+        List<String> names = new ArrayList<>();
+        try (ResultSet resultSet = connection.getMetaData().getIndexInfo(
+                null, null, table, false, false)) {
+            while (resultSet.next()) {
+                String name = resultSet.getString("INDEX_NAME");
+                if (name != null) {
+                    names.add(name.toLowerCase());
+                }
+            }
+        }
+        return names;
+    }
+
     private List<String> columnNames(Connection connection, String table)
             throws Exception {
         List<String> columns = new ArrayList<>();
