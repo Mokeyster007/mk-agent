@@ -6,13 +6,18 @@ import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.PreparedStatement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 音乐业务种子数据初始化器。
@@ -58,11 +63,15 @@ public class MusicSeedInitializer implements ApplicationRunner {
     public static final String USER_ADMIN = "music-admin-1";
 
     /**
-     * 种子歌单 ID：2001（alice 私有）、2002（alice 公开）、2003（bob 公开）。
+     * 种子歌单名：alice 私有、alice 公开、bob 公开。
+     *
+     * 只保留**名字**，不再保留固定 ID。歌单 id 由数据库 identity 列生成：
+     * 显式写死 id 不会推进序列，之后新插入的行仍从 1 开始，早晚撞上历史值。
+     * 需要 id 的地方（歌单歌曲关联、测试）一律按 (user_id, name) 回查。
      */
-    public static final long PLAYLIST_PRIVATE_ALICE = 2001L;
-    public static final long PLAYLIST_PUBLIC_ALICE = 2002L;
-    public static final long PLAYLIST_PUBLIC_BOB = 2003L;
+    public static final String PLAYLIST_NAME_PRIVATE_ALICE = "深夜通勤";
+    public static final String PLAYLIST_NAME_PUBLIC_ALICE = "周末清晨";
+    public static final String PLAYLIST_NAME_PUBLIC_BOB = "跑步歌单";
 
     /**
      * 歌曲元数据：title|artist|album|durationSeconds|genre|releaseYear。
@@ -134,40 +143,43 @@ public class MusicSeedInitializer implements ApplicationRunner {
     };
 
     /**
-     * 歌单：id|user|name|description|isPublic。
+     * 歌单：user|name|description|isPublic（id 由数据库生成，这里不写）。
      */
     private static final String[] PLAYLIST_ROWS = {
-            "2001|" + USER_ALICE + "|深夜通勤|地铁上的四十分钟|false",
-            "2002|" + USER_ALICE + "|周末清晨|咖啡与窗边的光|true",
-            "2003|" + USER_BOB + "|跑步歌单|配速 5 分 30 秒|true"
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|地铁上的四十分钟|false",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|咖啡与窗边的光|true",
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|配速 5 分 30 秒|true"
     };
 
     /**
-     * 歌单内歌曲：playlistId|songId|position。
+     * 歌单内歌曲：user|playlistName|songId|position。
+     *
+     * 用 (user, name) 而不是歌单 id：id 由数据库生成，
+     * 只能插完歌单再按 (user_id, name) 回查（见 {@link #insertPlaylists()}）。
      */
-    private static final long[][] PLAYLIST_SONGS = {
+    private static final String[] PLAYLIST_SONGS = {
             // alice 私有歌单：8 首
-            {PLAYLIST_PRIVATE_ALICE, 1001, 1},
-            {PLAYLIST_PRIVATE_ALICE, 1002, 2},
-            {PLAYLIST_PRIVATE_ALICE, 1003, 3},
-            {PLAYLIST_PRIVATE_ALICE, 1004, 4},
-            {PLAYLIST_PRIVATE_ALICE, 1005, 5},
-            {PLAYLIST_PRIVATE_ALICE, 1012, 6},
-            {PLAYLIST_PRIVATE_ALICE, 1021, 7},
-            {PLAYLIST_PRIVATE_ALICE, 1031, 8},
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1001|1",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1002|2",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1003|3",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1004|4",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1005|5",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1012|6",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1021|7",
+            USER_ALICE + "|" + PLAYLIST_NAME_PRIVATE_ALICE + "|1031|8",
             // alice 公开歌单：6 首
-            {PLAYLIST_PUBLIC_ALICE, 1006, 1},
-            {PLAYLIST_PUBLIC_ALICE, 1007, 2},
-            {PLAYLIST_PUBLIC_ALICE, 1041, 3},
-            {PLAYLIST_PUBLIC_ALICE, 1042, 4},
-            {PLAYLIST_PUBLIC_ALICE, 1051, 5},
-            {PLAYLIST_PUBLIC_ALICE, 1056, 6},
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1006|1",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1007|2",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1041|3",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1042|4",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1051|5",
+            USER_ALICE + "|" + PLAYLIST_NAME_PUBLIC_ALICE + "|1056|6",
             // bob 公开歌单：5 首
-            {PLAYLIST_PUBLIC_BOB, 1011, 1},
-            {PLAYLIST_PUBLIC_BOB, 1016, 2},
-            {PLAYLIST_PUBLIC_BOB, 1026, 3},
-            {PLAYLIST_PUBLIC_BOB, 1036, 4},
-            {PLAYLIST_PUBLIC_BOB, 1046, 5}
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|1011|1",
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|1016|2",
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|1026|3",
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|1036|4",
+            USER_BOB + "|" + PLAYLIST_NAME_PUBLIC_BOB + "|1046|5"
     };
 
     /**
@@ -225,8 +237,8 @@ public class MusicSeedInitializer implements ApplicationRunner {
 
         insertSongs();
         insertUsers();
-        insertPlaylists();
-        insertPlaylistSongs();
+        Map<String, Long> playlistIds = insertPlaylists();
+        insertPlaylistSongs(playlistIds);
         insertPlayLogs();
 
         log.info(
@@ -297,37 +309,59 @@ public class MusicSeedInitializer implements ApplicationRunner {
         );
     }
 
-    private void insertPlaylists() {
-        List<Object[]> rows = new ArrayList<>(PLAYLIST_ROWS.length);
+    /**
+     * 插入歌单，返回 {@code user|name} → 数据库生成的歌单 id。
+     *
+     * 逐条插入而不是 batchUpdate：批量插入拿不到**逐行**生成的键，
+     * 而下面的歌单歌曲关联必须按真实 id 写入。种子只有 3 个歌单，代价可忽略。
+     */
+    private Map<String, Long> insertPlaylists() {
+        Map<String, Long> idsByKey = new LinkedHashMap<>(PLAYLIST_ROWS.length);
 
         for (String row : PLAYLIST_ROWS) {
             String[] parts = row.split("\\|");
-            rows.add(new Object[]{
-                    Long.parseLong(parts[0]),
-                    parts[1],
-                    parts[2],
-                    parts[3],
-                    Boolean.parseBoolean(parts[4]),
-                    Timestamp.valueOf(anchor.minusDays(10))
-            });
+            String userId = parts[0];
+            String name = parts[1];
+
+            KeyHolder keyHolder = new GeneratedKeyHolder();
+
+            jdbcTemplate.update(connection -> {
+                PreparedStatement statement = connection.prepareStatement(
+                        "INSERT INTO music_playlist "
+                                + "(user_id, name, description, is_public, created_at) "
+                                + "VALUES (?, ?, ?, ?, ?)",
+                        new String[]{"id"}
+                );
+                statement.setString(1, userId);
+                statement.setString(2, name);
+                statement.setString(3, parts[2]);
+                statement.setBoolean(4, Boolean.parseBoolean(parts[3]));
+                statement.setTimestamp(5, Timestamp.valueOf(anchor.minusDays(10)));
+                return statement;
+            }, keyHolder);
+
+            idsByKey.put(playlistKey(userId, name), GeneratedKeyIds.extract(keyHolder));
         }
 
-        jdbcTemplate.batchUpdate(
-                "INSERT INTO music_playlist "
-                        + "(id, user_id, name, description, is_public, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
-                rows
-        );
+        return idsByKey;
     }
 
-    private void insertPlaylistSongs() {
+    private void insertPlaylistSongs(Map<String, Long> playlistIds) {
         List<Object[]> rows = new ArrayList<>(PLAYLIST_SONGS.length);
 
-        for (long[] row : PLAYLIST_SONGS) {
+        for (String row : PLAYLIST_SONGS) {
+            String[] parts = row.split("\\|");
+            Long playlistId = playlistIds.get(playlistKey(parts[0], parts[1]));
+
+            if (playlistId == null) {
+                throw new IllegalStateException(
+                        "歌单歌曲引用了不存在的歌单：" + parts[0] + "|" + parts[1]);
+            }
+
             rows.add(new Object[]{
-                    row[0],
-                    row[1],
-                    (int) row[2],
+                    playlistId,
+                    Long.parseLong(parts[2]),
+                    Integer.parseInt(parts[3]),
                     Timestamp.valueOf(anchor.minusDays(9))
             });
         }
@@ -338,6 +372,13 @@ public class MusicSeedInitializer implements ApplicationRunner {
                         + "VALUES (?, ?, ?, ?)",
                 rows
         );
+    }
+
+    /**
+     * 歌单在种子数据里的逻辑键：同一用户下名字唯一（uk_music_playlist_user_name）。
+     */
+    private static String playlistKey(String userId, String name) {
+        return userId + "|" + name;
     }
 
     /**
@@ -352,7 +393,6 @@ public class MusicSeedInitializer implements ApplicationRunner {
         for (int i = 0; i < PLAY_LOG_COUNT; i++) {
             boolean alice = i < 20;
             rows.add(new Object[]{
-                    3001L + i,
                     alice ? USER_ALICE : USER_BOB,
                     SONG_ID_BASE + (i * 7 % SONG_ROWS.length),
                     sources[i % sources.length],
@@ -362,8 +402,8 @@ public class MusicSeedInitializer implements ApplicationRunner {
 
         jdbcTemplate.batchUpdate(
                 "INSERT INTO music_play_log "
-                        + "(id, user_id, song_id, source, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?)",
+                        + "(user_id, song_id, source, created_at) "
+                        + "VALUES (?, ?, ?, ?)",
                 rows
         );
     }

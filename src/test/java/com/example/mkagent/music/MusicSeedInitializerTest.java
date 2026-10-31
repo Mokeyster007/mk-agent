@@ -105,7 +105,9 @@ class MusicSeedInitializerTest {
         String owner = jdbcTemplate.queryForObject(
                 "SELECT user_id FROM music_playlist WHERE id = ?",
                 String.class,
-                MusicSeedInitializer.PLAYLIST_PRIVATE_ALICE);
+                playlistId(
+                        MusicSeedInitializer.USER_ALICE,
+                        MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE));
         assertEquals(MusicSeedInitializer.USER_ALICE, owner,
                 "私有歌单必须能查到归属用户（可见性靠它判定）");
     }
@@ -132,7 +134,9 @@ class MusicSeedInitializerTest {
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(
                 "SELECT song_id, position FROM music_playlist_song "
                         + "WHERE playlist_id = ? ORDER BY position",
-                MusicSeedInitializer.PLAYLIST_PRIVATE_ALICE);
+                playlistId(
+                        MusicSeedInitializer.USER_ALICE,
+                        MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE));
 
         assertEquals(8, rows.size());
         for (int i = 0; i < rows.size(); i++) {
@@ -167,6 +171,19 @@ class MusicSeedInitializerTest {
 
         assertEquals(0, future == null ? 0 : future,
                 "不应有未来时间的播放日志");
+    }
+
+    /**
+     * 歌单 id 由数据库生成，测试按 (user_id, name) 回查。
+     */
+    private long playlistId(String userId, String name) {
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM music_playlist WHERE user_id = ? AND name = ?",
+                Long.class,
+                userId,
+                name);
+        assertNotNull(id, "种子歌单必须存在：" + userId + "/" + name);
+        return id;
     }
 
     private int count(String table) {

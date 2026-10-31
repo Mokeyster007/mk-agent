@@ -2,10 +2,12 @@ package com.example.mkagent.tools;
 
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.model.AgentRunContext;
+import com.example.mkagent.music.MusicSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.tool.ToolCallback;
@@ -21,6 +23,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -71,6 +74,22 @@ class PlaylistWriteToolTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    /**
+     * alice 的私有种子歌单 id（由数据库生成，按 (user_id, name) 回查）。
+     */
+    private long alicePrivate;
+
+    @BeforeEach
+    void resolveSeedPlaylist() {
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM music_playlist WHERE user_id = ? AND name = ?",
+                Long.class,
+                ALICE,
+                MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE);
+        assertNotNull(id, "种子歌单必须存在");
+        alicePrivate = id;
+    }
 
     @AfterEach
     void tearDown() {
@@ -161,9 +180,9 @@ class PlaylistWriteToolTest {
     void otherUsersPlaylistIsRejected() throws Exception {
         bindUser(BOB);
 
-        // 2001 是 alice 的私有歌单（种子数据）。
+        // alice 的私有歌单（种子数据）。
         JsonNode forbidden = objectMapper.readTree(
-                tool.addSongsToPlaylist(2001L, List.of(1001L)));
+                tool.addSongsToPlaylist(alicePrivate, List.of(1001L)));
         JsonNode missing = objectMapper.readTree(
                 tool.addSongsToPlaylist(999_999L, List.of(1001L)));
 
@@ -174,10 +193,10 @@ class PlaylistWriteToolTest {
         String missingHint = missing.path("meta").path("hint").asText();
         assertEquals(
                 missingHint.replace("999999", "{id}"),
-                forbiddenHint.replace("2001", "{id}"),
+                forbiddenHint.replace(String.valueOf(alicePrivate), "{id}"),
                 "两种情况文案必须一致，否则可以探测歌单是否存在"
         );
-        assertEquals(8, countSongs(2001L), "拒绝后不能改动歌单");
+        assertEquals(8, countSongs(alicePrivate), "拒绝后不能改动歌单");
     }
 
     @Test
@@ -242,7 +261,7 @@ class PlaylistWriteToolTest {
         assertThrows(IllegalStateException.class,
                 () -> tool.createPlaylist(NAME_PREFIX + "无上下文", SEED_SONGS));
         assertThrows(IllegalStateException.class,
-                () -> tool.addSongsToPlaylist(2001L, SEED_SONGS));
+                () -> tool.addSongsToPlaylist(alicePrivate, SEED_SONGS));
 
         assertEquals(0, countByName(NAME_PREFIX + "无上下文"));
     }

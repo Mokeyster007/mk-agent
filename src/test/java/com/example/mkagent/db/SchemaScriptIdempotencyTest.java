@@ -176,6 +176,63 @@ class SchemaScriptIdempotencyTest {
         }
     }
 
+    /**
+     * 歌单 / 播放日志的 id 必须是数据库生成的 identity 列。
+     *
+     * 修复前 {@code music_playlist.id} 是普通 BIGINT，应用只能取 MAX(id)+1，
+     * 并发创建会撞主键。这条测试从 DDL 层确认生成方式，
+     * 顺带验证 H2（PostgreSQL 模式）能通过 RETURN_GENERATED_KEYS 取回主键。
+     */
+    @Test
+    @DisplayName("music_playlist / music_play_log 的 id 由 identity 生成")
+    void musicIdsAreGeneratedByIdentity() throws Exception {
+        String url = "jdbc:h2:mem:schema_music_identity;MODE=PostgreSQL;"
+                + "DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1";
+
+        try (Connection connection = DriverManager.getConnection(url, "sa", "")) {
+            ScriptUtils.executeSqlScript(
+                    connection, new ClassPathResource("db/schema.sql"));
+
+            long firstPlaylist = insertAndReadId(connection,
+                    "INSERT INTO music_playlist (user_id, name) VALUES (?, ?)",
+                    "music-user-1", "歌单一");
+            long secondPlaylist = insertAndReadId(connection,
+                    "INSERT INTO music_playlist (user_id, name) VALUES (?, ?)",
+                    "music-user-1", "歌单二");
+
+            assertTrue(firstPlaylist > 0, "歌单 id 必须由数据库生成");
+            assertTrue(secondPlaylist > firstPlaylist,
+                    "歌单 id 必须自增：first=" + firstPlaylist
+                            + ", second=" + secondPlaylist);
+
+            long firstLog = insertAndReadId(connection,
+                    "INSERT INTO music_play_log (user_id, song_id) VALUES (?, ?)",
+                    "music-user-1", 1001L);
+            long secondLog = insertAndReadId(connection,
+                    "INSERT INTO music_play_log (user_id, song_id) VALUES (?, ?)",
+                    "music-user-1", 1002L);
+
+            assertTrue(secondLog > firstLog,
+                    "播放日志 id 必须自增：first=" + firstLog
+                            + ", second=" + secondLog);
+        }
+    }
+
+    private long insertAndReadId(Connection connection, String sql,
+                                 Object first, Object second) throws Exception {
+        try (java.sql.PreparedStatement statement = connection.prepareStatement(
+                sql, new String[]{"id"})) {
+            statement.setObject(1, first);
+            statement.setObject(2, second);
+            statement.executeUpdate();
+
+            try (ResultSet keys = statement.getGeneratedKeys()) {
+                assertTrue(keys.next(), "插入后必须返回生成的主键：" + sql);
+                return keys.getLong(1);
+            }
+        }
+    }
+
     private boolean tableExists(Connection connection, String table)
             throws Exception {
         try (ResultSet resultSet = connection.getMetaData().getTables(

@@ -124,7 +124,7 @@
 | 播放历史未开放 | 用户暂时无法查"我最近听了什么" | M3 随权限模型一起开放 `get_play_history` |
 | 事件文案未做 i18n | 中英混排界面会露出中文 | 待办，见 `music-agent.md` 第 7 节 |
 | 写工具无人工确认 | 一旦误开放即直接落库 | M3 的审批链路（`@RequiresApproval` 与守卫测试已就位） |
-| 歌单 ID 用 `MAX(id)+1` 分配 | 并发创建可能主键冲突（回滚，不会写脏数据） | 正式开放写工具前改为 identity / 序列 |
+| ~~歌单 ID 用 `MAX(id)+1` 分配~~ | 已在 M2e 前置修复中改为 identity 列 | ✅ 已解决（`MusicPlaylistIdGenerationTest` 守回归） |
 
 ---
 

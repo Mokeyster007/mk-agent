@@ -1,9 +1,12 @@
 package com.example.mkagent.music;
 
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.PreparedStatement;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -26,11 +29,10 @@ import java.util.Set;
  * 所有方法都以 userId 为**必填入参**，且写入前必须校验归属：
  * 越权写入不能靠上层"记得传对 userId"来保证。
  *
- * 已知限制（写工具目前不在任何白名单里，M3 开放前需解决）：
- * {@code music_playlist.id} 没有自增/序列，只能取 {@code MAX(id)+1}。
- * 并发创建时可能算出同一个 id，主键冲突会让其中一个事务回滚
- * （失败关闭，不会写脏数据），但用户会看到一次失败。
- * 正式开放前应改为 identity 列或独立序列。
+ * 歌单 id 由数据库 identity 列生成，插入时用 {@link KeyHolder} 取回：
+ * 早期版本用 {@code SELECT COALESCE(MAX(id), 0) + 1} 分配，
+ * 并发创建会算出同一个 id 并撞主键（失败关闭，不会写脏数据，
+ * 但用户会看到一次莫名其妙的失败）。取回方式见 {@link GeneratedKeyIds}。
  */
 @Service
 public class MusicPlaylistWriteService {
@@ -109,19 +111,28 @@ public class MusicPlaylistWriteService {
         List<Long> songs = distinct(songIds);
         requireAllSongsExist(songs);
 
-        long playlistId = nextPlaylistId();
+        KeyHolder keyHolder = new GeneratedKeyHolder();
 
-        jdbcTemplate.update(
-                "INSERT INTO music_playlist "
-                        + "(id, user_id, name, description, is_public, created_at) "
-                        + "VALUES (?, ?, ?, ?, ?, ?)",
-                playlistId,
-                userId,
-                name,
-                null,
-                false,
-                Timestamp.valueOf(LocalDateTime.now())
-        );
+        jdbcTemplate.update(connection -> {
+            /*
+             * 显式声明只取 id 列：PostgreSQL 的 RETURN_GENERATED_KEYS
+             * 会把整行都返回，KeyHolder 里就有多个键，取单值时直接抛异常。
+             */
+            PreparedStatement statement = connection.prepareStatement(
+                    "INSERT INTO music_playlist "
+                            + "(user_id, name, description, is_public, created_at) "
+                            + "VALUES (?, ?, ?, ?, ?)",
+                    new String[]{"id"}
+            );
+            statement.setString(1, userId);
+            statement.setString(2, name);
+            statement.setString(3, null);
+            statement.setBoolean(4, false);
+            statement.setTimestamp(5, Timestamp.valueOf(LocalDateTime.now()));
+            return statement;
+        }, keyHolder);
+
+        long playlistId = GeneratedKeyIds.extract(keyHolder);
 
         insertSongs(playlistId, songs, 1);
 
@@ -250,19 +261,6 @@ public class MusicPlaylistWriteService {
                     now
             );
         }
-    }
-
-    /**
-     * 分配歌单 ID。
-     *
-     * 见类注释的"已知限制"：没有序列可用，只能取 MAX+1。
-     */
-    private long nextPlaylistId() {
-        Long max = jdbcTemplate.queryForObject(
-                "SELECT COALESCE(MAX(id), 0) FROM music_playlist",
-                Long.class
-        );
-        return (max == null ? 0L : max) + 1L;
     }
 
     /**
