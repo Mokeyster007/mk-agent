@@ -42,6 +42,24 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
   取消后不再进入新的 step
 - **任务持久化**：任务记录落库（`agent_run` 表），支持按 runId 查询与分页查询历史
 
+### 1.1 音乐业务 Agent（M2，进行中）
+
+同一套 `ToolCallAgent` 骨架，按 `AgentType` 收窄工具白名单：
+
+| 入口 | AgentType | 工具 |
+| --- | --- | --- |
+| `GET /api/ai/music/chat` | `MUSIC_USER` | 曲库检索、歌曲详情、我的歌单、歌单曲目 |
+| `GET /api/ai/music/admin/chat` | `MUSIC_ADMIN` | 曲库检索、歌曲详情、播放统计、歌曲排行（**无**歌单工具） |
+
+- 身份由 `X-User-Id` 占位提供，角色只认 `music_user` 表；未知用户 403
+- 工具里**没有** `userId` 参数，身份来自服务端固化的 `AgentRunContextHolder`
+- 写工具（建歌单、加歌）已实现但**不在任何白名单**，M3 接审批后才开放
+- 详见 [`docs/music-agent.md`](docs/music-agent.md) 与
+  [`docs/music-permissions.md`](docs/music-permissions.md)
+
+> ⚠️ 当前没有真实认证，`X-User-Id` 可以伪造。这是占位方案，
+> 不是安全边界——接入 JWT / 网关后由拦截器替换解析逻辑。
+
 ### 2. 弹性与成本控制（resilience）
 
 | 机制 | 说明 |
@@ -155,7 +173,9 @@ cd mk-image-search-mcp-server && ./mvnw spring-boot:run
 | `GET /api/ai/chat_app/chat/events` | 流式对话（ServerSentEvent 包装） |
 | `GET /api/ai/chat_app/chat/sse/emitter` | 流式对话（SseEmitter 手动推送） |
 | `GET /api/ai/manus/chat?message=...` | Agent 任务（SSE），需请求头 `X-User-Id` |
-| `POST /api/ai/manus/{runId}/cancel` | 主动取消运行中的 Agent 任务 |
+| `GET /api/ai/music/chat?message=...` | 音乐助手（`MUSIC_USER`），需 `X-User-Id`，用户须在 `music_user` 表中 |
+| `GET /api/ai/music/admin/chat?message=...` | 音乐统计（`MUSIC_ADMIN`），角色必须是 ADMIN |
+| `POST /api/ai/manus/{runId}/cancel` | 主动取消运行中的 Agent 任务（音乐任务沿用此接口，仅本人可取消） |
 | `GET /api/ai/runs/{runId}` | 查询任务详情 |
 | `GET /api/ai/runs/page` | 分页查询任务历史 |
 
@@ -189,6 +209,9 @@ event:done       [DONE]
 # 异步 SSE 工具调用全链路集成测试
 ./mvnw test "-Dtest=MkManusAsyncSseIntegrationTest"
 
+# 音乐入口：访问控制 + 端到端（桩模型，不联网）
+./mvnw test "-Dtest=MusicEndpointAccessControlTest,MusicAgentSseIntegrationTest"
+
 # live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
 ./mvnw -Plive test "-Dtest=MkManusTest"
 ```
@@ -207,7 +230,7 @@ event:done       [DONE]
 - [`docs/agent-eval.md`](docs/agent-eval.md)：离线评测（33 条用例、确定性检查 + 引用真实性校验 + LLM-as-judge、整轮预算保护）
 - [`docs/SECURITY.md`](docs/SECURITY.md)：安全加固（SSRF 校验、密钥管理、会话 ID 校验）
 - [`docs/COST.md`](docs/COST.md)：成本控制（RAG 延迟初始化、模型重试策略与取舍、工具重试耗尽与站点级熔断、评测预算、模型分层、工具配置/输出上限/日志治理、任务轨迹落库与预算耗尽收尾）
-- [`docs/music-agent.md`](docs/music-agent.md)：音乐业务 Agent（M2）——六张业务表、种子数据、只读工具、统计工具、写工具（未开放）
+- [`docs/music-agent.md`](docs/music-agent.md)：音乐业务 Agent（M2）——六张业务表、种子数据、只读工具、两个入口、手动冒烟脚本
 - [`docs/music-permissions.md`](docs/music-permissions.md)：音乐权限矩阵——工具 × AgentType × 数据范围 × 三道防线
 - [`docs/music-idempotency-research.md`](docs/music-idempotency-research.md)：写工具幂等键调研（Spring AI 1.0.0 不传 toolCallId，改用服务端派生键）
 
