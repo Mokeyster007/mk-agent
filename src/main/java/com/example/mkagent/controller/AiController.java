@@ -218,17 +218,25 @@ public class AiController {
      * 主动取消运行中的 Agent 任务。
      *
      * 流程：
-     * 1. 按 runId 查注册表，不存在 → 404 业务错误；
-     * 2. 运行中：由 AgentTaskCanceller 完成状态转换、
+     * 1. 必须携带用户身份，否则 401；
+     * 2. 按 runId 查注册表，不存在**或不属于当前用户** → 404 业务错误；
+     * 3. 运行中：由 AgentTaskCanceller 完成状态转换、
      *    线程中断与 SSE 通知（终态竞态时抛 409）。
+     *
+     * 归属校验为什么返回 404 而不是 403：
+     * 403 等于告诉调用方"这个 runId 确实存在，只是不是你的"，
+     * 攻击者可以据此枚举他人的 runId；两种情况共用同一句文案，
+     * 外部无法区分。
      *
      * 注册表移除由任务线程的 finally 完成，这里不重复移除。
      */
     @PostMapping("/manus/{runId}/cancel")
     public Map<String, Object> cancelManusTask(@PathVariable String runId) {
+        String userId = requireUserId();
+
         RunningAgentTask task = agentTaskRegistry.get(runId);
 
-        if (task == null) {
+        if (task == null || !userId.equals(task.context().getUserId())) {
             throw new BusinessException(404, "任务不存在或已结束：" + runId);
         }
 

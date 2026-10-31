@@ -6,6 +6,7 @@ import com.example.mkagent.model.AgentState;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.support.HermeticSpringBootTest;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.mockito.Mockito;
@@ -155,6 +156,18 @@ class AgentTaskCancelIntegrationTest {
     @MockitoBean
     private VectorStore chatAppVectorStore;
 
+    /**
+     * 桩模型是单例 Bean，多个用例共享同一个计数器。
+     *
+     * 每个用例开始前清零，否则"模型只被调用 1 次"这类**绝对次数**断言
+     * 会被上一个用例的调用污染（表现为偶发失败，且与执行顺序相关）。
+     */
+    @BeforeEach
+    void resetModelCounters() {
+        slowFakeChatModel.callCount.set(0);
+        slowFakeChatModel.interrupted.set(false);
+    }
+
     @Test
     void cancelRunningTaskThroughHttpApi() throws Exception {
         HttpClient client = HttpClient.newBuilder()
@@ -186,9 +199,10 @@ class AgentTaskCancelIntegrationTest {
         assertThat(agentTaskRegistry.size()).isGreaterThanOrEqualTo(1);
         assertThat(ctx.getState()).isEqualTo(AgentState.RUNNING);
 
-        // ===== 3. 调用取消接口 =====
+        // ===== 3. 调用取消接口（必须带上任务所属用户） =====
         HttpRequest cancelRequest = HttpRequest.newBuilder(URI.create(
                         "http://localhost:" + port + "/api/ai/manus/" + runId + "/cancel"))
+                .header("X-User-Id", "user-cancel-test")
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
 
@@ -235,6 +249,7 @@ class AgentTaskCancelIntegrationTest {
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(
                         "http://localhost:" + port + "/api/ai/manus/no-such-run-id/cancel"))
+                .header("X-User-Id", "user-cancel-test")
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
 
@@ -243,6 +258,136 @@ class AgentTaskCancelIntegrationTest {
 
         assertThat(response.statusCode()).isEqualTo(404);
         assertThat(response.body()).contains("任务不存在或已结束");
+    }
+
+    /**
+     * 缺失 X-User-Id：401，且**先于** runId 查询发生。
+     *
+     * 顺序很重要：先鉴权再查注册表，
+     * 否则"有没有身份"和"runId 是否存在"的响应差异本身就成了探测通道。
+     */
+    @Test
+    void cancelWithoutUserHeaderReturns401() throws Exception {
+        HttpClient client = HttpClient.newHttpClient();
+
+        HttpRequest request = HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/api/ai/manus/no-such-run-id/cancel"))
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+
+        HttpResponse<String> response =
+                client.send(request, HttpResponse.BodyHandlers.ofString());
+
+        assertThat(response.statusCode()).isEqualTo(401);
+        assertThat(response.body()).contains("X-User-Id");
+    }
+
+    /**
+     * 跨用户取消：404，且任务**没有被取消**。
+     *
+     * 断言要点：
+     * 1. 别人的任务取消请求拿不到任何"存在性"信号——404 与"任务不存在"
+     *    共用同一句文案；
+     * 2. 状态仍是 RUNNING、注册表里仍在，说明拒绝发生在取消之前，
+     *    不是"先取消再报错"；
+     * 3. 跨用户 404 的响应体与"任务结束后再取消"的响应体**逐字相同**
+     *    （同一个 runId，只差任务是否还活着），这是最难被误改的一条。
+     */
+    @Test
+    void crossUserCancelIsRejectedAndTaskKeepsRunning() throws Exception {
+        String owner = "user-cancel-owner";
+        String other = "user-cancel-other";
+
+        HttpClient client = HttpClient.newHttpClient();
+        String url = "http://localhost:" + port + "/api/ai/manus/chat?message="
+                + URLEncoder.encode("请执行一个需要很长时间的库存盘点任务",
+                StandardCharsets.UTF_8);
+
+        CompletableFuture<HttpResponse<String>> sseFuture = client.sendAsync(
+                HttpRequest.newBuilder(URI.create(url))
+                        .timeout(Duration.ofSeconds(30))
+                        .header("X-User-Id", owner)
+                        .GET()
+                        .build(),
+                HttpResponse.BodyHandlers.ofString()
+        );
+
+        RunningAgentTask runningTask = awaitRunningTask(owner);
+        assertThat(runningTask).as("任务应已注册到注册表").isNotNull();
+
+        AgentRunContext ctx = runningTask.context();
+        String runId = ctx.getRunId().toString();
+        assertThat(ctx.getUserId()).isEqualTo(owner);
+
+        // ===== 他人取消：404，任务不受影响 =====
+        HttpResponse<String> rejected = postCancel(client, other, runId);
+
+        assertThat(rejected.statusCode()).isEqualTo(404);
+        assertThat(rejected.body()).contains("任务不存在或已结束");
+        assertThat(ctx.getState())
+                .as("跨用户取消不得改变任务状态")
+                .isEqualTo(AgentState.RUNNING);
+        assertThat(agentTaskRegistry.contains(runId))
+                .as("跨用户取消不得把任务从注册表移除")
+                .isTrue();
+
+        // ===== 本人取消：成功 =====
+        HttpResponse<String> cancelled = postCancel(client, owner, runId);
+
+        assertThat(cancelled.statusCode()).isEqualTo(200);
+        assertThat(cancelled.body()).contains("CANCELLED");
+
+        try {
+            runningTask.future().join();
+        } catch (Exception ignored) {
+            // 被取消的任务 join 会抛 CancellationException / CompletionException
+        }
+        awaitUntil(() -> !agentTaskRegistry.contains(runId));
+
+        // ===== 任务结束后再取消：与跨用户 404 逐字相同 =====
+        HttpResponse<String> gone = postCancel(client, owner, runId);
+
+        assertThat(gone.statusCode()).isEqualTo(404);
+        assertThat(gone.body())
+                .as("跨用户与任务已结束必须返回完全相同的响应体")
+                .isEqualTo(rejected.body());
+
+        // 收尾：SSE 连接应已结束
+        sseFuture.get(10, TimeUnit.SECONDS);
+    }
+
+    private HttpResponse<String> postCancel(HttpClient client, String userId,
+                                            String runId) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder(URI.create(
+                        "http://localhost:" + port + "/api/ai/manus/" + runId + "/cancel"))
+                .timeout(Duration.ofSeconds(10))
+                .header("X-User-Id", userId)
+                .POST(HttpRequest.BodyPublishers.noBody())
+                .build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
+    /**
+     * 轮询注册表，直到出现指定用户的一个 RUNNING 任务（最多等 10 秒）。
+     *
+     * 按用户筛选：注册表是进程内共享的，
+     * 其他用例残留的任务不能被误当成"本次启动的任务"。
+     */
+    private RunningAgentTask awaitRunningTask(String userId)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            RunningAgentTask task = agentTaskRegistry.snapshot().stream()
+                    .filter(t -> t.context().getState() == AgentState.RUNNING)
+                    .filter(t -> userId.equals(t.context().getUserId()))
+                    .findFirst()
+                    .orElse(null);
+            if (task != null) {
+                return task;
+            }
+            Thread.sleep(50);
+        }
+        return null;
     }
 
     /**

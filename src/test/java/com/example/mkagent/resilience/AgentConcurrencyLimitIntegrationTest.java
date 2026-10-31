@@ -334,7 +334,7 @@ class AgentConcurrencyLimitIntegrationTest {
         assertNotNull(runningTask, "挂起任务应已注册到注册表");
         String runId = runningTask.context().getRunId().toString();
 
-        HttpResponse<String> cancelResponse = postCancel(runId);
+        HttpResponse<String> cancelResponse = postCancel("user-cc-cancel", runId);
         assertEquals(200, cancelResponse.statusCode(),
                 "取消接口应返回 200，响应体：" + cancelResponse.body());
         assertTrue(cancelResponse.body().contains("CANCELLED"));
@@ -381,10 +381,15 @@ class AgentConcurrencyLimitIntegrationTest {
                 .build();
     }
 
-    private HttpResponse<String> postCancel(String runId) throws Exception {
+    /**
+     * 取消接口要求携带任务所属用户：跨用户取消按"任务不存在"处理（404）。
+     */
+    private HttpResponse<String> postCancel(String userId, String runId)
+            throws Exception {
         HttpRequest request = HttpRequest.newBuilder(URI.create(
                         "http://localhost:" + port + "/api/ai/manus/" + runId + "/cancel"))
                 .timeout(Duration.ofSeconds(10))
+                .header("X-User-Id", userId)
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build();
         return httpClient().send(request, HttpResponse.BodyHandlers.ofString());
