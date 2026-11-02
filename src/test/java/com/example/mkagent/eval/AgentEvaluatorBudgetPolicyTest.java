@@ -75,7 +75,7 @@ class AgentEvaluatorBudgetPolicyTest {
                 "强制收尾应在 maxSteps 之外多一次模型调用");
         assertTrue(model.anyPromptContains(ToolCallAgent.BUDGET_WARNING_MESSAGE),
                 "显式开启后，maxSteps=2 的两轮都应带收尾提示");
-        assertTrue(model.lastPromptContains("步数预算已经耗尽"),
+        assertTrue(model.lastPromptContains("执行预算已经耗尽"),
                 "强制收尾调用应携带只输出文本的指令");
         assertBudgetExhaustedCaseFailed(result);
     }

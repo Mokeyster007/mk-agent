@@ -139,7 +139,7 @@ class BudgetAwarenessAgentTest {
         assertTrue(
                 ctx.getFinalAnswer().startsWith(
                         ToolCallAgent.FORCED_FINAL_ANSWER_PREFIX),
-                "答案必须带'(因步数预算耗尽……)'前缀，实际："
+                "答案必须带'(因执行预算耗尽……)'前缀，实际："
                         + ctx.getFinalAnswer()
         );
         assertTrue(ctx.getFinalAnswer().contains("尽力回答"),
@@ -176,8 +176,8 @@ class BudgetAwarenessAgentTest {
     }
 
     @Test
-    @DisplayName("收尾调用失败时回退到步骤摘要，不抛异常")
-    void forcedFinalAnswerFailureFallsBackToSummary() {
+    @DisplayName("收尾调用抛异常时写确定性兜底，不抛异常、不改终态")
+    void forcedFinalAnswerFailureFallsBackToDeterministicAnswer() {
         ScriptedModel model = new ScriptedModel(true);
         ToolCallAgent agent = newAgent(model, 2);
 
@@ -187,9 +187,20 @@ class BudgetAwarenessAgentTest {
         assertEquals(1, model.forcedCallCount.get(), "应尝试过一次收尾调用");
         assertEquals(AgentState.MAX_STEPS_REACHED, ctx.getState(),
                 "收尾失败不能把任务改成 FAILED");
-        assertNull(ctx.getFinalAnswer(), "失败时不应留下半截答案");
-        assertTrue(result.contains("安全停止"),
-                "应回退到步骤摘要，实际：" + result);
+
+        /*
+         * 行为变更（真实冒烟暴露的问题）：
+         * 旧行为是 finalAnswer 留空、run() 返回"安全停止……"，
+         * 导致 SSE 没有 final_answer、数据库该列为 NULL。
+         * 现在必须给出确定性兜底。
+         */
+        assertNotNull(ctx.getFinalAnswer(), "失败时必须有兜底答案");
+        assertTrue(ctx.getFinalAnswer().startsWith(ToolCallAgent.BUDGET_FALLBACK_PREFIX),
+                "兜底答案必须带固定前缀，实际：" + ctx.getFinalAnswer());
+        assertEquals(ctx.getFinalAnswer(), result,
+                "同步 run() 必须返回同一个兜底答案");
+        assertFalse(result.contains("模拟收尾调用失败"),
+                "兜底文案不得包含内部异常信息");
     }
 
     @Test

@@ -860,8 +860,11 @@ public abstract class BaseAgent {
 
     /**
      * 判断异常链中是否包含 InterruptedException（中断导致的失败）。
+     *
+     * 子类（ToolCallAgent 的预算收尾调用）也要用同一套判定：
+     * 取消/超时不能被当成普通异常吞掉，否则会被包装成"预算耗尽"的正常回答。
      */
-    private boolean causedByInterruption(Throwable e) {
+    protected boolean causedByInterruption(Throwable e) {
         Throwable current = e;
         while (current != null) {
             if (current instanceof InterruptedException) {

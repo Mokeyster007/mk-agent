@@ -20,6 +20,7 @@ import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingManager;
@@ -119,26 +120,48 @@ public class ToolCallAgent extends ReActAgent {
                     + "不要再搜索新资料";
 
     /**
+     * 预算耗尽且收尾调用没有拿到文本时的确定性兜底回答前缀。
+     *
+     * 用"执行预算"而不是"步数预算"：MAX_STEPS_REACHED 也可能由
+     * maxToolCalls（工具调用次数上限）触发，写死"步数"会给出错误的归因。
+     */
+    public static final String BUDGET_FALLBACK_PREFIX =
+            "因执行预算耗尽，本次任务已停止，未能生成完整回答。\n";
+
+    /**
      * 预算耗尽后强制收尾回答的前缀。
      *
      * 必须让用户一眼看出这是"尽力而为"，而不是模型正常完成任务给出的结论。
+     *
+     * 与 {@link #BUDGET_FALLBACK_PREFIX} 用同一个口径（"执行预算"）：
+     * 两个前缀面向同一种终态（MAX_STEPS_REACHED），
+     * 一个说"步数预算"、另一个说"执行预算"会让同一次失败出现两种归因。
      */
     public static final String FORCED_FINAL_ANSWER_PREFIX =
-            "(因步数预算耗尽，以下为基于已获取信息的尽力回答)\n";
+            "(因执行预算耗尽，以下为基于已获取信息的尽力回答)\n";
 
     /**
      * 预算耗尽后强制收尾时追加给模型的指令。
      *
-     * 明确要求"不调用工具"：这次调用本身就没给工具，
-     * 但模型仍可能在文本里请求工具，写清楚可以少一次无效轮次。
+     * 冲突必须**显式**消解，不能依赖"最后一条 SystemMessage 会覆盖前面的规则"：
+     * 系统提示词（MkManus / MusicAgent）与 budget warning 都写了
+     * "必须调用 terminate_task"，而本轮没有任何工具。两条规则同时存在时，
+     * 谁生效没有任何协议保证——模型完全可能按先出现且重复出现过的那条行事，
+     * 于是返回一个 tool_call、content 为空，收尾就拿不到文本（真实冒烟里就是这个现象）。
+     *
+     * 所以这里不靠顺序，直接点名"terminate_task 本轮不存在、该规则不适用"。
+     * 常规工具循环的提示词一个字都不改：那条规则在还有工具的轮次里是对的。
      */
     static final String FORCED_FINAL_ANSWER_INSTRUCTION =
-            "步数预算已经耗尽，无法再调用任何工具。"
-                    + "请只依据上面的对话历史和已经拿到的工具结果，"
-                    + "直接给出一个尽力而为的最终回答："
-                    + "用自然语言写结论；"
+            "执行预算已经耗尽，本轮没有提供任何工具，也无法再执行工具。"
+                    + "前面所有要求\"必须调用 terminate_task\"或\"继续调用工具\"的规则，"
+                    + "在本轮一律不适用：terminate_task 本轮不存在，"
+                    + "不要调用它，也不要假装调用它。"
+                    + "本轮唯一的任务是输出纯文本总结："
+                    + "只依据上面的对话历史和已经拿到的工具结果，"
+                    + "直接写出尽力而为的最终回答；"
                     + "没有获取到的信息要明确说明，不要编造；"
-                    + "不要再请求调用工具。";
+                    + "不要请求调用任何工具。";
 
     /**
      * 剩余步数 ≤ 该值时追加收尾提示。
@@ -636,27 +659,60 @@ public class ToolCallAgent extends ReActAgent {
      * 只是没来得及写结论。旧行为把"安全停止：达到最大步骤数……"
      * 当成最终回答返回，用户等于什么答案都没拿到。
      *
-     * 三条硬约束：
+     * 四条硬约束：
      * 1. **不改终态**：仍然是 MAX_STEPS_REACHED（这是成本事实，不能伪装成 SUCCEEDED）；
-     * 2. **不带工具**：options 里没有 toolCallbacks，模型没有工具可用；
-     * 3. **失败必须降级**：任何异常都只记 WARN 并保持 finalAnswer 为空，
-     *    由 BaseAgent 回退到原有的步骤摘要。
+     * 2. **不带工具**：options 里没有 toolCallbacks，且模型默认选项已被配置层清空工具
+     *    （见 DashScopeChatModelConfig#stripDefaultTools——只靠 options 为空**不够**，
+     *    DashScopeChatModel 会用 mergeToolCallbacks 把 defaultOptions 里的工具合并回来）；
+     * 3. **失败必须降级**：拿不到文本时写确定性兜底回答，绝不留下空 finalAnswer；
+     * 4. **取消/超时优先**：终态一旦不是 MAX_STEPS_REACHED，或线程被中断，
+     *    一律不写兜底——不能把取消伪装成"预算耗尽"。
      */
     @Override
     protected void onBudgetExhausted(AgentRunContext ctx) {
         if (!forceFinalAnswer) {
+            /*
+             * 开关契约：关闭后不新增模型调用，也不写本次的确定性兜底。
+             * 这两件事是同一个承诺——"不要在预算耗尽后再产出任何东西"，
+             * 拆开做会让开关的含义变得没法一句话说清。
+             */
             log.info(
-                    "预算耗尽且无最终回答，force-final-answer=false，保持旧行为（步骤摘要）：runId={}",
+                    "预算耗尽且无最终回答，force-final-answer=false，保持既有行为"
+                            + "（不新增调用、不写兜底）：runId={}",
                     ctx.getRunId()
             );
             return;
         }
 
         String answer = requestForcedFinalAnswer(ctx);
+
+        /*
+         * 收尾调用期间可能被取消/超时：此时不能补"预算耗尽"的文案，
+         * 否则用户看到的是"正常收尾"，而实际是取消。
+         * 判定收敛在 canWriteBudgetFallback 里，便于单独测试这条契约。
+         */
+        if (!canWriteBudgetFallback(ctx)) {
+            log.info(
+                    "收尾期间任务已不是预算终态或线程已中断，不写兜底回答："
+                            + "runId={}, state={}, interrupted={}",
+                    ctx.getRunId(),
+                    ctx.getState(),
+                    Thread.currentThread().isInterrupted()
+            );
+            return;
+        }
+
         if (answer == null || answer.isBlank()) {
+            /*
+             * 确定性兜底：不花第二次调用，也不拼任何工具原文/URL/参数/异常。
+             * 为什么必须有它：收尾失败时若 finalAnswer 为空，
+             * SSE 不发 final_answer、数据库该列保持 NULL，用户只看到
+             * "安全停止"——这正是真实冒烟里暴露的问题。
+             */
+            ctx.setFinalAnswer(buildBudgetFallbackAnswer(ctx));
             log.warn(
-                    "预算耗尽后的收尾调用没有拿到有效回答，回退到步骤摘要：runId={}",
-                    ctx.getRunId()
+                    "预算耗尽后的收尾调用没有拿到有效文本，改用确定性兜底回答：runId={}, chars={}",
+                    ctx.getRunId(), ctx.getFinalAnswer().length()
             );
             return;
         }
@@ -674,12 +730,52 @@ public class ToolCallAgent extends ReActAgent {
     }
 
     /**
+     * 是否允许写"预算耗尽"的兜底回答。
+     *
+     * 两个条件缺一不可：
+     * 1. 终态仍是 MAX_STEPS_REACHED——收尾期间被取消/超时（终态已变）时不能写，
+     *    否则取消会被伪装成一次正常的预算收尾；
+     * 2. 当前线程未被中断——取消接口会 interrupt 任务线程，
+     *    这时模型调用即使返回了文本也不可信（可能只是半截）。
+     *
+     * 抽成独立方法而不是内联：这两个条件无法在完整 run() 流程里稳定构造
+     * （终态是终态，外部改不动），只能直接对谓词做契约测试。
+     */
+    static boolean canWriteBudgetFallback(AgentRunContext ctx) {
+        return ctx.getState() == AgentState.MAX_STEPS_REACHED
+                && !Thread.currentThread().isInterrupted();
+    }
+
+    /**
+     * 预算耗尽且收尾调用没有拿到文本时的确定性兜底回答。
+     *
+     * 三条约束：
+     * 1. 只含步数与工具调用次数（非敏感计数），
+     *    不拼工具原文、URL、参数、异常或模型内部细节；
+     * 2. 纯函数：不读时钟、不读模型、不读数据库，便于单测；
+     * 3. 不改变终态，调用方仍保持 MAX_STEPS_REACHED。
+     */
+    static String buildBudgetFallbackAnswer(AgentRunContext ctx) {
+        return BUDGET_FALLBACK_PREFIX
+                + "本次已执行 " + ctx.getCurrentStep() + " 步、调用工具 "
+                + ctx.getToolCallCount() + " 次。\n"
+                + "请缩小任务范围后重试。";
+    }
+
+    /**
      * 执行一次"不带工具"的模型调用，用于预算耗尽后的收尾。
+     *
+     * ================== 关于"一次调用"的口径 ==================
+     *
+     * 这里只有**一次业务级收尾调用**：不重试、不做多轮总结。
+     * 但底层 ChatModel 自带 RetryTemplate（mkagent.model-retry.*，
+     * 只对 5xx/429/超时生效），所以一次业务调用可能对应**多个 HTTP 请求**。
+     * 文档与注释都不要写成"只会发生一个 HTTP 请求"。
      *
      * 该调用的 Token 通过 {@link #recordUsage} 计入本任务 Usage——
      * 它确实花了钱，必须出现在成本统计里，不能当成免费操作。
      *
-     * @return 模型给出的文本；失败或空文本时返回 null
+     * @return 模型给出的文本；没有可用文本时返回 null（由调用方写确定性兜底）
      */
     String requestForcedFinalAnswer(AgentRunContext ctx) {
         // 取消/超时已中断线程时不再发起新的模型调用。
@@ -696,37 +792,135 @@ public class ToolCallAgent extends ReActAgent {
         messages.add(new SystemMessage(FORCED_FINAL_ANSWER_INSTRUCTION));
 
         /*
-         * 关键：不传 toolCallbacks。
-         * 模型因此无法再请求工具，只能输出文本。
+         * 不传 toolCallbacks / toolNames。
+         *
+         * 注意这不是"无工具"的全部保证：DashScopeChatModel#buildRequestPrompt
+         * 会用 mergeToolCallbacks(runtime, defaultOptions) 合并默认选项，
+         * 而该方法的语义是"runtime 为空就返回 defaults"。
+         * 真正的保证来自配置层把 defaultOptions 的工具清空
+         * （DashScopeChatModelConfig#stripDefaultTools），见 ForcedFinalAnswerRequestShapeTest。
          */
         ToolCallingChatOptions options = ToolCallingChatOptions.builder()
                 .internalToolExecutionEnabled(false)
                 .build();
 
         long modelCallStart = System.currentTimeMillis();
+        ChatResponse response;
         try {
-            ChatResponse response = chatModel.call(new Prompt(messages, options));
-            long modelCallCost = System.currentTimeMillis() - modelCallStart;
-
-            // 计入 Usage：Token 与耗时都要算进这次任务。
-            recordUsage(ctx, response, modelCallCost);
-
-            if (response == null
-                    || response.getResult() == null
-                    || response.getResult().getOutput() == null) {
-                return null;
-            }
-            return response.getResult().getOutput().getText();
+            response = chatModel.call(new Prompt(messages, options));
         } catch (RuntimeException e) {
             /*
-             * 收尾失败不是任务失败：任务早就因为预算耗尽结束了，
-             * 这里只影响"有没有答案"，所以只记 WARN 并降级。
+             * 取消/超时：异常链里带 InterruptedException，或线程已被中断。
+             * 必须原样抛出，交给 BaseAgent 判 CANCELLED——
+             * 如果在这里吞掉，取消就会变成一条"预算耗尽"的正常回答。
+             */
+            if (Thread.currentThread().isInterrupted()
+                    || causedByInterruption(e)) {
+                log.info(
+                        "收尾调用被中断（取消/超时），按取消语义向上抛出：runId={}",
+                        ctx.getRunId()
+                );
+                throw e;
+            }
+
+            /*
+             * 其余异常不是任务失败：任务早就因为预算耗尽结束了，
+             * 这里只影响"有没有答案"，所以只记 WARN 并降级到确定性兜底。
              */
             log.warn(
-                    "预算耗尽后的收尾模型调用失败，回退到步骤摘要：runId={}, reason={}",
-                    ctx.getRunId(), e.getMessage()
+                    "收尾模型调用失败：reason=exception, type={}, message={}, runId={}",
+                    e.getClass().getSimpleName(),
+                    e.getMessage(),
+                    ctx.getRunId()
             );
             return null;
+        }
+        long modelCallCost = System.currentTimeMillis() - modelCallStart;
+
+        // 计入 Usage：Token 与耗时都要算进这次任务（失败/空文本也算，钱已经花了）。
+        recordUsage(ctx, response, modelCallCost);
+
+        return extractForcedAnswerText(ctx, response);
+    }
+
+    /**
+     * 从收尾响应里取文本，并把"为什么没取到"拆成可检索的原因。
+     *
+     * 只记录形状（是否存在、数量、长度、finishReason），
+     * 绝不记录正文、工具名、参数或完整响应。
+     *
+     * 文本与 ToolCall 同时存在时：**采用文本**（模型确实写了结论），
+     * 但照样告警说明工具调用被忽略——收尾阶段永远不执行任何工具。
+     */
+    private String extractForcedAnswerText(
+            AgentRunContext ctx,
+            ChatResponse response
+    ) {
+        if (response == null) {
+            log.warn("收尾响应形状：reason=null-response, runId={}", ctx.getRunId());
+            return null;
+        }
+
+        Generation generation = response.getResult();
+        if (generation == null) {
+            log.warn("收尾响应形状：reason=no-generation, runId={}", ctx.getRunId());
+            return null;
+        }
+
+        AssistantMessage output = generation.getOutput();
+        if (output == null) {
+            log.warn("收尾响应形状：reason=no-output, runId={}", ctx.getRunId());
+            return null;
+        }
+
+        boolean hasToolCalls = response.hasToolCalls();
+        int toolCallCount = output.getToolCalls() == null
+                ? 0
+                : output.getToolCalls().size();
+        String text = output.getText();
+        int textLength = text == null ? 0 : text.length();
+
+        log.info(
+                "收尾响应形状：runId={}, hasToolCalls={}, toolCallCount={}, textLength={}, finishReason={}",
+                ctx.getRunId(),
+                hasToolCalls,
+                toolCallCount,
+                textLength,
+                resolveFinishReason(generation)
+        );
+
+        if (hasToolCalls) {
+            log.warn(
+                    "收尾响应包含工具调用，按约定不执行：runId={}, toolCallCount={}",
+                    ctx.getRunId(), toolCallCount
+            );
+        }
+
+        if (text == null || text.isBlank()) {
+            log.warn(
+                    "收尾响应没有可用文本：reason={}, runId={}",
+                    hasToolCalls ? "tool-call-only" : "blank-text",
+                    ctx.getRunId()
+            );
+            return null;
+        }
+
+        return text;
+    }
+
+    /**
+     * finishReason 的空安全读取：取不到时明确记为 unknown，不抛异常。
+     */
+    private String resolveFinishReason(Generation generation) {
+        try {
+            if (generation.getMetadata() == null
+                    || generation.getMetadata().getFinishReason() == null
+                    || generation.getMetadata().getFinishReason().isBlank()) {
+                return "unknown";
+            }
+            return generation.getMetadata().getFinishReason();
+        } catch (RuntimeException e) {
+            return "unknown";
         }
     }
 
