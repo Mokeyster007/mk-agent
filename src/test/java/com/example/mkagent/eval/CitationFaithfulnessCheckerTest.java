@@ -180,6 +180,72 @@ class CitationFaithfulnessCheckerTest {
         );
     }
 
+    // ==================== 当前行为与边界（刻画，不是安全规则） ====================
+
+    @Test
+    @DisplayName("助手自己写出的链接不算出处：出处只看工具结果与用户输入")
+    void assistantTextIsNeverTreatedAsEvidence() {
+        /*
+         * 反直觉但必要：回答里当然"包含"它自己引用的 URL。
+         * 如果实现把 finalAnswer 也当成 sources，任何编造都会自动通过。
+         * 这里用同一个 URL 同时出现在回答里、却不在工具结果里来锁住这一点。
+         */
+        String url = "https://docs.example.com/guide/chapter-3";
+        EvalExecution execution = execution(
+                "已验证可加载：" + url,
+                List.of("首页正文（只给了首页，没有任何章节链接）")
+        );
+
+        CitationFaithfulnessChecker.CheckResult result =
+                checker.check(evalCase("读一下这份文档"), execution);
+
+        assertFalse(result.passed(),
+                "回答里出现的 URL 不能自己给自己作证");
+        assertTrue(result.failures().get(0).contains(url));
+    }
+
+    @Test
+    @DisplayName("已知误通过：把真 URL 截短后会被判通过（当前行为，待收紧）")
+    void knownFalsePassWhenCitedUrlIsShortenedPrefixOfRealUrl() {
+        /*
+         * 判定用的是 source.contains(cited)，所以 cited 是 source 的前缀时通过。
+         * 这是**当前行为**的刻画，不代表它正确：
+         * 模型把 https://a.com/guide/intro 写成 https://a.com/guide 依然会被放过。
+         * 收紧前先在这里改断言（并同步 docs/agent-eval.md 第 8 节）。
+         */
+        EvalExecution execution = execution(
+                "参考 https://docs.example.com/guide",
+                List.of("章节链接：https://docs.example.com/guide/intro")
+        );
+
+        assertTrue(checker.check(evalCase("查"), execution).passed(),
+                "当前实现会误判通过；若这条断言失败，说明判定已收紧，请同步更新文档");
+    }
+
+    @Test
+    @DisplayName("加长 URL（真链接 + 编造路径）仍然正确失败")
+    void longerFabricatedUrlStillFails() {
+        EvalExecution execution = execution(
+                "参考 https://docs.example.com/guide/intro/not-exist",
+                List.of("章节链接：https://docs.example.com/guide/intro")
+        );
+
+        assertFalse(checker.check(evalCase("查"), execution).passed(),
+                "在真链接后面接路径属于编造，必须失败");
+    }
+
+    @Test
+    @DisplayName("只说“已验证可加载”但没有 URL → 当前不判定（不在检查范围）")
+    void verificationClaimWithoutUrlIsOutOfScope() {
+        EvalExecution execution = execution(
+                "我确认第 3 章的链接经验证可以正常加载。",
+                List.of("首页正文，只有一段说明文字")
+        );
+
+        assertTrue(checker.check(evalCase("查"), execution).passed(),
+                "没有 URL 就没有可校验对象；这类断言目前不在检查范围");
+    }
+
     // ==================== 辅助 ====================
 
     private static EvalExecution execution(String finalAnswer, List<String> toolResults) {
