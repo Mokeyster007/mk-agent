@@ -271,7 +271,7 @@ class AgentStateMachineUnitTest {
         assertThat(registry.size()).isEqualTo(1);
         assertThat(registry.get(runId).context()).isSameAs(ctx);
 
-        registry.remove(runId);
+        registry.remove(runId, 0);
 
         assertThat(registry.contains(runId)).isFalse();
         assertThat(registry.size()).isZero();

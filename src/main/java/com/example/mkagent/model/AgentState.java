@@ -4,7 +4,7 @@ package com.example.mkagent.model;
  * Agent 任务状态机。
  *
  * 状态分两类：
- * 1. 过程态：IDLE、RUNNING，任务仍在推进；
+ * 1. 过程态：IDLE、RUNNING、WAITING_APPROVAL，任务尚未结束；
  * 2. 终态：SUCCEEDED、FAILED、CANCELLED、TIMED_OUT、MAX_STEPS_REACHED，
  *    任务已经结束，不允许再被修改。
  *
@@ -16,9 +16,16 @@ package com.example.mkagent.model;
  * RUNNING ──→ CANCELLED          用户主动取消或客户端提前断开
  * RUNNING ──→ TIMED_OUT          超过 Agent 任务超时时间
  * RUNNING ──→ MAX_STEPS_REACHED  达到最大步骤数或最大工具调用次数
+ * RUNNING ──→ WAITING_APPROVAL   命中需人工确认的写工具，整轮暂停
+ * WAITING_APPROVAL ──→ RUNNING   批准/拒绝后恢复执行
+ * WAITING_APPROVAL ──→ FAILED    审批过期或检查点不可恢复
+ * WAITING_APPROVAL ──→ CANCELLED 用户取消暂停中的任务
  *
  * 任何终态都不允许再转换到其他状态（包括重新变回 RUNNING），
  * 避免已结束的任务被误判、被覆盖或被重复处理。
+ *
+ * WAITING_APPROVAL **不是终态**：它表示任务被挂起，之后还会继续。
+ * 因此它不能写 finished_at，也不能被 onCompletion/onTimeout 当成"已结束"。
  */
 public enum AgentState {
 
@@ -27,6 +34,14 @@ public enum AgentState {
 
     /** 任务正在 Agent Loop 中执行。 */
     RUNNING,
+
+    /**
+     * 任务已挂起，等待人工确认写操作（M3）。
+     *
+     * 不是终态：批准/拒绝后会回到 RUNNING，
+     * 过期或被取消则转 FAILED / CANCELLED。
+     */
+    WAITING_APPROVAL,
 
     /** 任务成功完成，且已经得到有效的最终回答。 */
     SUCCEEDED,

@@ -1,5 +1,15 @@
 package com.example.mkagent.agent;
 
+import com.example.mkagent.approval.AgentConfigFingerprint;
+import com.example.mkagent.approval.ApprovalCheckpoint;
+import com.example.mkagent.approval.ApprovalPauseGateway;
+import com.example.mkagent.approval.ApprovalSummary;
+import com.example.mkagent.approval.ApprovalSummaryBuilder;
+import com.example.mkagent.approval.ApprovalToolPolicy;
+import com.example.mkagent.approval.CheckpointCodec;
+import com.example.mkagent.approval.PauseRejectedException;
+import com.example.mkagent.approval.PauseResult;
+import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEventType;
@@ -34,7 +44,9 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.stream.Collectors;
 
@@ -212,6 +224,21 @@ public class ToolCallAgent extends ReActAgent {
      */
     private final ToolEventMessageProvider toolEventMessageProvider;
 
+    /**
+     * 哪些工具需要人工确认（M3）。为 null 时不做审批拦截。
+     */
+    private ApprovalToolPolicy approvalToolPolicy;
+
+    /**
+     * 暂停持久化入口。为 null 时命中写工具会失败关闭。
+     */
+    private ApprovalPauseGateway approvalPauseGateway;
+
+    /**
+     * 审批摘要构造器。
+     */
+    private ApprovalSummaryBuilder approvalSummaryBuilder;
+
     public ToolCallAgent(
             ChatModel chatModel,
             ToolCallback[] availableTools,
@@ -234,6 +261,22 @@ public class ToolCallAgent extends ReActAgent {
         return availableTools;
     }
 
+    /**
+     * 当前 Agent 实际可执行的工具名集合。
+     *
+     * 供审批元数据校验使用：这是"真正能被执行的工具"，
+     * 与"扫到了哪些 @Tool 方法"必须一一对上。
+     */
+    private Set<String> exposedToolNames() {
+        Set<String> names = new LinkedHashSet<>();
+        for (ToolCallback callback : availableTools) {
+            if (callback != null && callback.getToolDefinition() != null) {
+                names.add(callback.getToolDefinition().name());
+            }
+        }
+        return names;
+    }
+
     public int getBudgetWarningSteps() {
         return budgetWarningSteps;
     }
@@ -254,6 +297,27 @@ public class ToolCallAgent extends ReActAgent {
      */
     public void setForceFinalAnswer(boolean forceFinalAnswer) {
         this.forceFinalAnswer = forceFinalAnswer;
+    }
+
+    /**
+     * 注入审批策略（M3，批次 1）。为 null 表示该 Agent 不支持审批。
+     */
+    public void setApprovalToolPolicy(ApprovalToolPolicy approvalToolPolicy) {
+        this.approvalToolPolicy = approvalToolPolicy;
+    }
+
+    /**
+     * 注入暂停持久化入口（M3，批次 1）。
+     */
+    public void setApprovalPauseGateway(ApprovalPauseGateway approvalPauseGateway) {
+        this.approvalPauseGateway = approvalPauseGateway;
+    }
+
+    /**
+     * 注入审批摘要构造器（M3，批次 1）。
+     */
+    public void setApprovalSummaryBuilder(ApprovalSummaryBuilder approvalSummaryBuilder) {
+        this.approvalSummaryBuilder = approvalSummaryBuilder;
     }
 
     /**
@@ -1068,6 +1132,168 @@ public class ToolCallAgent extends ReActAgent {
     }
 
     /**
+     * 命中写工具：整轮暂停，**一个工具都不执行**。
+     *
+     * 顺序（每一步失败都有明确后果）：
+     * 1. 先算配置指纹与检查点：算不出来就别暂停，避免留下半份数据；
+     * 2. 拿执行权交接锁：保证"暂停提交 → 释放许可 → 注销"与批准不重叠；
+     * 3. 切状态：切不动说明任务已被取消/终态，直接放弃；
+     * 4. 事务落库：agent_run 暂停 + 检查点 + 审批记录；
+     * 5. 提交后发现状态又变了（并发取消）：撤销这条审批，不留垃圾。
+     *
+     * @return null：不产生 STEP 事件（暂停不是"完成了一轮"）
+     */
+    private String pauseForApproval(
+            AgentRunContext ctx,
+            ChatResponse response,
+            List<AssistantMessage.ToolCall> toolCalls
+    ) {
+        if (approvalPauseGateway == null || approvalSummaryBuilder == null) {
+            ctx.setErrorCode("APPROVAL_DISABLED");
+            throw new IllegalStateException(
+                    "审批组件未装配，拒绝执行需要人工确认的写操作");
+        }
+
+        AssistantMessage assistantMessage = response.getResult().getOutput();
+
+        String configVersion = AgentConfigFingerprint.compute(
+                getAgentType(),
+                getSystemPrompt(),
+                availableTools,
+                approvalToolPolicy.requiredToolNames()
+        );
+        ctx.setConfigVersion(configVersion);
+
+        /*
+         * 结束当前执行段：审批等待不计入任务预算。
+         * 恢复时会重新 openExecutionSegment()。
+         */
+        ctx.closeExecutionSegment();
+
+        ApprovalCheckpoint checkpoint =
+                buildCheckpoint(ctx, assistantMessage, configVersion);
+
+        ApprovalSummary summary = approvalSummaryBuilder.build(toolCalls);
+
+        String runId = ctx.getRunId().toString();
+        RunHandoffLocks locks = getHandoffLocks();
+        if (locks != null) {
+            locks.acquire(runId);
+            /*
+             * 锁要一直持有到"并发许可释放 + 注册表注销"之后，
+             * 由 BaseAgent 的 finally 统一放锁——
+             * 在这里放锁会重新打开"批准抢在释放之前"的窗口。
+             */
+            ctx.setHandoffLockHeld(true);
+        }
+
+        if (!ctx.transitionTo(AgentState.WAITING_APPROVAL)) {
+            log.info("放弃暂停：任务已进入终态 runId={}, state={}",
+                    runId, ctx.getState());
+            return null;
+        }
+
+        PauseResult result;
+        try {
+            /*
+             * 事务边界就在这里：persist 是跨 Bean 的 @Transactional 调用，
+             * 抛出时事务已经回滚完毕，数据库里没有半截暂停。
+             * 因此"把异常转成脱敏错误"只能发生在这一层之后，
+             * 不能在事务内部 catch 后继续提交。
+             */
+            result = approvalPauseGateway.persist(ctx, checkpoint, summary);
+        } catch (PauseRejectedException e) {
+            /*
+             * CAS 未命中（被取消/代次已变）：暂停根本没成立，
+             * 由上层按取消或失败收尾，这里不覆盖状态。
+             */
+            throw e;
+        } catch (RuntimeException e) {
+            /*
+             * 落库失败（检查点/审批写入异常）：内存状态必须跟着回退，
+             * 否则会留下"ctx 说在等审批、库里还是 RUNNING"的假暂停。
+             */
+            ctx.transitionTo(AgentState.RUNNING);
+            ctx.setErrorCode("APPROVAL_PERSIST_FAILED");
+            throw new IllegalStateException("审批暂停写入失败，已回滚", e);
+        }
+
+        ctx.setApprovalId(result.approvalId());
+        ctx.setPendingApprovalJson(result.eventJson());
+
+        /*
+         * 提交暂停后状态可能已被取消（并发取消窗口）。
+         * 此时审批记录已经写进去了，必须撤销，
+         * 否则用户会看到一条"批准了也没人执行"的僵尸记录。
+         */
+        if (ctx.getState() != AgentState.WAITING_APPROVAL) {
+            approvalPauseGateway.abandon(result.approvalId(), "state=" + ctx.getState());
+            log.warn("暂停后状态已变化，已撤销审批：runId={}, state={}",
+                    runId, ctx.getState());
+            return null;
+        }
+
+        log.info(
+                "已暂停等待审批：runId={}, approvalId={}, step={}, toolCount={}, configVersion={}",
+                runId, result.approvalId(), ctx.getCurrentStep(),
+                toolCalls.size(), configVersion
+        );
+
+        return null;
+    }
+
+    /**
+     * 组装检查点。
+     *
+     * 关键点：`messages` 只存本轮**之前**的历史，
+     * 本轮的 Assistant(toolCalls) 单独放 `pendingAssistant`。
+     *
+     * 恢复（批次 2）时：用 `messages` 构造 Prompt，把 `pendingAssistant`
+     * 包装成 ChatResponse 交给 `executeToolCalls`，由框架追加一次；
+     * **不能**先 add 进 messages，否则 assistant 会出现两次、配对错位。
+     * 拒绝路径不执行工具，才手动追加 assistant + 拒绝回执。
+     */
+    private ApprovalCheckpoint buildCheckpoint(
+            AgentRunContext ctx,
+            AssistantMessage assistantMessage,
+            String configVersion
+    ) {
+        ApprovalCheckpoint.CheckpointMessage assistant =
+                CheckpointCodec.fromAssistant(assistantMessage);
+
+        return new ApprovalCheckpoint(
+                ApprovalCheckpoint.CURRENT_SCHEMA_VERSION,
+                configVersion,
+                ctx.getRunId().toString(),
+                ctx.getUserId(),
+                getAgentType() == null ? "UNKNOWN" : getAgentType().name(),
+                ctx.getCurrentStep(),
+                ctx.getToolCallCount(),
+                CheckpointCodec.toCheckpointMessages(ctx.getMessages()),
+                assistant,
+                assistant.toolCalls(),
+                new ApprovalCheckpoint.BudgetSnapshot(
+                        getMaxSteps(),
+                        getMaxToolCalls(),
+                        getTimeout().toSeconds()
+                ),
+                new ApprovalCheckpoint.UsageSnapshot(
+                        ctx.getModel(),
+                        ctx.getPromptTokens(),
+                        ctx.getCompletionTokens(),
+                        ctx.getTotalTokens(),
+                        ctx.getModelCallCount(),
+                        ctx.getTotalModelCallMillis()
+                ),
+                new ApprovalCheckpoint.TimingSnapshot(
+                        ctx.getStartedAt().toString(),
+                        ctx.getActiveElapsedMillis()
+                ),
+                AgentConfigFingerprint.whitelistHash(availableTools)
+        );
+    }
+
+    /**
      * Act：执行模型请求的工具。
      */
     @Override
@@ -1076,6 +1302,50 @@ public class ToolCallAgent extends ReActAgent {
 
         if (response == null || !response.hasToolCalls()) {
             return "本轮没有需要执行的工具。";
+        }
+
+        /*
+         * 审批拦截：必须在 executeToolCalls 之前。
+         *
+         * 判定粒度是**整轮**：只要本轮有一个工具需要人工确认，
+         * 整轮都不执行（包括只读工具）。
+         * 否则会出现"读执行了、写暂停了"的半轮，
+         * 恢复时要么重复读，要么模型基于半截结果继续推理。
+         */
+        if (approvalToolPolicy != null) {
+            /*
+             * 先确认"这个 Agent 真正能执行的每个工具，审批元数据都是确定的"。
+             *
+             * 扫描漏掉一个工具时，它的 requiresApproval 会是 false，
+             * 于是被当成普通工具执行——这是把审批承诺悄悄作废。
+             * 这里失败关闭：抛异常让任务失败，绝不放行。
+             */
+            try {
+                approvalToolPolicy.verifyExposedTools(
+                        getAgentType() + "/" + getName(), exposedToolNames());
+            } catch (IllegalStateException e) {
+                ctx.setErrorCode("APPROVAL_POLICY_INCOMPLETE");
+                throw e;
+            }
+
+            List<AssistantMessage.ToolCall> requested =
+                    response.getResult().getOutput().getToolCalls();
+
+            if (approvalToolPolicy.anyRequiresApproval(requested)) {
+                return pauseForApproval(ctx, response, requested);
+            }
+
+            /*
+             * 审批被关闭但模型仍然调到了写工具：
+             * 失败关闭，绝不"因为审批没开就直接执行"。
+             * 这条路径在批次 1 不会触发（写工具不在白名单），
+             * 但配置一改就可能打开，必须提前挡住。
+             */
+            if (approvalToolPolicy.hitsApprovalToolWhenDisabled(requested)) {
+                ctx.setErrorCode("APPROVAL_DISABLED");
+                throw new IllegalStateException(
+                        "审批功能未启用，拒绝执行需要人工确认的写操作");
+            }
         }
 
         /*

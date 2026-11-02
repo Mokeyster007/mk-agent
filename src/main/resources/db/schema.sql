@@ -88,6 +88,109 @@ COMMENT ON COLUMN agent_run.total_tokens IS '累计总 Token 数（成本统计�
 COMMENT ON COLUMN agent_run.total_cost_millis IS '任务总耗时（毫秒）';
 
 -- =============================================================
+-- M3 审批恢复（批次 1）：运行记录扩展列
+--
+-- execution_epoch：执行代次。首次执行 0，每次"领取审批恢复" +1。
+--   所有执行期写库都带该条件，旧执行线程的迟到写入影响 0 行，
+--   不会覆盖后来恢复的新代次。
+-- active_elapsed_millis：累计**执行**时间，不含审批等待。
+-- approval_count：本任务创建过的审批数量，用于 max-per-run 限制。
+-- error_code：稳定原因码，前端只认码，不解析中文 error_message。
+-- =============================================================
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS error_code VARCHAR(64);
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS execution_epoch INT NOT NULL DEFAULT 0;
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS config_version VARCHAR(64);
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS active_elapsed_millis BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS approval_count INT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_error_code
+    ON agent_run (error_code);
+
+COMMENT ON COLUMN agent_run.error_code IS '稳定原因码：APPROVAL_EXPIRED / USER_CANCELLED / PROCESS_RESTART / CHECKPOINT_* 等';
+COMMENT ON COLUMN agent_run.execution_epoch IS '执行代次：首次 0，每次恢复 +1；执行期写库均以此做 CAS';
+COMMENT ON COLUMN agent_run.config_version IS '暂停时的 Agent 配置指纹（提示词/工具/参数 Schema/审批标记），恢复必须精确相等';
+COMMENT ON COLUMN agent_run.active_elapsed_millis IS '累计执行时间（毫秒），不含审批等待';
+COMMENT ON COLUMN agent_run.approval_count IS '本任务创建过的审批数量（用于 max-per-run 限制）';
+
+-- =============================================================
+-- 审批记录：一次暂停一行
+--
+-- 决定（status）与执行（resume_state）分开存：
+--   status       = PENDING / APPROVED / REJECTED / CANCELLED / EXPIRED / INVALIDATED
+--   resume_state = PENDING_RESUME（决定已持久化，待领取）
+--                / CLAIMED（已领取执行权，尚未提交执行）
+--                / RUNNING（任务线程已启动）
+--                / FINISHED / FAILED
+--
+-- 这样"已批准但尚未执行"与"正在执行"可区分，
+-- 启动清理不会把前者误判为 FAILED。
+--
+-- 安全约束：只存用户可读摘要与参数哈希；
+-- 参数原文在 agent_checkpoint 中（执行需要），不进入摘要、不下发前端。
+-- =============================================================
+CREATE TABLE IF NOT EXISTS agent_approval
+(
+    approval_id     VARCHAR(64)  NOT NULL,
+    run_id          VARCHAR(64)  NOT NULL,
+    user_id         VARCHAR(64)  NOT NULL,
+    agent_type      VARCHAR(32)  NOT NULL,
+    step            INT          NOT NULL,
+    primary_tool    VARCHAR(64)  NOT NULL,
+    tool_count      INT          NOT NULL,
+    args_hash       VARCHAR(64)  NOT NULL,
+    summary_text    VARCHAR(500) NOT NULL,
+    summary_json    TEXT,
+    status          VARCHAR(16)  NOT NULL,
+    resume_state    VARCHAR(16)  NOT NULL DEFAULT 'PENDING_RESUME',
+    resume_attempts INT          NOT NULL DEFAULT 0,
+    decided_at      TIMESTAMP,
+    expires_at      TIMESTAMP    NOT NULL,
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_agent_approval PRIMARY KEY (approval_id)
+);
+
+-- 同一 run 的同一 step 只允许一条审批（重放不会产生第二条）。
+CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_approval_run_step
+    ON agent_approval (run_id, step);
+
+CREATE INDEX IF NOT EXISTS idx_agent_approval_pending
+    ON agent_approval (status, expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_agent_approval_resume
+    ON agent_approval (resume_state);
+
+CREATE INDEX IF NOT EXISTS idx_agent_approval_user
+    ON agent_approval (user_id);
+
+COMMENT ON TABLE agent_approval IS '审批记录：一次写工具暂停一行（M3）';
+COMMENT ON COLUMN agent_approval.summary_text IS '用户可读摘要（≤500 字符，不含参数原文/密钥）';
+COMMENT ON COLUMN agent_approval.args_hash IS '整轮 pending 工具调用的规范化参数哈希，批准即绑定该组参数';
+COMMENT ON COLUMN agent_approval.status IS '决定状态：PENDING/APPROVED/REJECTED/CANCELLED/EXPIRED/INVALIDATED';
+COMMENT ON COLUMN agent_approval.resume_state IS '执行子状态：PENDING_RESUME/CLAIMED/RUNNING/FINISHED/FAILED';
+
+-- =============================================================
+-- 检查点：暂停点恢复所需的全部信息（每个 run 一行）
+--
+-- 不存 system prompt 原文，只存 config_version 指纹；
+-- 恢复时版本不匹配即拒绝，不用新提示词顶替。
+-- =============================================================
+CREATE TABLE IF NOT EXISTS agent_checkpoint
+(
+    run_id         VARCHAR(64) NOT NULL,
+    schema_version INT         NOT NULL,
+    config_version VARCHAR(64) NOT NULL,
+    payload_json   TEXT        NOT NULL,
+    created_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_agent_checkpoint PRIMARY KEY (run_id)
+);
+
+COMMENT ON TABLE agent_checkpoint IS '审批暂停点检查点（M3）；不存系统提示词原文';
+COMMENT ON COLUMN agent_checkpoint.schema_version IS '检查点 JSON 结构版本，当前 1';
+COMMENT ON COLUMN agent_checkpoint.config_version IS 'Agent 配置指纹，恢复必须精确相等';
+
+-- =============================================================
 -- 音乐业务表（M2a：数据模型）
 --
 -- 约定与 agent_run 一致：

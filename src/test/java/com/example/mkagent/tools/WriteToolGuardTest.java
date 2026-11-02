@@ -1,5 +1,6 @@
 package com.example.mkagent.tools;
 
+import com.example.mkagent.approval.ApprovalToolPolicy;
 import com.example.mkagent.config.AgentToolProvider;
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.support.HermeticSpringBootTest;
@@ -66,6 +67,9 @@ class WriteToolGuardTest {
     @Autowired
     private Environment environment;
 
+    @Autowired
+    private ApprovalToolPolicy approvalToolPolicy;
+
     @Test
     @DisplayName("扫描能发现写工具（防止扫描本身失效导致的假绿）")
     void scanFindsWriteTools() {
@@ -74,6 +78,30 @@ class WriteToolGuardTest {
         assertFalse(writeTools.isEmpty(), "扫描结果为空说明守卫失效");
         assertTrue(writeTools.contains("create_playlist"), writeTools.toString());
         assertTrue(writeTools.contains("add_songs_to_playlist"), writeTools.toString());
+    }
+
+    /**
+     * 审批策略也必须看见这两个写工具。
+     *
+     * 与上面的反射扫描是**两条独立链路**：
+     * 反射扫描只证明"注解写对了"，策略扫描才决定运行时会不会暂停。
+     * 只断言其中一条，另一条坏了照样是失败放行（写工具会被当普通工具执行）。
+     *
+     * 断言用"包含"而不是"相等"：以后新增写工具不需要改这里，
+     * 但少了一个已知写工具必须立刻失败。
+     */
+    @Test
+    @DisplayName("审批策略扫到了两个写工具（不能是空集合）")
+    void approvalPolicySeesWriteTools() {
+        assertTrue(approvalToolPolicy.isReady(), "容器刷新后必须已完成扫描");
+
+        Set<String> approvalTools = approvalToolPolicy.requiredToolNames();
+
+        assertFalse(approvalTools.isEmpty(), "审批工具集合为空说明策略扫描失效");
+        assertTrue(approvalTools.contains("create_playlist"),
+                "策略必须识别 create_playlist，实际：" + approvalTools);
+        assertTrue(approvalTools.contains("add_songs_to_playlist"),
+                "策略必须识别 add_songs_to_playlist，实际：" + approvalTools);
     }
 
     @Test

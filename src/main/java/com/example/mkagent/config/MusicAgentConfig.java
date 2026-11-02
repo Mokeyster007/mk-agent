@@ -2,6 +2,10 @@ package com.example.mkagent.config;
 
 import com.example.mkagent.agent.AgentTaskRegistry;
 import com.example.mkagent.agent.MusicAgent;
+import com.example.mkagent.approval.ApprovalPauseGateway;
+import com.example.mkagent.approval.ApprovalSummaryBuilder;
+import com.example.mkagent.approval.ApprovalToolPolicy;
+import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
@@ -43,6 +47,10 @@ public class MusicAgentConfig {
             AgentTaskRegistry agentTaskRegistry,
             AgentRunRecorder agentRunRecorder,
             AgentConcurrencyGuard agentConcurrencyGuard,
+            ApprovalToolPolicy approvalToolPolicy,
+            ApprovalPauseGateway approvalPauseGateway,
+            ApprovalSummaryBuilder approvalSummaryBuilder,
+            RunHandoffLocks runHandoffLocks,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
@@ -66,6 +74,10 @@ public class MusicAgentConfig {
                 agentTaskRegistry,
                 agentRunRecorder,
                 agentConcurrencyGuard,
+                approvalToolPolicy,
+                approvalPauseGateway,
+                approvalSummaryBuilder,
+                runHandoffLocks,
                 maxSteps,
                 maxToolCalls,
                 timeout,
@@ -84,6 +96,10 @@ public class MusicAgentConfig {
             AgentTaskRegistry agentTaskRegistry,
             AgentRunRecorder agentRunRecorder,
             AgentConcurrencyGuard agentConcurrencyGuard,
+            ApprovalToolPolicy approvalToolPolicy,
+            ApprovalPauseGateway approvalPauseGateway,
+            ApprovalSummaryBuilder approvalSummaryBuilder,
+            RunHandoffLocks runHandoffLocks,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
@@ -107,6 +123,10 @@ public class MusicAgentConfig {
                 agentTaskRegistry,
                 agentRunRecorder,
                 agentConcurrencyGuard,
+                approvalToolPolicy,
+                approvalPauseGateway,
+                approvalSummaryBuilder,
+                runHandoffLocks,
                 maxSteps,
                 maxToolCalls,
                 timeout,
@@ -133,6 +153,10 @@ public class MusicAgentConfig {
             AgentTaskRegistry agentTaskRegistry,
             AgentRunRecorder agentRunRecorder,
             AgentConcurrencyGuard agentConcurrencyGuard,
+            ApprovalToolPolicy approvalToolPolicy,
+            ApprovalPauseGateway approvalPauseGateway,
+            ApprovalSummaryBuilder approvalSummaryBuilder,
+            RunHandoffLocks runHandoffLocks,
             int maxSteps,
             int maxToolCalls,
             Duration timeout,
@@ -154,6 +178,16 @@ public class MusicAgentConfig {
         agent.setTaskRegistry(agentTaskRegistry);
         agent.setRunRecorder(agentRunRecorder);
         agent.setConcurrencyGuard(agentConcurrencyGuard);
+
+        /*
+         * 审批链路（M3，批次 1）：只装配"暂停"所需的三个组件。
+         * approve/reject/resume 在批次 2 接入；
+         * 写工具本身仍不在白名单里，因此这批不会真的暂停任何线上请求。
+         */
+        agent.setApprovalToolPolicy(approvalToolPolicy);
+        agent.setApprovalPauseGateway(approvalPauseGateway);
+        agent.setApprovalSummaryBuilder(approvalSummaryBuilder);
+        agent.setHandoffLocks(runHandoffLocks);
 
         agent.applyBudget(maxSteps, maxToolCalls, timeout, sseBuffer);
 

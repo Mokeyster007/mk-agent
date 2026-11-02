@@ -38,7 +38,17 @@ public enum AgentEventType {
     DONE("done"),
 
     /** 任务被主动取消（取消接口或客户端提前断开）。 */
-    CANCELLED("cancelled");
+    CANCELLED("cancelled"),
+
+    /**
+     * 任务暂停，等待人工确认写操作（M3）。
+     *
+     * data 只包含 approvalId、用户可读摘要与有效期，
+     * 不含工具参数原文、userId 或任何密钥。
+     * 收到本事件后紧跟一条 done：done 只表示"本段连接结束"，
+     * 任务本身仍处于 WAITING_APPROVAL，不是终态。
+     */
+    APPROVAL_REQUIRED("approval_required");
 
     private final String wireName;
 

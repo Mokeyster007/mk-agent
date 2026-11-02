@@ -85,6 +85,34 @@ public class AgentRunEntity {
     private String errorMessage;
 
     /**
+     * 稳定原因码（M3）：前端只认码，不解析中文 error_message。
+     * 例如 APPROVAL_EXPIRED / PROCESS_RESTART。
+     */
+    private String errorCode;
+
+    /**
+     * 执行代次：首次 0，每次审批恢复 +1。
+     * 所有执行期写库都以它做 CAS，旧代次不能覆盖新代次。
+     */
+    private Integer executionEpoch;
+
+    /**
+     * 暂停时的 Agent 配置指纹（提示词 / 工具 / 参数 Schema / 审批标记）。
+     * 恢复必须精确相等，否则拒绝恢复。
+     */
+    private String configVersion;
+
+    /**
+     * 累计执行时间（毫秒），不含审批等待。
+     */
+    private Long activeElapsedMillis;
+
+    /**
+     * 本任务创建过的审批数量（max-per-run 限制）。
+     */
+    private Integer approvalCount;
+
+    /**
      * 本次任务实际使用的模型名（来自模型响应 metadata）。
      */
     private String model;
@@ -200,6 +228,46 @@ public class AgentRunEntity {
 
     public void setErrorMessage(String errorMessage) {
         this.errorMessage = errorMessage;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public void setErrorCode(String errorCode) {
+        this.errorCode = errorCode;
+    }
+
+    public Integer getExecutionEpoch() {
+        return executionEpoch;
+    }
+
+    public void setExecutionEpoch(Integer executionEpoch) {
+        this.executionEpoch = executionEpoch;
+    }
+
+    public String getConfigVersion() {
+        return configVersion;
+    }
+
+    public void setConfigVersion(String configVersion) {
+        this.configVersion = configVersion;
+    }
+
+    public Long getActiveElapsedMillis() {
+        return activeElapsedMillis;
+    }
+
+    public void setActiveElapsedMillis(Long activeElapsedMillis) {
+        this.activeElapsedMillis = activeElapsedMillis;
+    }
+
+    public Integer getApprovalCount() {
+        return approvalCount;
+    }
+
+    public void setApprovalCount(Integer approvalCount) {
+        this.approvalCount = approvalCount;
     }
 
     public String getModel() {

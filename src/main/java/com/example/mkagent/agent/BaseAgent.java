@@ -1,6 +1,7 @@
 package com.example.mkagent.agent;
 
 import com.example.mkagent.config.AgentExecutorConfig;
+import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.exception.ModelCallException;
@@ -122,6 +123,15 @@ public abstract class BaseAgent {
      * 为 null 时任务不注册（例如纯单元测试场景）。
      */
     private AgentTaskRegistry taskRegistry;
+
+    /**
+     * 执行权交接锁（可选，M3）。
+     *
+     * 暂停与批准都要先拿它：保证"暂停提交 → 释放许可 → 注销"与
+     * "批准 → 取许可 → 提交执行"两段不会重叠。
+     * 为 null 时不做交接保护（纯单元测试场景）。
+     */
+    private RunHandoffLocks handoffLocks;
 
     /**
      * AgentRun 生命周期记录器（可选）。
@@ -286,6 +296,17 @@ public abstract class BaseAgent {
             }
 
             /*
+             * 审批暂停：任务被挂起，不是结束。
+             *
+             * 不调用 finishIfStillRunning（它只处理 RUNNING），
+             * 不写 final_answer，也不写 finished_at——
+             * 暂停行已经由 ApprovalPauseService 在同一事务里落库。
+             */
+            if (ctx.getState() == AgentState.WAITING_APPROVAL) {
+                return "任务已暂停，等待人工确认。";
+            }
+
+            /*
              * 循环退出时如果仍是 RUNNING，
              * 根据具体停止原因判定终态（超时 / 成功 / 达到预算）。
              */
@@ -346,9 +367,12 @@ public abstract class BaseAgent {
 
         } finally {
             /*
-             * 同步任务终态后释放并发许可。
+             * 同步任务终态后释放并发许可（release-once），
+             * 再放执行权交接锁：顺序不能反——
+             * 先放锁会让批准请求在许可还没释放时就进来。
              */
-            releaseConcurrencyPermit();
+            releaseConcurrencyPermit(ctx);
+            releaseHandoffLock(ctx);
         }
     }
 
@@ -451,8 +475,16 @@ public abstract class BaseAgent {
          */
         CompletableFuture<Void> task = new CompletableFuture<>();
 
+        /*
+         * 注册表句柄单独持有引用：
+         * SSE 回调要按"对象身份"确认自己是否仍是当前执行，
+         * 只拿 future 无法区分新老代次。
+         */
+        RunningAgentTask runningTask = new RunningAgentTask(
+                ctx, task, ctx.getExecutionEpoch());
+
         if (taskRegistry != null) {
-            taskRegistry.register(runId, new RunningAgentTask(ctx, task));
+            taskRegistry.register(runId, runningTask);
         }
 
         CompletableFuture.runAsync(() -> {
@@ -521,6 +553,43 @@ public abstract class BaseAgent {
                                 )
                         );
                     }
+                }
+
+                /*
+                 * 审批暂停：本段流到此结束，但任务**没有**终态。
+                 *
+                 * 事件顺序：status → approval_required → done。
+                 * 这里的 done 只表示"本段连接结束"，不表示任务完成——
+                 * 终态一律以 agent_run.state 为准（客户端应查询或等待批准后续流）。
+                 *
+                 * 不发 final_answer（还没有答案），不发 error（不是错误）。
+                 */
+                if (ctx.getState() == AgentState.WAITING_APPROVAL) {
+                    sendEvent(
+                            ctx,
+                            AgentEventType.STATUS,
+                            "等待人工确认，本段连接结束。"
+                    );
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.APPROVAL_REQUIRED,
+                                    ctx.getPendingApprovalJson(),
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.DONE,
+                                    "[DONE]",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    emitter.complete();
+                    return;
                 }
 
                 /*
@@ -642,13 +711,17 @@ public abstract class BaseAgent {
 
                 logTaskSummary(ctx, startMillis);
                 cleanupOnce(ctx, cleaned);
-                unregisterTask(runId);
+                unregisterTask(ctx);
 
                 /*
-                 * 任务终态后释放并发许可（异步线程释放，
-                 * Semaphore 支持跨线程释放）。
+                 * 任务结束（含暂停）后释放并发许可。
+                 *
+                 * release-once：暂停路径与 finally 都可能走到这里，
+                 * 由 ctx 的标记保证一次执行只释放一次；
+                 * 每个执行代次有独立 ctx，旧代次也无法释放新代次的许可。
                  */
-                releaseConcurrencyPermit();
+                releaseConcurrencyPermit(ctx);
+                releaseHandoffLock(ctx);
             }
 
         }, agentExecutor).whenComplete((result, error) -> {
@@ -664,6 +737,20 @@ public abstract class BaseAgent {
         });
 
         emitter.onTimeout(() -> {
+            /*
+             * 只处理"自己这一次执行"的回调。
+             *
+             * 审批恢复会给同一个 runId 注册新句柄；
+             * 旧连接的 onTimeout 如果迟到一步，绝不能去中断新线程、
+             * 删新任务或释放新许可。按句柄对象身份比较，
+             * 比比较 ctx.epoch（旧对象自比较，永远相等）可靠。
+             */
+            if (!isCurrentExecution(runId, runningTask)) {
+                log.info("忽略过期的 SSE 超时回调：runId={}, epoch={}",
+                        runId, ctx.getExecutionEpoch());
+                return;
+            }
+
             /*
              * SSE 连接超时：优先把任务标记为 TIMED_OUT。
              * 若任务线程已先到达其他终态，本调用会被拒绝，不会覆盖。
@@ -690,10 +777,19 @@ public abstract class BaseAgent {
             ctx.interruptExecutingThread();
 
             cleanupOnce(ctx, cleaned);
-            unregisterTask(runId);
+            unregisterTask(ctx);
         });
 
         emitter.onCompletion(() -> {
+            /*
+             * 同样只处理自己这一次执行。
+             */
+            if (!isCurrentExecution(runId, runningTask)) {
+                log.info("忽略过期的 SSE 完成回调：runId={}, epoch={}",
+                        runId, ctx.getExecutionEpoch());
+                return;
+            }
+
             /*
              * 完成时仍是 RUNNING，说明任务没有正常走到终态，
              * 通常是客户端提前断开，视为取消。
@@ -701,6 +797,9 @@ public abstract class BaseAgent {
              * 正常完成时，任务线程已在 emitter.complete() 之前
              * 设置 SUCCEEDED（或其他终态），不会进入本分支，
              * 这是避免把正常完成误判为 CANCELLED 的关键。
+             *
+             * WAITING_APPROVAL 也不进入本分支：暂停时连接是"正常关闭"，
+             * 不是客户端掉线，把挂起任务判成 CANCELLED 会让批准无从谈起。
              */
             if (ctx.getState() == AgentState.RUNNING) {
                 ctx.transitionTo(AgentState.CANCELLED);
@@ -725,7 +824,7 @@ public abstract class BaseAgent {
             }
 
             cleanupOnce(ctx, cleaned);
-            unregisterTask(runId);
+            unregisterTask(ctx);
         });
 
         return emitter;
@@ -735,7 +834,7 @@ public abstract class BaseAgent {
              * 同步段在异步任务提交成功前失败（例如线程池拒绝）：
              * 此时异步 finally 不会执行，必须由本处释放许可。
              */
-            releaseConcurrencyPermit();
+            releasePermitOnSubmitFailure();
             throw e;
         }
     }
@@ -744,13 +843,18 @@ public abstract class BaseAgent {
      * 判断当前任务是否允许继续进入下一轮 Agent Loop。
      */
     private boolean canContinue(AgentRunContext ctx) {
+        /*
+         * 超时按"累计执行时间"算，不是"从 startedAt 到现在的墙钟时间"。
+         *
+         * 审批暂停可能持续几小时，若用墙钟时间，
+         * 一恢复就会立刻被判超时——用户明明批准了，任务却什么都没做就失败。
+         * 恢复时的 timeoutBudget 取检查点里的任务预算快照，
+         * 因此"恢复后剩余额度"= 快照 - 已累计执行时间，不会被重置。
+         */
         return ctx.getState() == AgentState.RUNNING
                 && ctx.getCurrentStep() < maxSteps
                 && ctx.getToolCallCount() < maxToolCalls
-                && Duration.between(
-                ctx.getStartedAt(),
-                Instant.now()
-        ).compareTo(timeout) < 0;
+                && ctx.elapsed().compareTo(ctx.effectiveTimeout(timeout)) < 0;
     }
 
     /**
@@ -790,8 +894,8 @@ public abstract class BaseAgent {
             return;
         }
 
-        boolean timedOut = Duration.between(ctx.getStartedAt(), Instant.now())
-                .compareTo(timeout) >= 0;
+        boolean timedOut = ctx.elapsed()
+                .compareTo(ctx.effectiveTimeout(timeout)) >= 0;
 
         if (timedOut) {
             ctx.transitionTo(AgentState.TIMED_OUT);
@@ -891,12 +995,24 @@ public abstract class BaseAgent {
     }
 
     /**
-     * 从注册表移除已结束的任务（注册表未注入时为空操作）。
+     * 从注册表移除**自己这一次执行**的任务。
+     *
+     * 必须带代次：审批恢复会给同一个 runId 注册新句柄，
+     * 旧线程按 runId 无条件删除会把新句柄删掉。
      */
-    private void unregisterTask(String runId) {
+    private void unregisterTask(AgentRunContext ctx) {
         if (taskRegistry != null) {
-            taskRegistry.remove(runId);
+            taskRegistry.remove(ctx.getRunId().toString(), ctx.getExecutionEpoch());
         }
+    }
+
+    /**
+     * 注册表里的句柄是否仍是自己这一次执行。
+     *
+     * 注册表未注入（纯单测）时视为"是"，保持既有行为。
+     */
+    private boolean isCurrentExecution(String runId, RunningAgentTask task) {
+        return taskRegistry == null || taskRegistry.isCurrent(runId, task);
     }
 
     // ===== 全局并发控制 =====
@@ -912,9 +1028,43 @@ public abstract class BaseAgent {
     }
 
     /**
-     * 释放全局并发许可；只能在成功获取后调用一次。
+     * 释放全局并发许可（release-once）。
+     *
+     * 暂停路径与 finally 都可能走到这里；
+     * 用 ctx 上的标记保证一次执行只释放一次，
+     * 否则许可数会被放大，并发上限形同虚设。
      */
-    private void releaseConcurrencyPermit() {
+    private void releaseConcurrencyPermit(AgentRunContext ctx) {
+        if (concurrencyGuard == null) {
+            return;
+        }
+        if (ctx == null || ctx.markPermitReleased()) {
+            concurrencyGuard.release();
+        }
+    }
+
+    /**
+     * 释放执行权交接锁（只有真正持有时才放）。
+     *
+     * 暂停时由 ToolCallAgent 获取并置标记；
+     * 这里在"许可已释放、注册表已注销"之后释放，
+     * 保证批准请求看到的永远是一个已经收尾干净的暂停态。
+     */
+    private void releaseHandoffLock(AgentRunContext ctx) {
+        if (handoffLocks == null || !ctx.isHandoffLockHeld()) {
+            return;
+        }
+        ctx.setHandoffLockHeld(false);
+        handoffLocks.release(ctx.getRunId().toString());
+    }
+
+    /**
+     * 提交异步任务失败时的释放（此时任务从未启动，ctx 的 finally 不会执行）。
+     *
+     * 这条路径与 {@link #releaseConcurrencyPermit(AgentRunContext)} 互斥：
+     * runAsync 抛异常意味着异步体一行都没跑。
+     */
+    private void releasePermitOnSubmitFailure() {
         if (concurrencyGuard != null) {
             concurrencyGuard.release();
         }
@@ -1167,6 +1317,17 @@ public abstract class BaseAgent {
      */
     public void setTaskRegistry(AgentTaskRegistry taskRegistry) {
         this.taskRegistry = taskRegistry;
+    }
+
+    public RunHandoffLocks getHandoffLocks() {
+        return handoffLocks;
+    }
+
+    /**
+     * 注入执行权交接锁（M3）。为 null 时暂停仍可用，只是不做交接保护。
+     */
+    public void setHandoffLocks(RunHandoffLocks handoffLocks) {
+        this.handoffLocks = handoffLocks;
     }
 
     /**

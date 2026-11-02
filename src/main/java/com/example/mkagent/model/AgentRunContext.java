@@ -6,10 +6,12 @@ import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 一次 Agent 任务运行期间的上下文。
@@ -26,11 +28,62 @@ import java.util.UUID;
 public class AgentRunContext {
 
     /**
+     * 新建一次任务。
+     */
+    public AgentRunContext() {
+        this(UUID.randomUUID(), Instant.now());
+    }
+
+    /**
+     * 按指定 runId 新建任务（测试用）。
+     */
+    public AgentRunContext(UUID runId) {
+        this(runId, Instant.now());
+    }
+
+    private AgentRunContext(UUID runId, Instant startedAt) {
+        this.runId = runId;
+        this.startedAt = startedAt;
+        this.segmentStartedAt = startedAt;
+    }
+
+    /**
+     * 从检查点恢复一次任务（M3，批次 2 使用）。
+     *
+     * 与新建的区别：
+     * 1. runId / 原始开始时间 / 累计执行时间 / 预算快照都来自检查点；
+     * 2. 状态从 IDLE 开始，由调用方 transitionTo(RUNNING)；
+     * 3. 新执行段从"现在"开始计时，审批等待不计入。
+     *
+     * @param runId           原任务的 runId（绝不能重新生成）
+     * @param originalStartedAt 首次开始时间（用于展示，不参与超时计算）
+     * @param activeElapsed   已累计的执行时间（不含审批等待）
+     * @param timeoutBudget   任务预算快照中的超时；null 表示用 Agent 当前配置
+     * @param executionEpoch  本次执行的代次（每次恢复 +1）
+     */
+    public static AgentRunContext restore(
+            UUID runId,
+            Instant originalStartedAt,
+            Duration activeElapsed,
+            Duration timeoutBudget,
+            int executionEpoch
+    ) {
+        AgentRunContext ctx = new AgentRunContext(runId, originalStartedAt);
+        ctx.activeElapsed = activeElapsed == null ? Duration.ZERO : activeElapsed;
+        ctx.timeoutBudget = timeoutBudget;
+        ctx.executionEpoch = executionEpoch;
+        ctx.segmentStartedAt = Instant.now();
+        return ctx;
+    }
+
+    /**
      * 当前任务的唯一标识。
      *
-     * 用于日志追踪、未来数据库持久化、SSE 推送事件等。
+     * 用于日志追踪、数据库持久化、SSE 推送事件等。
+     * 审批恢复时由检查点传入，**不能**重新生成——
+     * 重新生成会让幂等键、审批记录、运行记录三者的关联断裂。
      */
-    private final UUID runId = UUID.randomUUID();
+    private final UUID runId;
 
     /**
      * 当前任务的消息历史。
@@ -128,11 +181,82 @@ public class AgentRunContext {
             new ToolTargetExhaustionTracker();
 
     /**
-     * 当前任务开始时间。
-     *
-     * BaseAgent 会用它和 Instant.now() 计算任务是否超时。
+     * 当前任务首次开始时间（展示用，不参与超时计算）。
      */
-    private final Instant startedAt = Instant.now();
+    private final Instant startedAt;
+
+    /**
+     * 累计**执行**时间（不含审批等待）。
+     *
+     * 暂停时把当前执行段并入这里；恢复后重新开一段。
+     * 这样"等待人工确认 3 天"不会把一个 2 分钟预算的任务判成超时，
+     * 但恢复后也拿不回被等待消耗掉的额度——用的是任务预算快照。
+     */
+    private Duration activeElapsed = Duration.ZERO;
+
+    /**
+     * 当前执行段的起点；暂停/结束时为 null。
+     */
+    private Instant segmentStartedAt;
+
+    /**
+     * 任务预算快照中的超时时间（仅恢复时有值）。
+     *
+     * 为 null 时用 Agent 当前配置的 timeout。
+     * 恢复必须用快照，不能换成"当前 Bean 配置"——
+     * 否则运维改一次配置，已暂停任务的剩余额度就被悄悄改了。
+     */
+    private Duration timeoutBudget;
+
+    /**
+     * 执行代次：首次执行 0，每次恢复 +1。
+     *
+     * 所有执行期写库都带这个条件，旧代次的迟到写入影响 0 行。
+     */
+    private int executionEpoch;
+
+    /**
+     * 本次执行的并发许可是否已释放（release-once 保护）。
+     *
+     * 暂停路径与 finally 都可能走到释放逻辑，
+     * 用本标记保证一次执行只释放一次，避免许可数被放大。
+     * 每个执行代次都有独立的 ctx，因此旧代次的标记不会影响新代次。
+     */
+    private final AtomicBoolean permitReleased = new AtomicBoolean(false);
+
+    /**
+     * 当前暂停对应的审批 ID（仅 WAITING_APPROVAL 时有值）。
+     */
+    private String approvalId;
+
+    /**
+     * 暂停时要下发的 approval_required 事件 data（已脱敏的 JSON 字符串）。
+     *
+     * 由暂停服务生成，BaseAgent 只负责发送，不再二次拼装，
+     * 避免两处各拼一份、字段慢慢走偏。
+     */
+    private String pendingApprovalJson;
+
+    /**
+     * 稳定原因码（落库到 agent_run.error_code）。
+     */
+    private String errorCode;
+
+    /**
+     * 本次执行的 Agent 配置指纹（提示词/工具/参数 Schema/审批标记）。
+     *
+     * 暂停时写入检查点与 agent_run；恢复时必须与当前配置精确相等。
+     */
+    private String configVersion;
+
+    /**
+     * 本次执行是否持有"执行权交接锁"（M3）。
+     *
+     * 暂停时由 ToolCallAgent 获取，必须一直持有到
+     * "并发许可释放 + 注册表注销"之后，由 BaseAgent 的 finally 释放。
+     * 提前释放会让批准请求抢在收尾之前，造成两段执行重叠。
+     */
+    private boolean handoffLockHeld;
 
     /**
      * 当前一轮 think() 调用模型后得到的响应。
@@ -218,8 +342,81 @@ public class AgentRunContext {
         if (state == next) {
             return false;
         }
+        /*
+         * WAITING_APPROVAL 的出口受控：
+         * 只允许回到 RUNNING（批准/拒绝后恢复），
+         * 或转 FAILED（过期/检查点不可恢复）、CANCELLED（用户取消）。
+         *
+         * 特别禁止 WAITING_APPROVAL → TIMED_OUT：
+         * 暂停期间没有执行，SSE 也已关闭，
+         * 若容器的 onTimeout 迟到一步把挂起任务判成超时，
+         * 用户批准时会发现任务已经"失败"，且原因完全不对。
+         */
+        if (state == AgentState.WAITING_APPROVAL
+                && next != AgentState.RUNNING
+                && next != AgentState.FAILED
+                && next != AgentState.CANCELLED) {
+            return false;
+        }
         this.state = next;
         return true;
+    }
+
+    /**
+     * 累计执行时间：已并入的时长 + 当前执行段。
+     *
+     * 暂停后 segmentStartedAt 为 null，只返回已累计值，
+     * 因此审批等待不会被算进任务预算。
+     */
+    public synchronized Duration elapsed() {
+        Instant segmentStart = segmentStartedAt;
+        if (segmentStart == null) {
+            return activeElapsed;
+        }
+        return activeElapsed.plus(Duration.between(segmentStart, Instant.now()));
+    }
+
+    /**
+     * 结束当前执行段（暂停/终态前调用）。
+     */
+    public synchronized void closeExecutionSegment() {
+        if (segmentStartedAt != null) {
+            activeElapsed = activeElapsed.plus(
+                    Duration.between(segmentStartedAt, Instant.now()));
+            segmentStartedAt = null;
+        }
+    }
+
+    /**
+     * 开启新的执行段（恢复时调用）。
+     */
+    public synchronized void openExecutionSegment() {
+        if (segmentStartedAt == null) {
+            segmentStartedAt = Instant.now();
+        }
+    }
+
+    /**
+     * 累计执行时间（毫秒），落库到 active_elapsed_millis。
+     */
+    public long getActiveElapsedMillis() {
+        return elapsed().toMillis();
+    }
+
+    /**
+     * 实际生效的超时：有预算快照用快照，否则用 Agent 当前配置。
+     */
+    public Duration effectiveTimeout(Duration fallback) {
+        return timeoutBudget != null ? timeoutBudget : fallback;
+    }
+
+    /**
+     * 标记许可已释放；返回 true 表示本次调用是"第一次"。
+     *
+     * 用于 release-once：只有返回 true 的调用方可以真正 release。
+     */
+    public boolean markPermitReleased() {
+        return permitReleased.compareAndSet(false, true);
     }
 
     /**
@@ -385,5 +582,53 @@ public class AgentRunContext {
 
     public long getTotalModelCallMillis() {
         return totalModelCallMillis;
+    }
+
+    public int getExecutionEpoch() {
+        return executionEpoch;
+    }
+
+    public void setExecutionEpoch(int executionEpoch) {
+        this.executionEpoch = executionEpoch;
+    }
+
+    public String getApprovalId() {
+        return approvalId;
+    }
+
+    public void setApprovalId(String approvalId) {
+        this.approvalId = approvalId;
+    }
+
+    public String getPendingApprovalJson() {
+        return pendingApprovalJson;
+    }
+
+    public void setPendingApprovalJson(String pendingApprovalJson) {
+        this.pendingApprovalJson = pendingApprovalJson;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public void setErrorCode(String errorCode) {
+        this.errorCode = errorCode;
+    }
+
+    public String getConfigVersion() {
+        return configVersion;
+    }
+
+    public void setConfigVersion(String configVersion) {
+        this.configVersion = configVersion;
+    }
+
+    public boolean isHandoffLockHeld() {
+        return handoffLockHeld;
+    }
+
+    public void setHandoffLockHeld(boolean handoffLockHeld) {
+        this.handoffLockHeld = handoffLockHeld;
     }
 }
