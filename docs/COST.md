@@ -584,7 +584,7 @@ ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS tool_trace TEXT;
 额外执行一次**不带工具**的模型调用，让模型基于已有上下文写一个尽力而为的回答：
 
 ```
-(因步数预算耗尽，以下为基于已获取信息的尽力回答)
+(因执行预算耗尽，以下为基于已获取信息的尽力回答)
 根据已抓到的页面，Spring AI 的 ChatClient 支持……
 ```
 
@@ -597,14 +597,105 @@ ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS tool_trace TEXT;
 | 约束 | 说明 |
 | --- | --- |
 | 状态不变 | 仍是 `MAX_STEPS_REACHED`，这是成本事实，不能伪装成 `SUCCEEDED` |
-| 不带工具 | options 里没有 `toolCallbacks`，模型没有工具可用 |
+| 不带工具 | Prompt 不传 `toolCallbacks`，且模型默认选项里的工具在装配时被清空（见 6.5） |
 | Token 计入 Usage | 这次调用确实花钱，必须出现在 `agent_run` 的 Token 统计里 |
-| 失败必须降级 | 任何异常只记 WARN，保持 `finalAnswer` 为空，由 `BaseAgent` 回退到步骤摘要 |
+| 失败必须降级 | 拿不到文本时写确定性兜底，绝不留空 `finalAnswer`（见 6.4） |
 
 SSE 侧配套改动：`final_answer` 事件不再只对 `SUCCEEDED` 发送，
 `MAX_STEPS_REACHED` 且有答案时也发——否则强制收尾的答案永远到不了前端。
 
-关闭（`false`）则完全保持旧行为。
+关闭（`false`）则完全保持旧行为：**不新增调用，也不写兜底**。
+两件事是同一个承诺（"预算耗尽后不再产出任何东西"），拆开做会让开关没法一句话说清；
+评测侧（`mkagent.eval.force-final-answer`，默认 `false`）也据此保持原始策略可比。
+
+### 6.4 收尾拿不到文本时的确定性兜底
+
+真实冒烟（runId `755b5dea-80e2-4962-aa30-b83affdf67c1`）暴露：收尾调用返回了
+27 个 completion token 却**没有文本**，于是 `final_answer` 为空 ——
+SSE 只发了 `status` → `done`，`agent_run.final_answer` 是 NULL，用户什么都没拿到。
+
+现在收尾失败（空串 / null 文本 / 只有 tool_call / 空 generations / 无 output / 抛异常）
+统一写一条确定性回答：
+
+```
+因执行预算耗尽，本次任务已停止，未能生成完整回答。
+本次已执行 8 步、调用工具 8 次。
+请缩小任务范围后重试。
+```
+
+- 用"执行预算"而不是"步数预算"：`MAX_STEPS_REACHED` 也可能由工具调用次数上限触发；
+- 只含步数与工具调用次数，**不拼**工具原文、URL、参数、异常或模型内部细节；
+- 只做一次，不重试、不做多轮总结。但底层 `RetryTemplate`
+  （`mkagent.model-retry.*`，只对 5xx/429/超时生效）仍可能重发 HTTP 请求，
+  所以"一次业务调用"**不等于**"一个 HTTP 请求"，文档不要写成后者；
+- 取消/超时不走兜底：终态一旦不是 `MAX_STEPS_REACHED`，或线程已被中断，一律不写；
+- 收尾调用**期间**被中断：在当前已核对的业务路径中，SSE `onTimeout`
+  是该阶段的中断来源（取消接口走不到这里：`AgentTaskCanceller` 看到
+  `state.isTerminal()` 就直接返回 409）。
+  不宣称已穷尽所有外部线程中断来源。
+  异常按中断语义原样抛给 `BaseAgent`，但 `MAX_STEPS_REACHED` 在收尾之前就已经是终态，
+  `failOrCancel` 里的 `transitionTo(CANCELLED)` 会被终态保护拒绝。
+  所以**最终状态仍是 `MAX_STEPS_REACHED`**（`ctx`、SSE、`agent_run.state` 三处一致），
+  `final_answer` 保持 NULL，SSE 在 `status` 之后以一条脱敏 `error` 结束、**没有** `done`；
+  `agent_run.error_message` 会写上脱敏摘要（异常类型 + 短消息，不含堆栈）。
+  也就是说：预算耗尽的任务**可能同时**有 `state = MAX_STEPS_REACHED` 和
+  `error_message != NULL`——按 `error_message IS NULL` 过滤"干净预算耗尽"会漏掉这一类，
+  但不要因此改终态：终态是成本事实，错误摘要只解释"收尾为什么没产出"；
+  不要写成"变成 CANCELLED"——那只是异常分支的意图，不是终态；
+- 收尾响应里若同时有文本和 tool_call：采用文本，但**绝不执行**任何工具。
+
+### 6.5 为什么"Prompt 里不带工具"不等于"请求里没有工具"
+
+`DashScopeChatModel#buildRequestPrompt` 先做一次 `ModelOptionsUtils.merge`
+（runtime 里为 null 的字段回落到 `defaultOptions`），然后执行：
+
+```java
+merged.setToolCallbacks(ToolCallingChatOptions.mergeToolCallbacks(
+        runtime.getToolCallbacks(), defaultOptions.getToolCallbacks()));
+merged.setToolNames(ToolCallingChatOptions.mergeToolNames(
+        runtime.getToolNames(), defaultOptions.getToolNames()));
+```
+
+而这两个方法的语义是"runtime 为空就返回 defaults"。所以只要模型默认选项
+（`spring.ai.dashscope.chat.options`）里带工具，**任何一次** Prompt 都会把工具
+合并回请求——包括收尾那次；在 Prompt 侧把 `toolCallbacks` 置空是拦不住的
+（空列表恰好触发回退到 defaults）。
+
+`DashScopeChatOptions` 里有四个字段会进请求，**必须一起清**：
+
+| 字段 | 怎么进请求 |
+| --- | --- |
+| `toolCallbacks` | 由 `ToolCallingManager.resolveToolDefinitions` 解析成 `tools` |
+| `toolNames` | 同上（按名字解析） |
+| `tools` | 已解析好的 `FunctionTool` 列表；`createRequest` 只在"解析结果非空"时覆盖它，否则原样进请求 |
+| `toolChoice` | 直接进 `ChatCompletionRequestParameter.tool_choice` |
+
+只清前两个是不够的：只配 `tools` + `toolChoice`（不配 `toolNames`）时，收尾请求
+依然会带工具和 `tool_choice`——`ForcedFinalAnswerRequestShapeTest` 里有一条用例
+专门刻画这个形状。
+
+`toolContext` **不清**：它不进请求、也不对外声明工具，而且两条路径都设了
+`internalToolExecutionEnabled(false)`，框架侧根本不会执行工具。
+
+因此 `DashScopeChatModelConfig#stripDefaultTools` 在装配时清空默认工具
+（四个字段一起清；`tools` 置 `null` 而不是空列表——请求 DTO 标了
+`@JsonInclude(NON_NULL)`，`null` 才是"请求里没有这个字段"；
+真的清掉东西时告警，避免"配置了却静默失效"）。
+
+`ForcedFinalAnswerRequestShapeTest` 用**真实出站 JSON** 锁住四件事：
+常规轮有 `parameters.tools`、收尾轮没有、默认选项带 `toolCallbacks` 时会被合并回来、
+默认选项带 `tools`/`toolChoice` 时同样会被合并回来（所以必须在配置层清）。
+
+影响面（改动前后都核对过）：
+
+- `chatProperties.getOptions()` 返回的是属性对象**本身**（`getOptions` 字节码就是
+  `getfield` + `areturn`，没有拷贝），所以清理是**原地**改这个配置 Bean。
+  本项目读它的只有本配置类和 `ConfiguredModelNameResolver`（只读 `model`）；
+- 模型名、`temperature`、`maxTokens` 等字段不动，`stripDefaultTools` 只碰四个工具字段；
+- 所有需要工具的调用方（`MkManus`、`MusicAgent`、`EvalAgent`）都在运行时通过
+  `ToolCallingChatOptions.toolCallbacks(...)` 显式传入白名单，常规工具轮不受影响；
+- OpenAI 兼容路径（`mkagent.model.base-url` 生效时）不绑定
+  `spring.ai.openai.chat.options`，默认选项里从来没有工具，无需同样的清理。
 
 ---
 

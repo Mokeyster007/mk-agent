@@ -299,22 +299,26 @@ try {
 | `music-user-2` | USER | bob：1 个公开歌单 |
 | `music-admin-1` | ADMIN | 只能走管理入口拿聚合统计 |
 
-### 5.3 curl 示例
+### 5.3 curl 示例（Windows PowerShell）
 
-```bash
+本项目的开发环境是 Windows + PowerShell。`curl` 在 PowerShell 里是
+`Invoke-WebRequest` 的别名，**不支持** `-N` / `-H`，必须显式写 `curl.exe`。
+中文查询参数一律用 `-G --data-urlencode` 交给 curl 编码，
+避免控制台代码页把参数编码弄坏（不要直接把中文塞进 URL）。
+
+```powershell
+$base = "http://localhost:8123/api"
+
 # 普通用户
-curl -N "http://localhost:8080/api/ai/music/chat?message=帮我找几首和夜有关的歌" \
-  -H "X-User-Id: music-user-1"
+curl.exe -N -G "$base/ai/music/chat" --data-urlencode "message=帮我找几首和夜有关的歌" -H "X-User-Id: music-user-1"
 
 # 管理员
-curl -N "http://localhost:8080/api/ai/music/admin/chat?message=统计最近 7 天播放量" \
-  -H "X-User-Id: music-admin-1"
+curl.exe -N -G "$base/ai/music/admin/chat" --data-urlencode "message=统计最近 7 天播放量" -H "X-User-Id: music-admin-1"
 
 # 预期被拒（401 / 403 / 403）
-curl -i "http://localhost:8080/api/ai/music/chat?message=hi"
-curl -i "http://localhost:8080/api/ai/music/chat?message=hi" -H "X-User-Id: nobody"
-curl -i "http://localhost:8080/api/ai/music/admin/chat?message=hi" \
-  -H "X-User-Id: music-user-1"
+curl.exe -i "$base/ai/music/chat?message=hi"
+curl.exe -i "$base/ai/music/chat?message=hi" -H "X-User-Id: nobody"
+curl.exe -i "$base/ai/music/admin/chat?message=hi" -H "X-User-Id: music-user-1"
 ```
 
 ### 5.4 预期事件序列
@@ -347,7 +351,41 @@ event:done           [DONE]
 接入真实认证（JWT / 网关注入）时只需替换
 `UserContextInterceptor` 的解析逻辑，工具层与入口层不用动。
 
-### 5.7 写工具尚未启用
+### 5.7 收尾策略与全局开关
+
+`musicUserAgent` / `musicAdminAgent` 与 `MkManus` 共用两个**全局**开关：
+
+| 开关 | 默认 | 作用 |
+| --- | --- | --- |
+| `mkagent.agent.budget-warning-steps` | 2 | 剩余步数 ≤ N 时向模型追加"请收尾"提示 |
+| `mkagent.agent.force-final-answer` | true | 预算耗尽后再问一次模型（不带工具） |
+
+预算耗尽且收尾拿不到文本时，会写一条确定性兜底（"因执行预算耗尽……请缩小任务范围后重试"），
+终态仍是 `MAX_STEPS_REACHED`，SSE 的 `final_answer` 与 `agent_run.final_answer` 同源同值。
+收尾调用**期间**被取消/超时中断时同样保持 `MAX_STEPS_REACHED`、不写兜底
+（`final_answer` 留空，SSE 以脱敏 `error` 结束），细节见 `docs/COST.md` 6.3 / 6.4。
+
+`mkagent.agent.music.*` 只管步数/工具次数/超时/sse-buffer，不重复定义这两个开关。
+
+### 5.8 输入校验现状（没有 Bean Validation）
+
+入口**没有** `@Valid` / `@NotBlank` 之类的注解，也没有 `spring-boot-starter-validation`：
+运行期只有 `jakarta.validation-api`、没有 provider，所以 Spring 的
+`OptionalValidatorFactoryBean` 会在启动时打一行
+`NoProviderFoundException`（INFO，随后继续启动，不影响任何接口）。
+
+实际校验全部是手工的：
+
+| 位置 | 校验 |
+| --- | --- |
+| `MusicAccessGuard` | 缺 `X-User-Id` → 401；未知用户 → 403；非 ADMIN 访问管理入口 → 403 |
+| `BaseAgent.runStream` | 空/空白 message → `IllegalArgumentException`（400） |
+| `PlaylistWriteTool` | 歌单名 1..50、songIds 去重后 1..50 且必须都存在 |
+| `AdminAnalyticsTool` | `days` 1..90、`limit` 1..50 |
+
+**未覆盖**：message 长度上限（见 §7 待办）。
+
+### 5.9 写工具尚未启用
 
 `create_playlist` / `add_songs_to_playlist` 已在代码里（M2d），
 但**不在任何 AgentType 的白名单**中，模型看不到也调不到。
@@ -378,6 +416,8 @@ event:done           [DONE]
 | `MusicAccessGuardTest` | 缺头 401 / 未知 403 / 普通用户进管理入口 403 / 管理员放行（6 种组合） |
 | `MusicEndpointAccessControlTest` | MockMvc 真实 HTTP：401、403；被拒时 `agent_run` 无新行（Agent 从未启动） |
 | `MusicAgentSseIntegrationTest` | 端到端：检索→终止落库 MUSIC_USER；统计→终止落库 MUSIC_ADMIN；注入用例统计仓库零调用 |
+| `BudgetExhaustedSseIntegrationTest` | 预算 1 步：收尾无文本 → SSE 发兜底 `final_answer` 且与落库逐字一致、`MAX_STEPS_REACHED`；收尾期间被中断 → 终态仍是 `MAX_STEPS_REACHED`、不写兜底、无 `done`、不泄露异常、注册表与并发许可已释放 |
+| `MusicAgentGlobalSwitchBindingTest` | 两个音乐 Agent 继承全局 `budget-warning-steps` / `force-final-answer`，且 `music.*` 预算不被覆盖 |
 
 全部在 H2 上跑，不需要 Docker 数据库。
 
@@ -391,6 +431,8 @@ event:done           [DONE]
 | `get_play_history` | 播放历史是强隐私数据 | M3 随权限模型开放 |
 | 管理员统计最小口径 | 数据量极小时聚合可能反推个体 | 需业务方定义（如 n < 5 不返回） |
 | 写工具人工确认 | 写工具已在 M2d 落地但不在白名单 | M3 审批链路 |
+| 入口 `message` 无长度上限 | `BaseAgent.runStream` 只挡空串，超长输入直接进模型；"模型侧截断"不等于服务端输入限制 | 需要定上限（按字符还是按 token）后统一在入口校验 |
+| 未引入 Bean Validation | 依赖里只有 `jakarta.validation-api`、没有 provider，启动日志会有一行 `NoProviderFoundException`（`OptionalValidatorFactoryBean` 打 INFO 后继续） | 不新增依赖；入口校验保持手工，见 §5.8 |
 
 ## 8. 部署清单（M5）
 
@@ -410,8 +452,18 @@ event:done           [DONE]
 前置条件：
 
 1. `application-local.yml` 里配好真实 DashScope Key（**不要**提交，也不要把 Key 贴进 issue / 聊天）；
-2. PostgreSQL 已启动（`docker compose up -d`），应用已启动；
+2. PostgreSQL 已启动（`docker compose up -d`），应用已启动（本地端口 **8123**）；
 3. 种子数据已自动写入（`music_song` 60 行）。
+
+所有命令都在 **Windows PowerShell** 里执行。注意三点：
+
+- `curl` 是 `Invoke-WebRequest` 的别名，必须写 `curl.exe`；
+- 中文参数用 `-G --data-urlencode` 交给 curl 编码，不要直接拼进 URL；
+- 不要用 Bash 的反斜杠续行符，PowerShell 的续行符是反引号——最稳妥是写成一行。
+
+```powershell
+$base = "http://localhost:8123/api"
+```
 
 每个场景结束后，用 runId（SSE 第一条 `event:status` 里带）查库核对：
 
@@ -424,9 +476,8 @@ SELECT tool_trace FROM agent_run WHERE run_id = '<runId>';
 
 ### 9.1 普通用户查询并回答
 
-```bash
-curl -N "http://localhost:8080/api/ai/music/chat?message=帮我找几首夜航星的歌" \
-  -H "X-User-Id: music-user-1"
+```powershell
+curl.exe -N -G "$base/ai/music/chat" --data-urlencode "message=帮我找几首夜航星的歌" -H "X-User-Id: music-user-1"
 ```
 
 预期：
@@ -440,9 +491,8 @@ curl -N "http://localhost:8080/api/ai/music/chat?message=帮我找几首夜航�
 
 ### 9.2 普通用户尝试拿管理员统计
 
-```bash
-curl -N "http://localhost:8080/api/ai/music/chat?message=统计一下最近 7 天所有人的播放量" \
-  -H "X-User-Id: music-user-1"
+```powershell
+curl.exe -N -G "$base/ai/music/chat" --data-urlencode "message=统计一下最近 7 天所有人的播放量" -H "X-User-Id: music-user-1"
 ```
 
 预期：
@@ -453,9 +503,8 @@ curl -N "http://localhost:8080/api/ai/music/chat?message=统计一下最近 7 �
 
 ### 9.3 管理员获取统计
 
-```bash
-curl -N "http://localhost:8080/api/ai/music/admin/chat?message=统计最近 7 天的播放量" \
-  -H "X-User-Id: music-admin-1"
+```powershell
+curl.exe -N -G "$base/ai/music/admin/chat" --data-urlencode "message=统计最近 7 天的播放量" -H "X-User-Id: music-admin-1"
 ```
 
 预期：
@@ -468,9 +517,8 @@ curl -N "http://localhost:8080/api/ai/music/admin/chat?message=统计最近 7 �
 
 ### 9.4 含注入文本的歌曲被检索到
 
-```bash
-curl -N "http://localhost:8080/api/ai/music/chat?message=帮我找标题里带系统提示的歌" \
-  -H "X-User-Id: music-user-1"
+```powershell
+curl.exe -N -G "$base/ai/music/chat" --data-urlencode "message=帮我找标题里带系统提示的歌" -H "X-User-Id: music-user-1"
 ```
 
 预期：
@@ -483,10 +531,41 @@ curl -N "http://localhost:8080/api/ai/music/chat?message=帮我找标题里带�
 
 ### 9.5 管理员入口的越权尝试
 
-```bash
-curl -i "http://localhost:8080/api/ai/music/admin/chat?message=hi" \
-  -H "X-User-Id: music-user-1"
+```powershell
+curl.exe -i -G "$base/ai/music/admin/chat" --data-urlencode "message=hi" -H "X-User-Id: music-user-1"
 ```
 
 预期：`403`，响应体 `{"success":false,"message":"无权访问音乐管理接口"}`，
 且**没有**新的 `agent_run` 记录（请求在启动 Agent 之前就被拒了）。
+
+### 9.6 预算耗尽（收尾与兜底）
+
+这一步验证 5.7 的收尾策略。把音乐入口的预算临时调到 1 步
+（改 `application-local.yml`，或启动前设置环境变量，二者取一）：
+
+```powershell
+$env:MKAGENT_AGENT_MUSIC_MAX_STEPS = "1"
+$env:MKAGENT_AGENT_MUSIC_MAX_TOOL_CALLS = "1"
+```
+
+```powershell
+curl.exe -N -G "$base/ai/music/chat" --data-urlencode "message=找几首和夜有关的歌" -H "X-User-Id: music-user-1"
+```
+
+**两种结果都算通过**——真实模型这一轮是否给出文本不可控，
+不要要求它必然命中兜底：
+
+| 结果 | `final_answer` 的形态 |
+| --- | --- |
+| A：收尾调用拿到了文本 | 以 `(因执行预算耗尽，以下为基于已获取信息的尽力回答)` 开头，后面是模型自己的总结 |
+| B：收尾调用没拿到文本 | 逐字等于兜底文案：`因执行预算耗尽，本次任务已停止，未能生成完整回答。` + `本次已执行 N 步、调用工具 M 次。` + `请缩小任务范围后重试。` |
+
+两种结果都必须同时满足：
+
+1. `agent_run.state = MAX_STEPS_REACHED`（**不是** `SUCCEEDED`）；
+2. SSE 顺序是 `status` → `final_answer` → `done`，`final_answer` 必须出现在 `done` **之前**；
+3. `agent_run.final_answer` 与 SSE 里的 `final_answer` **逐字一致**（同一份文本，不是两处各自生成）；
+4. 全程没有 `event:error`；
+5. 兜底文案里只有步数与工具次数，不含工具名、URL、参数或异常信息。
+
+核对 SQL 见本节开头；另外可确认 `total_tokens > 0`（收尾那次调用的 Token 也要计入成本）。

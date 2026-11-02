@@ -198,6 +198,14 @@ mkagent:
 若 M4 需要评估"尽力回答"的质量，应新增独立指标（回答非空率、引用忠实度等），
 不能依赖通过率。
 
+两套开关**互不影响**：`EvalProperties` 只绑 `mkagent.eval.*`，`EvalAgent` 也不是 Spring Bean，
+生产把 `mkagent.agent.force-final-answer` 打开时，评测仍然跑 `false`。
+回归见 `EvalPropertiesIsolationTest`。
+
+生产侧"收尾拿不到文本 → 确定性兜底"的改动**不影响评测**：
+`force-final-answer=false` 时既不新增调用，也不写兜底（见 `docs/COST.md` 6.3/6.4），
+所以评测口径与改动前完全一致。
+
 ## 6. 报告字段
 
 Markdown 报告包含：
@@ -222,4 +230,13 @@ Markdown 报告包含：
 - 关键词用例是“硬断言”：关键词缺失直接判失败，不会交给 judge 兜底；这是为了保证确定性指标可复现。
 - 当前 `ToolCallAgent` 在模型直接调用 `terminate_task`、且没有独立文本回答时，`finalAnswer` 是终止工具摘要。若真实评测出现这类失败，说明 Agent 没有给出面向用户的回答，属于被测行为问题，不是评测器误判。
 - 真实评测会消耗模型与搜索 API 额度，默认不随 `mvn test` 执行。
+- `CitationFaithfulnessChecker` **只在评测链路里跑**（`AgentEvaluator` 调用），生产请求不检查，
+  所以真实冒烟里"模型声称某章节 URL 经验证可加载"不会被拦下来。
+- 该检查的出处口径是"用户输入 + 工具返回原文"，助手自己的文本永远不会被当作证据；
+  但它只验证**URL 字符串的出处**，不验证"是否真的抓取过/可加载"，
+  "经验证可加载"这类断言不在检查范围内。
+- 已知误通过（当前行为，不是安全规则）：判定用的是
+  `工具结果.contains(回答里的 URL)`，因此模型把真 URL **截短**
+  （`https://a.com/guide` 之于 `https://a.com/guide/intro`）会被判为通过。
+  加长则正确失败。收紧前先在 `CitationFaithfulnessCheckerTest` 里补刻画用例。
 
