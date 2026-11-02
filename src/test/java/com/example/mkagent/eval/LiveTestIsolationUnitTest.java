@@ -15,8 +15,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 目的：live 测试（真实模型 / 真实搜索 / 真实数据库）一旦漏打 @Tag("live")，
  * 就会在 `mvn test` 里默默花钱。这里用两道断言把它钉死：
  *
- * 1. pom.xml 里 surefire 默认排除 live 分组，且 -Plive 可以把排除项覆盖掉；
+ * 1. pom.xml 里 surefire 默认排除 live 与 pg 分组，且 -Plive 可以把排除项覆盖掉；
  * 2. 已知的 live 测试类确实带 @Tag("live")。
+ *
+ * pg 分组（M3 幂等/行锁语义验证）必须一起排除：
+ * 这类用例要连真实 PostgreSQL，一旦漏排除，"默认全量测试不依赖 Docker"
+ * 这条约定就悄悄失效了，而失效现场往往只有加了 Docker 的机器能复现。
  *
  * 本测试本身不启动 Spring、不触网，属于默认执行的分组。
  */
@@ -43,8 +47,8 @@ class LiveTestIsolationUnitTest {
         String pom = Files.readString(Path.of("pom.xml"));
 
         assertThat(pom)
-                .as("默认排除的分组必须是 live")
-                .contains("<mkagent.test.excluded-groups>live</mkagent.test.excluded-groups>");
+                .as("默认排除的分组必须是 live 与 pg")
+                .contains("<mkagent.test.excluded-groups>live,pg</mkagent.test.excluded-groups>");
 
         assertThat(pom)
                 .as("surefire 必须真的使用该属性作为 excludedGroups")

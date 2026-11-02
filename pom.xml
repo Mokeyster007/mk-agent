@@ -40,9 +40,13 @@
             默认被排除的测试分组。
             live = 需要真实模型 / 真实搜索 / 真实数据库的测试：
             默认 mvn test 一律不跑，避免误消耗额度。
-            需要跑 live 测试时用 -Plive 把该值覆盖成 none（见 build/profiles）。
+            pg   = 需要真实 PostgreSQL 的测试（M3 幂等/行锁语义验证）：
+            默认构建必须显式排除，否则"默认全量测试不依赖 Docker"这条约定
+            会在有人加了 @Tag("pg") 用例后悄悄失效。
+            需要跑 live 测试时用 -Plive 把该值覆盖成 none（见 build/profiles）；
+            只跑 pg 用例时用 -Dmkagent.test.excluded-groups=live -Dgroups=pg。
         -->
-        <mkagent.test.excluded-groups>live</mkagent.test.excluded-groups>
+        <mkagent.test.excluded-groups>live,pg</mkagent.test.excluded-groups>
 
         <!--
             测试 JVM 参数（surefire argLine）。
