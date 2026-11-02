@@ -107,6 +107,15 @@ class MusicAgentConfigIntegrationTest {
     }
 
     @Test
+    @DisplayName("全局收尾开关默认值：budget-warning-steps=2、force-final-answer=true")
+    void globalSwitchDefaults() {
+        for (MusicAgent agent : new MusicAgent[]{musicUserAgent, musicAdminAgent}) {
+            assertEquals(2, agent.getBudgetWarningSteps(), agent.getName());
+            assertTrue(agent.isForceFinalAnswer(), agent.getName());
+        }
+    }
+
+    @Test
     @DisplayName("系统提示词按类型装配，没有互相串")
     void systemPromptsAreBoundToTheRightAgent() {
         assertTrue(musicUserAgent.getSystemPrompt()

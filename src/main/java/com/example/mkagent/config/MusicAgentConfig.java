@@ -46,7 +46,14 @@ public class MusicAgentConfig {
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
-            @Value("${mkagent.agent.music.sse-buffer:30s}") Duration sseBuffer
+            @Value("${mkagent.agent.music.sse-buffer:30s}") Duration sseBuffer,
+            /*
+             * 下面两个是**全局**开关（与 MkManus 同一份配置），不是 music.* 专属：
+             * 它们描述的是"预算耗尽后怎么收尾"的行为，属于 Agent 通用语义，
+             * 分成本地副本会让运维改了 application.yml 却只对 Manus 生效。
+             */
+            @Value("${mkagent.agent.budget-warning-steps:2}") int budgetWarningSteps,
+            @Value("${mkagent.agent.force-final-answer:true}") boolean forceFinalAnswer
     ) {
         return build(
                 AgentType.MUSIC_USER,
@@ -62,7 +69,9 @@ public class MusicAgentConfig {
                 maxSteps,
                 maxToolCalls,
                 timeout,
-                sseBuffer
+                sseBuffer,
+                budgetWarningSteps,
+                forceFinalAnswer
         );
     }
 
@@ -78,7 +87,14 @@ public class MusicAgentConfig {
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
-            @Value("${mkagent.agent.music.sse-buffer:30s}") Duration sseBuffer
+            @Value("${mkagent.agent.music.sse-buffer:30s}") Duration sseBuffer,
+            /*
+             * 下面两个是**全局**开关（与 MkManus 同一份配置），不是 music.* 专属：
+             * 它们描述的是"预算耗尽后怎么收尾"的行为，属于 Agent 通用语义，
+             * 分成本地副本会让运维改了 application.yml 却只对 Manus 生效。
+             */
+            @Value("${mkagent.agent.budget-warning-steps:2}") int budgetWarningSteps,
+            @Value("${mkagent.agent.force-final-answer:true}") boolean forceFinalAnswer
     ) {
         return build(
                 AgentType.MUSIC_ADMIN,
@@ -94,7 +110,9 @@ public class MusicAgentConfig {
                 maxSteps,
                 maxToolCalls,
                 timeout,
-                sseBuffer
+                sseBuffer,
+                budgetWarningSteps,
+                forceFinalAnswer
         );
     }
 
@@ -118,7 +136,9 @@ public class MusicAgentConfig {
             int maxSteps,
             int maxToolCalls,
             Duration timeout,
-            Duration sseBuffer
+            Duration sseBuffer,
+            int budgetWarningSteps,
+            boolean forceFinalAnswer
     ) {
         MusicAgent agent = new MusicAgent(
                 chatModel,
@@ -136,6 +156,14 @@ public class MusicAgentConfig {
         agent.setConcurrencyGuard(agentConcurrencyGuard);
 
         agent.applyBudget(maxSteps, maxToolCalls, timeout, sseBuffer);
+
+        /*
+         * 全局收尾策略：与 MkManus 共用 mkagent.agent.* 两个开关。
+         * 不传的后果很隐蔽——音乐入口会一直用代码默认值（2 / true），
+         * 运维把 yml 改成 false 时只有 Manus 变，音乐入口照旧多花一次调用。
+         */
+        agent.setBudgetWarningSteps(budgetWarningSteps);
+        agent.setForceFinalAnswer(forceFinalAnswer);
 
         return agent;
     }
