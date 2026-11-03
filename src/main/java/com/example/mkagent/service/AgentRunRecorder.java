@@ -112,6 +112,18 @@ public class AgentRunRecorder {
             return;
         }
 
+        /*
+         * 终态由 recordFinish 独占写入。
+         *
+         * 进度写入也会写 state，如果某轮 step 自己把状态置成 SUCCEEDED/FAILED，
+         * 这里就会先写一个"终态但 finished_at 仍为 NULL"的行；
+         * 客户端轮询恰好落在这一瞬间，会看到自相矛盾的数据。
+         * 跳过终态，让 recordFinish 一次性把 state 与 finished_at 写进去。
+         */
+        if (ctx.getState().isTerminal()) {
+            return;
+        }
+
         try {
             String toolTrace = toolTraceOf(ctx);
 
@@ -224,66 +236,97 @@ public class AgentRunRecorder {
         }
 
         try {
-            String finalAnswer = truncate(
-                    ctx.getFinalAnswer(), MAX_FINAL_ANSWER_LENGTH);
-            String safeErrorMessage = truncate(
-                    errorMessage, MAX_ERROR_MESSAGE_LENGTH);
-            String toolTrace = toolTraceOf(ctx);
-
-            LambdaUpdateWrapper<AgentRunEntity> wrapper =
-                    new LambdaUpdateWrapper<AgentRunEntity>()
-                            .eq(AgentRunEntity::getRunId, ctx.getRunId().toString())
-                            .eq(AgentRunEntity::getExecutionEpoch, ctx.getExecutionEpoch())
-                            .set(AgentRunEntity::getState, ctx.getState().name())
-                            .set(AgentRunEntity::getCurrentStep, ctx.getCurrentStep())
-                            .set(AgentRunEntity::getToolCallCount, ctx.getToolCallCount())
-                            /*
-                             * 终态也写一次轨迹：最后一轮 step 之后不会再触发
-                             * recordProgress，漏写会丢掉"最后一个工具"。
-                             */
-                            .set(toolTrace != null,
-                                    AgentRunEntity::getToolTrace, toolTrace)
-                            .set(finalAnswer != null,
-                                    AgentRunEntity::getFinalAnswer, finalAnswer)
-                            .set(safeErrorMessage != null,
-                                    AgentRunEntity::getErrorMessage, safeErrorMessage)
-                            .set(ctx.getErrorCode() != null,
-                                    AgentRunEntity::getErrorCode, ctx.getErrorCode())
-                            .set(AgentRunEntity::getActiveElapsedMillis,
-                                    ctx.getActiveElapsedMillis())
-                            /*
-                             * 模型 Usage（成本观测）：
-                             * 模型未返回 usage 时 totalTokens 为 0，
-                             * 此时不写 Token 字段，库中保持 NULL，
-                             * 区分“未提供”与“真实为 0”。
-                             */
-                            .set(ctx.getModel() != null,
-                                    AgentRunEntity::getModel, ctx.getModel())
-                            .set(ctx.getTotalTokens() > 0,
-                                    AgentRunEntity::getPromptTokens,
-                                    ctx.getPromptTokens())
-                            .set(ctx.getTotalTokens() > 0,
-                                    AgentRunEntity::getCompletionTokens,
-                                    ctx.getCompletionTokens())
-                            .set(ctx.getTotalTokens() > 0,
-                                    AgentRunEntity::getTotalTokens,
-                                    ctx.getTotalTokens())
-                            .set(AgentRunEntity::getFinishedAt, LocalDateTime.now())
-                            .set(AgentRunEntity::getTotalCostMillis, totalCostMillis)
-                            .set(AgentRunEntity::getUpdatedAt, LocalDateTime.now());
-
-            agentRunMapper.update(null, wrapper);
-
-            log.info(
-                    "AgentRun 终态已持久化：runId={}, state={}, cost={}ms, model={}, totalTokens={}, modelCalls={}({}ms)",
-                    ctx.getRunId(), ctx.getState(), totalCostMillis,
-                    ctx.getModel(), ctx.getTotalTokens(),
-                    ctx.getModelCallCount(), ctx.getTotalModelCallMillis()
-            );
+            doRecordFinish(ctx, errorMessage, totalCostMillis);
         } catch (Exception e) {
             log.error("AgentRun 终态更新持久化失败（不影响任务主流程）：runId={}, state={}",
                     ctx.getRunId(), ctx.getState(), e);
         }
+    }
+
+    /**
+     * 严格版终态写入：不吞异常，返回受影响行数。
+     *
+     * 供"run 终态 + 审批 FINISHED 同一事务"使用。
+     * {@link #recordFinish} 吞异常是为了"记录失败不影响主流程"，
+     * 但吞掉异常的事务不会回滚——两条写入就会一条成功一条失败。
+     * 需要原子性的调用方必须走这里，由调用方决定失败后怎么办。
+     *
+     * @return 受影响行数；0 表示代次不符或任务仍处于 WAITING_APPROVAL
+     */
+    public int recordFinishStrict(
+            AgentRunContext ctx,
+            String errorMessage,
+            long totalCostMillis
+    ) {
+        if (ctx.getState() == AgentState.WAITING_APPROVAL) {
+            log.info("跳过终态写入（任务处于 WAITING_APPROVAL）：runId={}", ctx.getRunId());
+            return 0;
+        }
+        return doRecordFinish(ctx, errorMessage, totalCostMillis);
+    }
+
+    private int doRecordFinish(
+            AgentRunContext ctx,
+            String errorMessage,
+            long totalCostMillis
+    ) {
+        String finalAnswer = truncate(
+                ctx.getFinalAnswer(), MAX_FINAL_ANSWER_LENGTH);
+        String safeErrorMessage = truncate(
+                errorMessage, MAX_ERROR_MESSAGE_LENGTH);
+        String toolTrace = toolTraceOf(ctx);
+
+        LambdaUpdateWrapper<AgentRunEntity> wrapper =
+                new LambdaUpdateWrapper<AgentRunEntity>()
+                        .eq(AgentRunEntity::getRunId, ctx.getRunId().toString())
+                        .eq(AgentRunEntity::getExecutionEpoch, ctx.getExecutionEpoch())
+                        .set(AgentRunEntity::getState, ctx.getState().name())
+                        .set(AgentRunEntity::getCurrentStep, ctx.getCurrentStep())
+                        .set(AgentRunEntity::getToolCallCount, ctx.getToolCallCount())
+                        /*
+                         * 终态也写一次轨迹：最后一轮 step 之后不会再触发
+                         * recordProgress，漏写会丢掉"最后一个工具"。
+                         */
+                        .set(toolTrace != null,
+                                AgentRunEntity::getToolTrace, toolTrace)
+                        .set(finalAnswer != null,
+                                AgentRunEntity::getFinalAnswer, finalAnswer)
+                        .set(safeErrorMessage != null,
+                                AgentRunEntity::getErrorMessage, safeErrorMessage)
+                        .set(ctx.getErrorCode() != null,
+                                AgentRunEntity::getErrorCode, ctx.getErrorCode())
+                        .set(AgentRunEntity::getActiveElapsedMillis,
+                                ctx.getActiveElapsedMillis())
+                        /*
+                         * 模型 Usage（成本观测）：
+                         * 模型未返回 usage 时 totalTokens 为 0，
+                         * 此时不写 Token 字段，库中保持 NULL，
+                         * 区分“未提供”与“真实为 0”。
+                         */
+                        .set(ctx.getModel() != null,
+                                AgentRunEntity::getModel, ctx.getModel())
+                        .set(ctx.getTotalTokens() > 0,
+                                AgentRunEntity::getPromptTokens,
+                                ctx.getPromptTokens())
+                        .set(ctx.getTotalTokens() > 0,
+                                AgentRunEntity::getCompletionTokens,
+                                ctx.getCompletionTokens())
+                        .set(ctx.getTotalTokens() > 0,
+                                AgentRunEntity::getTotalTokens,
+                                ctx.getTotalTokens())
+                        .set(AgentRunEntity::getFinishedAt, LocalDateTime.now())
+                        .set(AgentRunEntity::getTotalCostMillis, totalCostMillis)
+                        .set(AgentRunEntity::getUpdatedAt, LocalDateTime.now());
+
+        int rows = agentRunMapper.update(null, wrapper);
+
+        log.info(
+                "AgentRun 终态已持久化：runId={}, state={}, cost={}ms, model={}, totalTokens={}, modelCalls={}({}ms)",
+                ctx.getRunId(), ctx.getState(), totalCostMillis,
+                ctx.getModel(), ctx.getTotalTokens(),
+                ctx.getModelCallCount(), ctx.getTotalModelCallMillis()
+        );
+        return rows;
     }
 
     private String agentTypeName(AgentType agentType) {
