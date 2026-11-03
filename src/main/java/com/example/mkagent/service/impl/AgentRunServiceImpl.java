@@ -4,6 +4,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.example.mkagent.agent.AgentTaskCanceller;
 import com.example.mkagent.agent.AgentTaskRegistry;
+import com.example.mkagent.approval.ApprovalDecisionService;
 import com.example.mkagent.entity.AgentRunEntity;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.mapper.AgentRunMapper;
@@ -39,12 +40,16 @@ public class AgentRunServiceImpl
 
     private final AgentTaskCanceller agentTaskCanceller;
 
+    private final ApprovalDecisionService approvalDecisionService;
+
     public AgentRunServiceImpl(
             AgentTaskRegistry agentTaskRegistry,
-            AgentTaskCanceller agentTaskCanceller
+            AgentTaskCanceller agentTaskCanceller,
+            ApprovalDecisionService approvalDecisionService
     ) {
         this.agentTaskRegistry = agentTaskRegistry;
         this.agentTaskCanceller = agentTaskCanceller;
+        this.approvalDecisionService = approvalDecisionService;
     }
 
     @Override
@@ -93,6 +98,17 @@ public class AgentRunServiceImpl
         }
 
         /*
+         * 2.1 暂停态任务：内存里没有执行句柄（任务线程早已结束），
+         *     取消必须落到"审批 + run"的数据库条件更新上。
+         *
+         *     与 approve/reject 竞争同一个 `status='PENDING'` 条件：
+         *     谁先命中谁赢，输的一方拿到 409 与真实状态。
+         */
+        if (AgentState.WAITING_APPROVAL.name().equals(entity.getState())) {
+            return cancelPausedRun(runId, userId);
+        }
+
+        /*
          * 3. 实时取消依赖内存注册表：
          *    数据库状态可能滞后于真实状态，注册表才是运行中任务的实时来源。
          */
@@ -114,6 +130,37 @@ public class AgentRunServiceImpl
                 "runId", runId,
                 "state", result.state(),
                 "message", result.message()
+        );
+    }
+
+    /**
+     * 取消暂停态任务：审批 CANCELLED + run CANCELLED。
+     *
+     * 归属已在调用方校验过一次；这里再校验一次审批的 userId，
+     * 因为"任务归属"与"审批归属"是两条独立记录，不能假设它们一致。
+     */
+    private Map<String, Object> cancelPausedRun(String runId, String userId) {
+        ApprovalDecisionService.DecisionResult result =
+                approvalDecisionService.cancel(runId, userId);
+
+        if (result.httpStatus() == 404) {
+            throw new BusinessException(404, "任务不存在或无权访问：" + runId);
+        }
+
+        if (!result.ok()) {
+            throw new BusinessException(
+                    result.httpStatus(),
+                    result.code(),
+                    "任务无法取消，当前审批状态："
+                            + (result.record() == null ? "UNKNOWN" : result.record().status())
+            );
+        }
+
+        return Map.of(
+                "success", true,
+                "runId", runId,
+                "state", AgentState.CANCELLED.name(),
+                "message", "任务已取消"
         );
     }
 

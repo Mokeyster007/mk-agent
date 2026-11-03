@@ -59,6 +59,18 @@ public class AgentTaskRegistry {
         boolean[] accepted = {false};
 
         runningTasks.compute(runId, (key, existing) -> {
+            /*
+             * 同一个句柄重复注册：幂等放行。
+             * 恢复路径可能先登记再重试，不能因此把句柄删掉或报错。
+             */
+            if (existing == task) {
+                accepted[0] = true;
+                return existing;
+            }
+
+            /*
+             * 只有"更旧的代次"会被拒绝（旧线程迟到的注册）。
+             */
             if (existing != null && existing.epoch() > task.epoch()) {
                 log.warn(
                         "拒绝注册过期代次：runId={}, 现有 epoch={}, 待注册 epoch={}",
@@ -66,6 +78,27 @@ public class AgentTaskRegistry {
                 );
                 return existing;
             }
+
+            /*
+             * 同代次的不同句柄：一律拒绝（M3 批次 2）。
+             *
+             * 一个执行代次只能有一个持有者：
+             * 数据库领取、交接锁、注册表、许可 release-once 四道共同保证这一点。
+             * 若这里放行，两个线程会以同一 epoch 并行跑同一 run，
+             * 一个暂停、另一个继续，审批与写入都会重复。
+             *
+             * 注意只拦"相等"：更旧的代次在上面已拦，
+             * 更新的代次（existing.epoch() < task.epoch()）必须放行，
+             * 那正是恢复接管旧执行的正常路径。
+             */
+            if (existing != null && existing.epoch() == task.epoch()) {
+                log.warn(
+                        "拒绝注册同代次的另一个句柄：runId={}, epoch={}（当前持有者已存在）",
+                        runId, task.epoch()
+                );
+                return existing;
+            }
+
             accepted[0] = true;
             return task;
         });

@@ -57,7 +57,7 @@ stateDiagram-v2
 | resume_state | 含义 | run.state | 崩溃后处理 |
 |---|---|---|---|
 | `PENDING_RESUME` | 决定已持久化，**待领取** | `WAITING_APPROVAL` | 扫描/`POST /resume` 重新领取 |
-| `CLAIMED` | 已领取执行权（锁 + 许可 + epoch），**尚未提交执行** | `RUNNING`（新 epoch） | 进程重启：**安全回退**到 `PENDING_RESUME`（任务线程从未启动，不可能写业务数据） |
+| `CLAIMED` | 已领取执行权（锁 + 许可 + epoch），**尚未提交执行** | `RUNNING`（新 epoch） | 进程重启：可安全回退到 `PENDING_RESUME`（任务线程从未启动，不可能写业务数据）——**该回退由批次 4 的扫描器实现，本批只有手动 `/resume` 与补偿路径** |
 | `RUNNING` | 已启动（任务线程已开始执行） | `RUNNING`（新 epoch） | 进程重启：`FAILED` + `PROCESS_RESTART`（可能已写，不自动恢复） |
 | `FINISHED` / `FAILED` | 执行结束 | 终态 | 不再处理 |
 
@@ -221,21 +221,57 @@ sequenceDiagram
 3. `done` 只表示**本段连接结束**，不表示 run 已终态；终态以 `agent_run.state` 为准；
 4. 暂停**不写** `finished_at`。
 
-### 5.2 approve / resume（批次 2）
+### 5.2 approve / reject / resume（批次 2，已实现）
+
+**HTTP 契约是一次调用**：`POST /approve`（或 `/reject`）落决定后**立即尝试恢复**并返回续流。
+用户点一次"批准"就应该看到这次执行的结果，而不是再点一次"恢复"。
+
+**内部职责仍然分离**：决定是持久化事实，恢复是领取执行权。
+`/resume` 不是第二条必经路径，而是"决定已保存、执行没起来"时的重试入口
+（无并发许可 429、执行器拒绝 409、进程重启等）。
 
 ```
-lock(runId) → tryAcquirePermit()（失败 429，不消耗 resume_attempts）
-  → TX1: approval PENDING → APPROVED（status='PENDING' AND expires_at>now）
-         run 保持 WAITING_APPROVAL，resume_state 保持 PENDING_RESUME
-  → TX2（领取）: approval PENDING_RESUME → CLAIMED（CAS）
-                run WAITING_APPROVAL → RUNNING, execution_epoch+1（CAS）
-  → 提交执行器；任务线程第一条语句：approval CLAIMED → RUNNING
-  → 释放锁
+POST /approve|/reject
+  归属校验（不是本人 → 404，只读，不改任何状态）
+  TX: approval PENDING → APPROVED|REJECTED（status='PENDING' AND expires_at>now）
+      run 保持 WAITING_APPROVAL，resume_state 保持 PENDING_RESUME
+  → 继续走下面的"恢复"步骤；决定失败按原状态码返回，决定成功但恢复失败时
+    返回恢复的原因码，并在消息里注明"决定已保存，可重试恢复"
+
+POST /resume（或 approve/reject 内部）
+  状态校验（未决定 409 / FINISHED 409 / FAILED 409 / CLAIMED·RUNNING 409）
+  → 启动期限（decided_at + resume-start-timeout 已过 → FAILED + APPROVAL_RESUME_TIMEOUT，410）
+  → 找 Agent（找不到 → 503，不改状态，部署修好后可重试）
+  → 检查点校验（失败 → INVALIDATED + FAILED，409）
+  → TX（领取）: approval PENDING_RESUME → CLAIMED, claimed_epoch=epoch+1
+               run WAITING_APPROVAL → RUNNING, execution_epoch=epoch+1
+  → tryAcquirePermit()（失败 → 补偿回 PENDING_RESUME，429，不计失败次数）
+  → 构建 ctx → 登记句柄 → 提交执行器
+  → **任务体第一条语句**：markStarted（CLAIMED → RUNNING，条件 approvalId+epoch，0 行即退出）
+  → 之后才开始模型/工具
 ```
 
-- 提交执行器失败：`RUNNING → WAITING_APPROVAL`（允许的转换）、`CLAIMED → PENDING_RESUME`、释放许可与锁，返回 503 可重试。
-- 崩溃在 `CLAIMED`：任务线程从未启动 → 启动扫描**回退**为 `PENDING_RESUME`，重新领取，不判 `FAILED`。
-- 崩溃在 `RUNNING`：`FAILED` + `PROCESS_RESTART`，approval `resume_state=FAILED`。
+- **启动标记在执行线程里，不在提交之前**：提交成功只代表"进了队列"。
+  排队期间库里是 `CLAIMED`，真正开始执行才变 `RUNNING`——
+  这样"已提交但没跑"和"正在执行"可区分，超期未启动也能被识别。
+- 提交执行器失败 / 登记失败：异步体一行都没跑，`RUNNING → WAITING_APPROVAL`、
+  `CLAIMED → PENDING_RESUME`、清空 `claimed_epoch`、释放许可，返回 409 `RESUME_SUBMIT_FAILED` 可重试。**代次不回退**。
+- 启动标记异常：**不能断言"库里仍是 CLAIMED"**。异常只说明应用没拿到这次写入的确认，
+  提交可能已生效而确认丢失。本次执行到此为止（不调模型、不执行工具），
+  补偿只对 `CLAIMED + 本次代次` 生效；实际已是 `RUNNING` 时补偿影响 0 行并整体放弃，
+  不伪造完成，状态不确定的记录留给后续恢复机制按实际状态收尾。
+  启动标记 0 行：领取已不属于本次代次，**不写终态、不补偿**，只清理句柄与许可。
+- **补偿只吃 `CLAIMED`**：`resume_state='CLAIMED' AND claimed_epoch=本次代次` 在数据库层面等价于
+  "还没有越过执行起点"（启动标记是任务体第一条语句）。一旦标记提交（`RUNNING`），
+  补偿的 CAS 影响 0 行并整体放弃，已开始的执行不会被回退。
+  两步在**同一事务**：第一步 0 行直接返回；第一步成功而第二步 0 行时，
+  只有"run 已是 `WAITING_APPROVAL` 且代次仍是本次代次"（别人已补偿，等价目标状态）按幂等接受，
+  其余情况抛异常回滚第一步，绝不提交"审批退回、run 没退"的半截补偿。
+- 崩溃在 `CLAIMED`：本批**不**自动重领（避免与仍在执行的领取者并行），
+  `requireResumable` 对"`CLAIMED`/`RUNNING` 且没有活跃句柄"一律返回
+  `409 RESUME_IN_PROGRESS`——**期限内与期限后都一样**，不猜、不自动改状态；
+  自动重领与超期收尾留给批次 4 的扫描器。
+- 崩溃在 `RUNNING`：由批次 4 的扫描器按 `PROCESS_RESTART` 收尾。
 
 ### 5.3 reject / cancel / 过期
 
@@ -258,6 +294,12 @@ lock(runId) → tryAcquirePermit()（失败 429，不消耗 resume_attempts）
 4. APPROVED：逐条复核 `name ∈ 当前白名单 ∩ 检查点白名单`、`argsHash` 一致、不在重试包装器；全部通过才 `executeToolCalls`；
 5. REJECTED：构造与 `toolCallId` 配对的拒绝回执，不执行工具；
 6. 任何"检查点/版本/哈希/白名单"不一致 → `INVALIDATED` + **失败关闭**，不执行 pending round，也不"继续循环"。
+7. 批准路径执行前先看两个额度：剩余执行时间（`elapsed >= effectiveTimeout` → `BUDGET_EXHAUSTED_ON_RESUME` + `TIMED_OUT`）、
+   剩余工具额度（不足 → `TOOL_BUDGET_INSUFFICIENT` + `MAX_STEPS_REACHED`，**整轮放弃**，绝不执行一半）；
+   拒绝路径不看工具额度、不增加 `toolCallCount`。
+8. 恢复流断开**不取消**任务：`onCompletion` 在 `resumed=true` 时只记日志，
+   不注销句柄、不释放许可，任务在后台跑完，结果通过 `agent_run` 查询；
+   普通 `runStream` 的断连取消语义保持不变。真正的执行预算超时（`onTimeout`）仍按任务超时处理。
 
 ### 5.5 写入条件按路径分别定义（不是统一要求 `state='RUNNING'`）
 
@@ -284,6 +326,90 @@ lock(runId) → tryAcquirePermit()（失败 429，不消耗 resume_attempts）
 | 写入条件按路径区分，不统一要求 `RUNNING` | §5.5；`AgentRunRecorder` 三个方法 |
 | 已计步的 pending round 在 `currentStep==maxSteps` 时仍必须执行完 | §5.4 第 3 条、§6；`ApprovalPauseBehaviourTest.pauseStillWorksWhenStepBudgetIsOne`（`maxSteps=1`） |
 | `pendingAssistant` 在历史里只出现一次 | §4；`ApprovalCheckpointCodecTest.realToolCallingManagerProducesOneResponsePerCall`（真实 `ToolCallingManager` + 桩工具，断言 4 条消息 / 1 条 assistant / 每个 `toolCallId` 都有配对回执） |
+
+### 5.7 批次 2 落实的状态转换（实现口径）
+
+`status`（决定）与 `resume_state`（执行）两列独立推进，任何一步都能从库里读出"现在到底在哪"。
+
+| 触发 | approval.status | approval.resume_state | run.state | run.execution_epoch |
+|---|---|---|---|---|
+| 暂停（批次 1） | `PENDING` | `PENDING_RESUME` | `WAITING_APPROVAL` | 不变 |
+| approve / reject | `APPROVED` / `REJECTED` | `PENDING_RESUME` | `WAITING_APPROVAL` | 不变 |
+| 取消暂停任务 | `CANCELLED` | `FAILED` | `CANCELLED` + `USER_CANCELLED` | 不变 |
+| 决定过期 | `EXPIRED` | `FAILED` | `FAILED` + `APPROVAL_EXPIRED` | 不变 |
+| 领取 | 不变 | `CLAIMED`（写 `claimed_epoch`） | `RUNNING` | **+1** |
+| 提交执行器（排队中） | 不变 | 仍 `CLAIMED` | `RUNNING` | 不变 |
+| 启动标记（任务体第一句） | 不变 | `RUNNING` | `RUNNING` | 不变 |
+| 正常结束 / 交接 | 不变 | `FINISHED`（与 run 终态同事务） | 由任务自身决定（成功/失败/预算） | 不变 |
+| 恢复后再次暂停 | 旧 → `FINISHED`；新 → `PENDING` | 旧 `FINISHED`；新 `PENDING_RESUME` | `WAITING_APPROVAL` | 不变 |
+| 提交失败 / 无许可 | 不变 | 回 `PENDING_RESUME`（清 `claimed_epoch`） | 回 `WAITING_APPROVAL` | 不回退 |
+| 启动期限到期 | 不变 | `FAILED` | `FAILED` + `APPROVAL_RESUME_TIMEOUT` | 不变 |
+| 检查点校验失败 | `INVALIDATED` | `FAILED` | `FAILED` + 具体原因码 | 不变 |
+| 审批次数触顶 | 不创建新记录 | — | `FAILED` + `APPROVAL_LIMIT_REACHED` | 不变 |
+
+三条容易写错的约束：
+
+1. `FINISHED` 只表示"这条审批不再有执行权"，**不代表业务成功**；业务结果只看工具结果与 `agent_run.state`。
+2. 再次暂停时，旧审批由**暂停事务**收尾，不能等"整个 run 终态"——那时 run 仍停在 `WAITING_APPROVAL`。
+3. 补偿必须带 `epoch + 预期状态`，且**不回退代次**：代次回退会让旧代次迟到的写入重新生效。
+
+### 5.8 终态与审批收尾的写入顺序
+
+恢复执行的收尾是**一个事务**：`agent_run` 终态与 `approval.resume_state='FINISHED'` 同事务提交
+（`ApprovalExecutionCompletionService.complete` 带 `@Transactional`；内部 `recordFinishStrict` 不吞异常，
+`claimService.finish` 是 `REQUIRED` 传播，加入同一事务而不是另开一个）。
+
+最终完成（恢复后正常结束）的真实顺序：
+
+```
+1. 循环结束，ctx 状态在内存里已是终态
+2. persistTerminal（同一事务）
+   2.1 UPDATE agent_run SET state=?, finished_at=?, ... WHERE run_id=? AND execution_epoch=?
+   2.2 仅当 2.1 影响 1 行：UPDATE agent_approval SET resume_state='FINISHED'
+       WHERE approval_id=? AND resume_state IN ('RUNNING','CLAIMED')
+   2.3 2.2 影响 0 行时：只有审批已是 FINISHED（重复收尾）按幂等接受；
+       其余（PENDING_RESUME / FAILED / 行不存在）抛异常，整个事务回滚
+3. 事务提交成功后，才发送 final_answer
+4. 再发送 done
+5. emitter.complete()（只关闭连接，不代表提交）
+6. finally：persistTerminal 已由标记位幂等，只做清理与释放许可
+```
+
+写入失败（第 2 步抛异常）时的顺序：
+
+```
+1. 不发 final_answer、不发 done——它们会被理解成"执行已成功提交"
+2. 发一条脱敏 error："执行结果未能保存，请稍后查询任务状态。"
+3. emitter.complete()
+4. finally 再试一次 persistTerminal；仍失败则保持 run=RUNNING、审批=RUNNING，
+   由批次 4 的扫描器按启动期限 / PROCESS_RESTART 收尾
+```
+
+再次暂停（恢复后又命中写工具）的真实顺序：
+
+```
+1. ToolCallAgent.pauseForApproval 在**暂停事务**里：
+   1.1 recordPause（RUNNING→WAITING_APPROVAL，approval_count+1，不写 finished_at）
+   1.2 旧审批（ctx.resumeApprovalId）RUNNING→FINISHED
+   1.3 写检查点 + 插入新审批（PENDING / PENDING_RESUME）
+   —— persist 返回即已提交；提交失败会抛异常，根本走不到发事件那一步
+2. 本段流才发 status → approval_required → done，然后关闭连接
+3. finally：persistTerminal 因状态是 WAITING_APPROVAL 而跳过
+   （recordFinishStrict 返回 0，审批收尾也不执行——旧审批已在 1.2 收尾）
+```
+
+四条约束：
+
+1. **不允许出现"审批 FINISHED、run 未终态"的提交结果**：两条写入同事务，要么都生效要么都不生效。
+   提交失败时 run 仍是 `RUNNING`、审批仍是 `RUNNING`，由批次 4 的扫描器收尾，
+   不会出现"看起来完成了、其实没落库"的假完成。
+2. **不允许静默提交"run 终态、审批未收尾"**：`finish` 的 0 行只有"已是 FINISHED"可按幂等接受，
+   其余一律回滚整个事务。
+3. **`emitter.complete()` 不保证数据库提交**，它只关闭连接；反过来说，**流结束也不证明提交成功**：
+   超时、客户端断开、网络错误、启动失败、持久化失败都会让流结束。
+   数据库提交成功同样不保证客户端一定收到成功事件。
+4. **`done` 不是"整个 run 已终态"的证据**：审批暂停也发 `done`（只表示本段连接结束），
+   终态一律以 `agent_run.state` 为准；再次暂停时 `approval_required` 与 `done` 都在暂停事务提交之后发送。
 
 ## 6. 时间与预算
 
@@ -379,16 +505,20 @@ INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING
 
 ## 11. 接口契约（批次 2）
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/api/ai/approvals/{id}/approve` | `SseEmitter` 续流 |
-| POST | `/api/ai/approvals/{id}/reject` | `SseEmitter` 续流 |
-| POST | `/api/ai/approvals/{id}/resume` | 幂等；`PENDING_RESUME` / `CLAIMED` 可重试 |
-| GET | `/api/ai/approvals/{id}` | 状态 + 摘要 + 有效期 |
-| GET | `/api/ai/runs/{runId}` | 现有接口 + `errorCode / activeElapsedMillis / approval` |
-| POST | `/api/ai/runs/{runId}/cancel` | 现有接口 + `WAITING_APPROVAL` 分支 |
+| 方法 | 路径 | 返回 | 说明 |
+|---|---|---|---|
+| POST | `/api/ai/approvals/{id}/approve` | `SseEmitter` | 落决定后立即恢复并返回续流；重复决定 → `409 ALREADY_APPROVED` |
+| POST | `/api/ai/approvals/{id}/reject` | `SseEmitter` | 同上，回填拒绝回执后继续模型轮；`409 ALREADY_REJECTED` |
+| POST | `/api/ai/approvals/{id}/resume` | `SseEmitter` | 重试入口：决定已保存但执行没起来时使用；`CLAIMED/RUNNING` → `409 RESUME_IN_PROGRESS` |
+| GET | `/api/ai/approvals/{id}` | JSON | 状态 + 摘要 + 有效期，**不含检查点原文** |
+| GET | `/api/ai/runs/{runId}` | JSON | 现有接口（结果以此为准） |
+| POST | `/api/ai/runs/{runId}/cancel` | JSON | 新增 `WAITING_APPROVAL` 分支，与 approve/reject 竞争同一条件 |
 
-后台恢复不创建无人接收的 SSE：`resume(approvalId, emitter=null)` 时只落库，用户通过查询接口读结果。
+- approve / reject / resume / query **都只接受 `approvalId`**，不读请求体：批准绑定的是暂停那一刻的整轮参数（`args_hash`），
+  允许决定时再传工具名或参数就等于"批准 A、执行 B"。
+- 错误统一 `{success:false, code, message}`，`code` 为稳定常量（`APPROVAL_EXPIRED` / `RESUME_IN_PROGRESS` /
+  `RESUME_CONCURRENCY_LIMIT` / `CHECKPOINT_*` / `APPROVAL_RESUME_TIMEOUT` 等），客户端按 `code` 分支而不是匹配中文。
+- 恢复接口断流不取消任务：结果通过 `/api/ai/runs/{runId}` 查询。
 
 ## 12. 测试清单
 
@@ -413,12 +543,25 @@ INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING
 | 17 | 真实写工具链路 | 真实注解 + 真实策略 → 暂停；`music_playlist` 相对快照零变更 |
 | 18 | 扫描失败关闭 | 未就绪 / 未知工具 → 抛异常，不按普通工具执行 |
 | 19 | 暂停事务故障 | 审批插入撞唯一索引 → 三表全回滚；`ctx` 不残留 `WAITING_APPROVAL`；SSE 不发 `approval_required` |
+| 20 | 批准闭环 | 写工具恰好执行一次；`SUCCEEDED`；审批 `FINISHED`；step 不重复计 |
+| 21 | 拒绝闭环 | 不执行工具、`toolCallCount` 不变；每个 `toolCallId` 配对拒绝回执；assistant 只出现一次 |
+| 22 | 跨用户 | approve/reject/resume/query/cancel 全 404；审批/run/检查点/业务数据快照不变（不置 `INVALIDATED`） |
+| 23 | 预算边界 | `maxSteps=1` 仍完成原轮；工具额度 0 时拒绝仍能回填 |
+| 24 | 重复恢复 | 第二次 409；模型只调两次；许可不泄漏 |
+| 25 | 启动门槛 | 代次不符 → 启动标记 0 行 → 模型/工具零调用、许可归还 |
+| 26 | 失败可重试 | 执行器拒绝 / 无并发许可 → 补偿回 `PENDING_RESUME`（决定不变、代次不回退），重试成功 |
+| 27 | 启动期限 | 超过 `resume-start-timeout` → 410 + `FAILED` + `APPROVAL_RESUME_TIMEOUT` |
+| 28 | 检查点完整性 | 归属篡改 → `CHECKPOINT_OWNER_MISMATCH`；缺失 → `CHECKPOINT_MISSING`；均失败关闭 |
+| 29 | 取消暂停任务 | 审批与 run 同时 `CANCELLED`；之后批准 409 |
+| 30 | 再次暂停 | 旧审批 `FINISHED`、新审批 `PENDING`、run 仍 `WAITING_APPROVAL`；第二轮可继续走完 |
+| 31 | 审批次数触顶 | `FAILED` + `APPROVAL_LIMIT_REACHED`；不建新审批；第二轮不执行 |
+| 32 | 续流断开 | 客户端断开后任务仍 `SUCCEEDED` 且结果可查；普通入口语义不变 |
 
 ## 13. 实现批次
 
 | 批次 | 内容 | 状态 |
 |---|---|---|
 | 1 | `WAITING_APPROVAL`、检查点 DTO/编解码、计时与预算快照、epoch/句柄保护、暂停事务与 `recordPause`、审批摘要、暂停 SSE 出口 | **已实现** |
-| 2 | approve/reject/resume 接口、条件更新、领取与代次、续流、查询接口、cancel 扩展 | 待实现 |
+| 2 | approve/reject/resume 接口、条件更新、领取与代次、续流、查询接口、cancel 扩展 | **已实现** |
 | 3 | 幂等执行器、`status` 列、并发/回滚/代理测试、PG 隔离验证 | 待实现 |
 | 4 | 白名单开放、`WriteToolGuardTest` 调整、提示词、启动扫描与 30s 扫描、文档与手动复测 | 待实现 |

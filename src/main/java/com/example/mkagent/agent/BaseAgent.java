@@ -1,6 +1,8 @@
 package com.example.mkagent.agent;
 
 import com.example.mkagent.config.AgentExecutorConfig;
+import com.example.mkagent.approval.ApprovalClaimService;
+import com.example.mkagent.approval.ApprovalExecutionCompletionService;
 import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
@@ -132,6 +134,23 @@ public abstract class BaseAgent {
      * 为 null 时不做交接保护（纯单元测试场景）。
      */
     private RunHandoffLocks handoffLocks;
+
+    /**
+     * 审批领取状态机（M3 批次 2）。
+     *
+     * 恢复执行前必须先用它做"启动标记"（CLAIMED→RUNNING，独立事务提交），
+     * 0 行就说明这次领取已失效，一个模型调用都不能发。
+     * 为 null 时（纯单测/普通任务）不做任何标记。
+     */
+    private ApprovalClaimService approvalClaimService;
+
+    /**
+     * 恢复执行的终态写入器（run 终态 + 审批 FINISHED 同一事务）。
+     *
+     * 为 null 时退化为"先 recordFinish、再 finish"，顺序仍然正确，
+     * 但两条写入不保证原子；生产装配不会为 null。
+     */
+    private ApprovalExecutionCompletionService approvalCompletionService;
 
     /**
      * AgentRun 生命周期记录器（可选）。
@@ -487,345 +506,7 @@ public abstract class BaseAgent {
             taskRegistry.register(runId, runningTask);
         }
 
-        CompletableFuture.runAsync(() -> {
-            /*
-             * 记录执行线程：取消/超时需要显式中断该线程。
-             */
-            ctx.setExecutingThread(Thread.currentThread());
-
-            /*
-             * 失败分支的脱敏错误信息，finally 中随终态写入数据库。
-             */
-            String errorMessage = null;
-
-            try {
-                sendEvent(ctx, AgentEventType.STATUS, "Agent 已开始执行");
-
-                /*
-                 * 保留 run_id 事件兼容旧前端；
-                 * 新协议下每条 AgentEvent 本身都携带 runId。
-                 */
-                sendEvent(
-                        emitter,
-                        AgentEvent.of(
-                                runId,
-                                AgentEventType.RUN_ID,
-                                runId,
-                                ctx.getCurrentStep()
-                        )
-                );
-
-                while (canContinue(ctx)) {
-                    /*
-                     * 中断检测：取消或超时已中断当前线程时，
-                     * 不再进入下一轮 step。
-                     */
-                    if (Thread.currentThread().isInterrupted()) {
-                        ctx.transitionTo(AgentState.CANCELLED);
-                        break;
-                    }
-
-                    ctx.nextStep();
-
-                    log.info(
-                            "Agent 流式执行中：runId={}, step={}/{}, thread={}",
-                            runId,
-                            ctx.getCurrentStep(),
-                            maxSteps,
-                            Thread.currentThread().getName()
-                    );
-
-                    String stepResult = step(ctx);
-
-                    /*
-                     * 每完成一轮 step 同步一次数据库进度（不是每个 token）。
-                     */
-                    recordRunProgress(ctx);
-
-                    if (stepResult != null && !stepResult.isBlank()) {
-                        sendEvent(
-                                emitter,
-                                AgentEvent.of(
-                                        runId,
-                                        AgentEventType.STEP,
-                                        stepResult,
-                                        ctx.getCurrentStep()
-                                )
-                        );
-                    }
-                }
-
-                /*
-                 * 审批暂停：本段流到此结束，但任务**没有**终态。
-                 *
-                 * 事件顺序：status → approval_required → done。
-                 * 这里的 done 只表示"本段连接结束"，不表示任务完成——
-                 * 终态一律以 agent_run.state 为准（客户端应查询或等待批准后续流）。
-                 *
-                 * 不发 final_answer（还没有答案），不发 error（不是错误）。
-                 */
-                if (ctx.getState() == AgentState.WAITING_APPROVAL) {
-                    sendEvent(
-                            ctx,
-                            AgentEventType.STATUS,
-                            "等待人工确认，本段连接结束。"
-                    );
-                    sendEvent(
-                            emitter,
-                            AgentEvent.of(
-                                    runId,
-                                    AgentEventType.APPROVAL_REQUIRED,
-                                    ctx.getPendingApprovalJson(),
-                                    ctx.getCurrentStep()
-                            )
-                    );
-                    sendEvent(
-                            emitter,
-                            AgentEvent.of(
-                                    runId,
-                                    AgentEventType.DONE,
-                                    "[DONE]",
-                                    ctx.getCurrentStep()
-                            )
-                    );
-                    emitter.complete();
-                    return;
-                }
-
-                /*
-                 * 循环退出但仍是 RUNNING：
-                 * 根据具体原因判定终态（超时 / 成功 / 达到预算）。
-                 */
-                if (ctx.getState() == AgentState.RUNNING) {
-                    finishIfStillRunning(ctx);
-
-                    if (ctx.getState() == AgentState.TIMED_OUT) {
-                        sendEvent(
-                                ctx,
-                                AgentEventType.STATUS,
-                                "任务运行超时，已强制停止。"
-                        );
-                    } else if (ctx.getState() == AgentState.MAX_STEPS_REACHED) {
-                        sendEvent(
-                                ctx,
-                                AgentEventType.STATUS,
-                                "安全停止：达到最大步骤数或最大工具调用次数限制。"
-                        );
-                    }
-                }
-
-                /*
-                 * 预算耗尽且无最终回答：给子类一次不带工具的收尾调用。
-                 * 放在状态事件之后、final_answer 事件之前，
-                 * 保证前端先看到"为什么停止"，再看到"尽力而为的答案"。
-                 */
-                applyBudgetFallback(ctx);
-
-                /*
-                 * 推送 final_answer 事件。
-                 *
-                 * 除了 SUCCEEDED，MAX_STEPS_REACHED 也要推：
-                 * 强制收尾会在预算耗尽时补一个 finalAnswer，
-                 * 不推的话用户只能看到"安全停止"，答案永远到不了前端。
-                 * 失败/取消/超时不推（这些情况下没有可信答案）。
-                 */
-                if ((ctx.getState() == AgentState.SUCCEEDED
-                        || ctx.getState() == AgentState.MAX_STEPS_REACHED)
-                        && ctx.getFinalAnswer() != null
-                        && !ctx.getFinalAnswer().isBlank()) {
-                    sendEvent(
-                            emitter,
-                            AgentEvent.of(
-                                    runId,
-                                    AgentEventType.FINAL_ANSWER,
-                                    ctx.getFinalAnswer(),
-                                    ctx.getCurrentStep()
-                            )
-                    );
-                }
-
-                sendEvent(
-                        emitter,
-                        AgentEvent.of(
-                                runId,
-                                AgentEventType.DONE,
-                                "[DONE]",
-                                ctx.getCurrentStep()
-                        )
-                );
-
-                /*
-                 * 重要顺序：此时状态必已是终态（上方已保证），
-                 * 再调用 emitter.complete()。
-                 * 否则 onCompletion 会看到 RUNNING，
-                 * 把正常完成误判为客户端断开并改成 CANCELLED。
-                 */
-                emitter.complete();
-
-            } catch (Exception e) {
-                /*
-                 * 区分中断（取消/超时）与真实异常。
-                 * 若取消接口或 onTimeout 已先行设置终态，
-                 * transitionTo 会被拒绝，原有终态保持不变。
-                 */
-                failOrCancel(ctx, e);
-
-                errorMessage = buildErrorMessage(e);
-
-                log.error(
-                        "Agent 流式执行失败：runId={}, state={}, thread={}",
-                        runId,
-                        ctx.getState(),
-                        Thread.currentThread().getName(),
-                        e
-                );
-
-                /*
-                 * 错误事件只发送脱敏提示，
-                 * 异常详情只记录在服务端日志，不外发堆栈。
-                 *
-                 * 模型调用失败时，ToolCallAgent.think() 已经在失败现场
-                 * 推送过一条更精确的 ERROR 事件（配置/额度问题），
-                 * 这里跳过，避免前端收到两条 error。
-                 */
-                if (findModelCallException(e) == null) {
-                    sendEvent(
-                            emitter,
-                            AgentEvent.of(
-                                    runId,
-                                    AgentEventType.ERROR,
-                                    "智能体执行失败，请稍后重试。",
-                                    ctx.getCurrentStep()
-                            )
-                    );
-                }
-
-                emitter.complete();
-
-            } finally {
-                /*
-                 * 终态单点写库：成功/失败/取消/超时/达到预算都在这里落盘。
-                 * 取消接口与 onTimeout 不单独写库，避免并发写冲突。
-                 */
-                recordRunFinish(ctx, errorMessage, startMillis);
-
-                logTaskSummary(ctx, startMillis);
-                cleanupOnce(ctx, cleaned);
-                unregisterTask(ctx);
-
-                /*
-                 * 任务结束（含暂停）后释放并发许可。
-                 *
-                 * release-once：暂停路径与 finally 都可能走到这里，
-                 * 由 ctx 的标记保证一次执行只释放一次；
-                 * 每个执行代次有独立 ctx，旧代次也无法释放新代次的许可。
-                 */
-                releaseConcurrencyPermit(ctx);
-                releaseHandoffLock(ctx);
-            }
-
-        }, agentExecutor).whenComplete((result, error) -> {
-            /*
-             * 异步任务真正执行完后，把结果回写到预先注册的句柄。
-             * 若句柄已被取消接口 cancel，这里的 complete 会静默失败，无副作用。
-             */
-            if (error != null) {
-                task.completeExceptionally(error);
-            } else {
-                task.complete(null);
-            }
-        });
-
-        emitter.onTimeout(() -> {
-            /*
-             * 只处理"自己这一次执行"的回调。
-             *
-             * 审批恢复会给同一个 runId 注册新句柄；
-             * 旧连接的 onTimeout 如果迟到一步，绝不能去中断新线程、
-             * 删新任务或释放新许可。按句柄对象身份比较，
-             * 比比较 ctx.epoch（旧对象自比较，永远相等）可靠。
-             */
-            if (!isCurrentExecution(runId, runningTask)) {
-                log.info("忽略过期的 SSE 超时回调：runId={}, epoch={}",
-                        runId, ctx.getExecutionEpoch());
-                return;
-            }
-
-            /*
-             * SSE 连接超时：优先把任务标记为 TIMED_OUT。
-             * 若任务线程已先到达其他终态，本调用会被拒绝，不会覆盖。
-             */
-            ctx.transitionTo(AgentState.TIMED_OUT);
-
-            log.warn(
-                    "SSE 连接超时：runId={}, state={}, step={}, thread={}, duration={}ms",
-                    runId,
-                    ctx.getState(),
-                    ctx.getCurrentStep(),
-                    Thread.currentThread().getName(),
-                    System.currentTimeMillis() - startMillis
-            );
-
-            /*
-             * 尝试中断后台 Agent 任务。
-             *
-             * 注意 1：CompletableFuture.cancel(true) 不会中断执行线程，
-             * 必须再显式中断 ctx 中记录的执行线程；
-             * 注意 2：不保证底层模型 HTTP 调用一定立即停止。
-             */
-            task.cancel(true);
-            ctx.interruptExecutingThread();
-
-            cleanupOnce(ctx, cleaned);
-            unregisterTask(ctx);
-        });
-
-        emitter.onCompletion(() -> {
-            /*
-             * 同样只处理自己这一次执行。
-             */
-            if (!isCurrentExecution(runId, runningTask)) {
-                log.info("忽略过期的 SSE 完成回调：runId={}, epoch={}",
-                        runId, ctx.getExecutionEpoch());
-                return;
-            }
-
-            /*
-             * 完成时仍是 RUNNING，说明任务没有正常走到终态，
-             * 通常是客户端提前断开，视为取消。
-             *
-             * 正常完成时，任务线程已在 emitter.complete() 之前
-             * 设置 SUCCEEDED（或其他终态），不会进入本分支，
-             * 这是避免把正常完成误判为 CANCELLED 的关键。
-             *
-             * WAITING_APPROVAL 也不进入本分支：暂停时连接是"正常关闭"，
-             * 不是客户端掉线，把挂起任务判成 CANCELLED 会让批准无从谈起。
-             */
-            if (ctx.getState() == AgentState.RUNNING) {
-                ctx.transitionTo(AgentState.CANCELLED);
-
-                log.warn(
-                        "客户端提前断开，任务已取消：runId={}, state={}, step={}, thread={}, duration={}ms",
-                        runId,
-                        ctx.getState(),
-                        ctx.getCurrentStep(),
-                        Thread.currentThread().getName(),
-                        System.currentTimeMillis() - startMillis
-                );
-
-                task.cancel(true);
-                ctx.interruptExecutingThread();
-            } else {
-                log.info(
-                        "SSE 连接完成：runId={}, state={}",
-                        runId,
-                        ctx.getState()
-                );
-            }
-
-            cleanupOnce(ctx, cleaned);
-            unregisterTask(ctx);
-        });
+        submitExecution(ctx, emitter, runningTask, startMillis, cleaned, false);
 
         return emitter;
 
@@ -1070,6 +751,153 @@ public abstract class BaseAgent {
         }
     }
 
+    /**
+     * 收尾本次恢复对应的审批（FINISHED）。
+     *
+     * 只在"这次执行真的结束了"时调用；再次暂停时跳过，
+     * 由暂停事务把旧审批与新审批一起处理。
+     */
+    private void finishResumeApproval(AgentRunContext ctx) {
+        if (approvalClaimService == null || ctx.getResumeApprovalId() == null) {
+            return;
+        }
+        if (ctx.getState() == AgentState.WAITING_APPROVAL) {
+            return;
+        }
+        try {
+            approvalClaimService.finish(ctx.getResumeApprovalId());
+        } catch (RuntimeException e) {
+            // 收尾失败不影响任务主流程，但必须留痕（扫描器/人工可查）
+            log.warn("审批收尾失败：approvalId={}, runId={}",
+                    ctx.getResumeApprovalId(), ctx.getRunId(), e);
+        }
+    }
+
+    /**
+     * 恢复执行的启动门槛：CLAIMED → RUNNING。
+     *
+     * 由任务体第一行调用，条件带 approvalId 与本次代次：
+     * 0 行说明这次领取已失效（被别人补偿或接管），本次执行必须一行都不跑。
+     *
+     * 为什么不在提交执行之前标记：
+     * 提交成功只代表"进了线程池队列"，不代表"开始执行"。
+     * 排队期间保持 CLAIMED，才能让"已提交但尚未执行"和"正在执行"可区分，
+     * 也让超期未启动的任务能被明确识别，而不是伪装成 RUNNING。
+     *
+     * @return true 表示本次执行持有执行权
+     */
+    private boolean beginResumedExecution(AgentRunContext ctx) {
+        if (approvalClaimService == null || ctx.getResumeApprovalId() == null) {
+            return true;
+        }
+
+        String approvalId = ctx.getResumeApprovalId();
+
+        try {
+            if (approvalClaimService.markStarted(approvalId, ctx.getExecutionEpoch())) {
+                log.info("审批执行已启动：approvalId={}, runId={}, epoch={}",
+                        approvalId, ctx.getRunId(), ctx.getExecutionEpoch());
+                return true;
+            }
+
+            /*
+             * 0 行：领取已不属于本次代次。
+             * 绝不能写终态——那一行现在归别人（或已回退为等待审批）。
+             */
+            ctx.setErrorCode("APPROVAL_CLAIM_LOST");
+            log.warn("审批启动标记 0 行，本次执行放弃：approvalId={}, runId={}, epoch={}",
+                    approvalId, ctx.getRunId(), ctx.getExecutionEpoch());
+            return false;
+
+        } catch (RuntimeException e) {
+            /*
+             * 标记写入异常：**不能**断言"库里一定还是 CLAIMED"。
+             *
+             * 异常只说明应用没拿到这次写入的确认：可能根本没提交，
+             * 也可能已经提交成 RUNNING 而确认丢了。两种情况从异常本身分辨不出来。
+             *
+             * 因此这里只做两件事：
+             * 1. 本次执行到此为止——不调用模型、不执行工具；
+             * 2. 尝试补偿：补偿的 CAS 只吃 CLAIMED + 本次代次，
+             *    若实际已是 RUNNING，影响 0 行并整体放弃，绝不回退已开始的执行。
+             *
+             * 状态不确定的记录不写终态、不伪造完成，留给后续恢复机制按实际状态收尾。
+             */
+            ctx.setErrorCode("APPROVAL_START_FAILED");
+            log.error("审批启动标记失败，补偿为可重试：approvalId={}, runId={}",
+                    approvalId, ctx.getRunId(), e);
+
+            try {
+                approvalClaimService.compensate(
+                        approvalId, ctx.getRunId().toString(), ctx.getExecutionEpoch());
+            } catch (RuntimeException compensationError) {
+                log.error("审批启动失败后的补偿也失败：approvalId={}",
+                        approvalId, compensationError);
+            }
+            return false;
+        }
+    }
+
+    /**
+     * 写终态：恢复执行时把 run 终态与审批收尾放进同一事务。
+     *
+     * 顺序不可交换：
+     * - 先写 run 终态，再写 approval FINISHED；
+     * - 两条写入同事务提交，因此不存在"审批已 FINISHED、run 还没终态"的中间态；
+     * - 若 run 的行数不为 1（旧代次迟到写入），审批收尾一并跳过；
+     * - 若审批收尾未命中且不是重复收尾，整个事务回滚，run 不留下终态。
+     *
+     * 返回值只表示"这次调用是否把终态安全处理完"：
+     * true  = 已提交，或按规则本来就不该写（旧代次 / 仍在等待审批）；
+     * false = 写入失败（异常）。调用方据此决定能不能发"执行成功"的事件。
+     *
+     * 这里不承诺 emitter.complete() 会保证数据库提交：
+     * 提交发生在 complete 之前的这次调用里，complete 只负责关闭连接。
+     */
+    private boolean persistTerminal(
+            AgentRunContext ctx,
+            String errorMessage,
+            long startMillis,
+            AtomicBoolean persisted
+    ) {
+        if (!persisted.compareAndSet(false, true)) {
+            // 成功/失败路径已写过，finally 这次只是兜底：不算失败
+            return true;
+        }
+
+        try {
+            long costMillis = System.currentTimeMillis() - startMillis;
+
+            if (approvalCompletionService != null && ctx.getResumeApprovalId() != null) {
+                approvalCompletionService.complete(ctx, errorMessage, costMillis);
+            } else {
+                /*
+                 * 非恢复执行（或未装配原子收尾服务）：单条 UPDATE 自带提交。
+                 * 用严格版拿到行数，才能区分"写失败"与"本来就不该写"：
+                 * 0 行是旧代次/暂停中，此时**不能**再去收尾审批——
+                 * 那条审批已经归新代次或仍待执行。
+                 */
+                int rows = runRecorder == null
+                        ? 0
+                        : runRecorder.recordFinishStrict(ctx, errorMessage, costMillis);
+
+                if (rows == 1) {
+                    finishResumeApproval(ctx);
+                } else {
+                    log.warn("终态写入未命中（旧代次或暂停中）：runId={}, epoch={}, state={}, rows={}",
+                            ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState(), rows);
+                }
+            }
+            return true;
+        } catch (RuntimeException e) {
+            // 允许 finally 再兜一次；失败时保持"run 仍 RUNNING"，由扫描器按启动期限收尾
+            persisted.set(false);
+            log.error("终态持久化失败：runId={}, state={}",
+                    ctx.getRunId(), ctx.getState(), e);
+            return false;
+        }
+    }
+
     // ===== AgentRun 持久化钩子（记录器未注入时均为空操作） =====
 
     /**
@@ -1078,6 +906,17 @@ public abstract class BaseAgent {
      */
     protected AgentType getAgentType() {
         return null;
+    }
+
+    /**
+     * 对外暴露的 Agent 类型（批次 2：按审批记录里的 agentType 找回 Agent 实例）。
+     *
+     * 恢复入口只拿到一行审批记录，必须按类型路由到正确的 Agent；
+     * 直接暴露 getter 而不是让调用方反射或猜 Bean 名，
+     * 保证"记录里的类型"与"实际执行者"来自同一处定义。
+     */
+    public AgentType agentType() {
+        return getAgentType();
     }
 
     private void recordRunStart(AgentRunContext ctx, String userPrompt) {
@@ -1092,6 +931,13 @@ public abstract class BaseAgent {
         }
     }
 
+    /**
+     * 同步入口（无 SSE）的终态写入：尽力而为，失败只记日志。
+     *
+     * 与流式入口的区别：这里没有"客户端看到成功事件"的问题，
+     * 因此沿用记录器的吞异常版本，不让写库失败影响同步调用的返回。
+     * 流式入口必须走 {@link #persistTerminal}（严格版 + 原子收尾）。
+     */
     private void recordRunFinish(
             AgentRunContext ctx,
             String errorMessage,
@@ -1330,6 +1176,88 @@ public abstract class BaseAgent {
         this.handoffLocks = handoffLocks;
     }
 
+    public void setApprovalClaimService(ApprovalClaimService approvalClaimService) {
+        this.approvalClaimService = approvalClaimService;
+    }
+
+    public void setApprovalCompletionService(
+            ApprovalExecutionCompletionService approvalCompletionService) {
+        this.approvalCompletionService = approvalCompletionService;
+    }
+
+    /**
+     * 恢复入口（M3 批次 2）。
+     *
+     * 前置条件由调用方（ApprovalResumeService）保证：
+     * 已领取（approval CLAIMED、run RUNNING、epoch 已 +1）、已拿到并发许可。
+     *
+     * 本方法只做两件事：登记句柄、提交执行。
+     *
+     * **启动标记不在这里**：提交成功只代表"排队了"，不代表"开始执行"。
+     * CLAIMED → RUNNING 由任务体第一条语句完成（见 beginResumedExecution），
+     * 因此排队期间库里始终是 CLAIMED——这正是"已提交但没跑"的正确表达。
+     *
+     * 这里抛出异常只有一种含义：异步体一行都没跑（登记失败/线程池拒绝），
+     * 调用方据此做数据库补偿是安全的。
+     */
+    public SseEmitter resume(AgentRunContext ctx, SseEmitter emitter) {
+        String runId = ctx.getRunId().toString();
+
+        RunningAgentTask runningTask = new RunningAgentTask(
+                ctx, new CompletableFuture<>(), ctx.getExecutionEpoch());
+
+        if (taskRegistry != null && !taskRegistry.register(runId, runningTask)) {
+            releaseConcurrencyPermit(ctx);
+            throw new IllegalStateException(
+                    "审批恢复登记失败：同代次已有执行者，runId=" + runId
+                            + ", epoch=" + ctx.getExecutionEpoch());
+        }
+
+        ctx.setEmitter(emitter);
+
+        AtomicBoolean cleaned = new AtomicBoolean(false);
+
+        try {
+            submitExecution(ctx, emitter, runningTask,
+                    System.currentTimeMillis(), cleaned, true);
+        } catch (RuntimeException e) {
+            /*
+             * 提交失败（线程池拒绝等）：异步体一行都没跑，
+             * 这里负责注销句柄与释放许可，再抛给调用方做数据库补偿。
+             */
+            if (taskRegistry != null) {
+                taskRegistry.remove(runId, ctx.getExecutionEpoch());
+            }
+            releaseConcurrencyPermit(ctx);
+            throw e;
+        }
+
+        return emitter;
+    }
+
+    /**
+     * 恢复钩子：进入循环之前补做"暂停那一轮"。
+     *
+     * 由 ToolCallAgent 实现（执行批准的工具，或回填拒绝回执）。
+     * 默认空实现，保证其它 Agent 即使被恢复也不会出错。
+     */
+    protected void afterResume(AgentRunContext ctx) {
+    }
+
+    /**
+     * 恢复流的 SSE 超时：剩余执行时间 + buffer（不是原始总超时）。
+     */
+    public SseEmitter createResumeEmitter(AgentRunContext ctx) {
+        long remaining = ctx.effectiveTimeout(timeout).minus(ctx.elapsed()).toMillis();
+        long buffer = sseBuffer == null ? 0L : sseBuffer.toMillis();
+
+        long total = Math.max(1000L, remaining) + buffer;
+        if (total < 0) {
+            total = Long.MAX_VALUE;
+        }
+        return new SseEmitter(total);
+    }
+
     /**
      * 注入 AgentRun 生命周期记录器（由具体 Agent 的构造器转交）。
      */
@@ -1354,5 +1282,481 @@ public abstract class BaseAgent {
         if(cleaned.compareAndSet(false,true)) {
             cleanup(ctx);
         }
+    }
+
+    /**
+     * 提交并运行 Agent Loop（普通入口与审批恢复入口共用同一份实现）。
+     *
+     * 共用而不是各写一份：暂停出口、终态判定、预算兜底、finally 清理
+     * 一旦分叉，恢复路径就会悄悄丢掉其中一条（例如恢复后暂停不关流）。
+     *
+     * @param resumed true 表示这是审批恢复，进入循环前先补做暂停轮
+     */
+    private void submitExecution(
+            AgentRunContext ctx,
+            SseEmitter emitter,
+            RunningAgentTask runningTask,
+            long startMillis,
+            AtomicBoolean cleaned,
+            boolean resumed
+    ) {
+        String runId = ctx.getRunId().toString();
+        CompletableFuture<Void> task = runningTask.future();
+
+        CompletableFuture.runAsync(() -> {
+            /*
+             * 记录执行线程：取消/超时需要显式中断该线程。
+             */
+            ctx.setExecutingThread(Thread.currentThread());
+
+            /*
+             * 失败分支的脱敏错误信息，finally 中随终态写入数据库。
+             */
+            String errorMessage = null;
+
+            /*
+             * executionEntered：本次执行是否真的拿到了执行权。
+             * 普通入口天然为 true；恢复入口要等启动标记成功后才置 true。
+             * 为 false 时 finally 不得写终态——那一行已经不属于本次代次。
+             */
+            AtomicBoolean executionEntered = new AtomicBoolean(!resumed);
+
+            /*
+             * terminalPersisted：终态只写一次。
+             * 成功/失败路径会在关闭连接之前写（让客户端拿到流结束时库里已是终态），
+             * finally 再兜一次；用标记保证不会重复写。
+             */
+            AtomicBoolean terminalPersisted = new AtomicBoolean(false);
+
+            try {
+                /*
+                 * 启动门槛（批次 2 修正）：执行器真正开始运行之后，
+                 * 才把 CLAIMED 改成 RUNNING，条件带 approvalId + 本次代次。
+                 *
+                 * 放在这里而不是提交之前：提交成功但排队时仍是 CLAIMED。
+                 * 标记之前没有任何模型/工具调用，所以标记失败时
+                 * 本次执行可以安全地不写任何终态、不做业务变更。
+                 */
+                if (resumed && !beginResumedExecution(ctx)) {
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.ERROR,
+                                    "本次恢复的领取已失效，未执行任何操作。",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    emitter.complete();
+                    return;
+                }
+                executionEntered.set(true);
+
+                sendEvent(ctx, AgentEventType.STATUS, "Agent 已开始执行");
+
+                /*
+                 * 保留 run_id 事件兼容旧前端；
+                 * 新协议下每条 AgentEvent 本身都携带 runId。
+                 */
+                sendEvent(
+                        emitter,
+                        AgentEvent.of(
+                                runId,
+                                AgentEventType.RUN_ID,
+                                runId,
+                                ctx.getCurrentStep()
+                        )
+                );
+
+                /*
+                 * 恢复入口：先补做"暂停那一轮"（执行或回填拒绝），
+                 * 再进入常规循环。必须放在循环之前——
+                 * currentStep==maxSteps 时该轮仍要完成，不能被循环条件挡掉。
+                 */
+                if (resumed) {
+                    afterResume(ctx);
+                }
+
+                while (canContinue(ctx)) {
+                    /*
+                     * 中断检测：取消或超时已中断当前线程时，
+                     * 不再进入下一轮 step。
+                     */
+                    if (Thread.currentThread().isInterrupted()) {
+                        ctx.transitionTo(AgentState.CANCELLED);
+                        break;
+                    }
+
+                    ctx.nextStep();
+
+                    log.info(
+                            "Agent 流式执行中：runId={}, step={}/{}, thread={}",
+                            runId,
+                            ctx.getCurrentStep(),
+                            maxSteps,
+                            Thread.currentThread().getName()
+                    );
+
+                    String stepResult = step(ctx);
+
+                    /*
+                     * 每完成一轮 step 同步一次数据库进度（不是每个 token）。
+                     */
+                    recordRunProgress(ctx);
+
+                    if (stepResult != null && !stepResult.isBlank()) {
+                        sendEvent(
+                                emitter,
+                                AgentEvent.of(
+                                        runId,
+                                        AgentEventType.STEP,
+                                        stepResult,
+                                        ctx.getCurrentStep()
+                                )
+                        );
+                    }
+                }
+
+                /*
+                 * 审批暂停：本段流到此结束，但任务**没有**终态。
+                 *
+                 * 事件顺序：status → approval_required → done。
+                 * 这三个事件都在**暂停事务提交之后**才发：
+                 * 暂停写入发生在 ToolCallAgent.pauseForApproval 的
+                 * approvalPauseGateway.persist 里，那是跨 Bean 的 @Transactional
+                 * 调用，方法返回即已提交；本分支的代码在那之后才执行。
+                 * 提交失败会在那边抛异常，根本走不到这里——
+                 * 不会出现"前端看到待确认、库里却没有审批"的假暂停。
+                 * 这里的 done 只表示"本段连接结束"，不表示任务完成——
+                 * 终态一律以 agent_run.state 为准（客户端应查询或等待批准后续流）。
+                 *
+                 * 不发 final_answer（还没有答案），不发 error（不是错误）。
+                 */
+                if (ctx.getState() == AgentState.WAITING_APPROVAL) {
+                    sendEvent(
+                            ctx,
+                            AgentEventType.STATUS,
+                            "等待人工确认，本段连接结束。"
+                    );
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.APPROVAL_REQUIRED,
+                                    ctx.getPendingApprovalJson(),
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.DONE,
+                                    "[DONE]",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    emitter.complete();
+                    return;
+                }
+
+                /*
+                 * 循环退出但仍是 RUNNING：
+                 * 根据具体原因判定终态（超时 / 成功 / 达到预算）。
+                 */
+                if (ctx.getState() == AgentState.RUNNING) {
+                    finishIfStillRunning(ctx);
+
+                    if (ctx.getState() == AgentState.TIMED_OUT) {
+                        sendEvent(
+                                ctx,
+                                AgentEventType.STATUS,
+                                "任务运行超时，已强制停止。"
+                        );
+                    } else if (ctx.getState() == AgentState.MAX_STEPS_REACHED) {
+                        sendEvent(
+                                ctx,
+                                AgentEventType.STATUS,
+                                "安全停止：达到最大步骤数或最大工具调用次数限制。"
+                        );
+                    }
+                }
+
+                /*
+                 * 预算耗尽且无最终回答：给子类一次不带工具的收尾调用。
+                 * 放在状态事件之后、final_answer 事件之前，
+                 * 保证前端先看到"为什么停止"，再看到"尽力而为的答案"。
+                 */
+                applyBudgetFallback(ctx);
+
+                /*
+                 * 终态先落库，再发"成功"事件。顺序不能反。
+                 *
+                 * 客户端看到 final_answer / done 就会认为这次执行已经完成；
+                 * 如果先发事件、后写库，事务失败时用户手里就是一个
+                 * 库里并不存在的成功结果。
+                 *
+                 * 所以：提交事务（恢复入口还会把审批 FINISHED 并进同一事务）
+                 * → 发 final_answer → 发 done → 关闭连接。
+                 * 提交失败时只发脱敏 error 并结束，绝不发成功事件。
+                 *
+                 * 注意：这只是"提交发生在关闭连接之前"，
+                 * 不是 emitter.complete() 保证提交——它只负责关闭连接。
+                 */
+                if (!persistTerminal(ctx, null, startMillis, terminalPersisted)) {
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.ERROR,
+                                    "执行结果未能保存，请稍后查询任务状态。",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                    emitter.complete();
+                    return;
+                }
+
+                /*
+                 * 推送 final_answer 事件。
+                 *
+                 * 除了 SUCCEEDED，MAX_STEPS_REACHED 也要推：
+                 * 强制收尾会在预算耗尽时补一个 finalAnswer，
+                 * 不推的话用户只能看到"安全停止"，答案永远到不了前端。
+                 * 失败/取消/超时不推（这些情况下没有可信答案）。
+                 */
+                if ((ctx.getState() == AgentState.SUCCEEDED
+                        || ctx.getState() == AgentState.MAX_STEPS_REACHED)
+                        && ctx.getFinalAnswer() != null
+                        && !ctx.getFinalAnswer().isBlank()) {
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.FINAL_ANSWER,
+                                    ctx.getFinalAnswer(),
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                }
+
+                sendEvent(
+                        emitter,
+                        AgentEvent.of(
+                                runId,
+                                AgentEventType.DONE,
+                                "[DONE]",
+                                ctx.getCurrentStep()
+                        )
+                );
+
+                /*
+                 * 重要顺序：此时状态必已是终态（上方已保证），
+                 * 再调用 emitter.complete()。
+                 * 否则 onCompletion 会看到 RUNNING，
+                 * 把正常完成误判为客户端断开并改成 CANCELLED。
+                 */
+                emitter.complete();
+
+            } catch (Exception e) {
+                /*
+                 * 区分中断（取消/超时）与真实异常。
+                 * 若取消接口或 onTimeout 已先行设置终态，
+                 * transitionTo 会被拒绝，原有终态保持不变。
+                 */
+                failOrCancel(ctx, e);
+
+                errorMessage = buildErrorMessage(e);
+
+                log.error(
+                        "Agent 流式执行失败：runId={}, state={}, thread={}",
+                        runId,
+                        ctx.getState(),
+                        Thread.currentThread().getName(),
+                        e
+                );
+
+                /*
+                 * 错误事件只发送脱敏提示，
+                 * 异常详情只记录在服务端日志，不外发堆栈。
+                 *
+                 * 模型调用失败时，ToolCallAgent.think() 已经在失败现场
+                 * 推送过一条更精确的 ERROR 事件（配置/额度问题），
+                 * 这里跳过，避免前端收到两条 error。
+                 */
+                if (findModelCallException(e) == null) {
+                    sendEvent(
+                            emitter,
+                            AgentEvent.of(
+                                    runId,
+                                    AgentEventType.ERROR,
+                                    "智能体执行失败，请稍后重试。",
+                                    ctx.getCurrentStep()
+                            )
+                    );
+                }
+
+                /*
+                 * 同成功路径：终态与审批收尾同一事务，且先于关闭连接。
+                 * 这里已经发过脱敏 error，不存在"成功事件早于提交"的问题；
+                 * 写入失败由 finally 再兜一次，仍失败则保持 RUNNING 等扫描器收尾。
+                 */
+                persistTerminal(ctx, errorMessage, startMillis, terminalPersisted);
+
+                emitter.complete();
+
+            } finally {
+                /*
+                 * 终态单点写库：成功/失败/取消/超时/达到预算都在这里落盘。
+                 * 取消接口与 onTimeout 不单独写库，避免并发写冲突。
+                 */
+                if (executionEntered.get()) {
+                    persistTerminal(ctx, errorMessage, startMillis, terminalPersisted);
+                }
+
+                logTaskSummary(ctx, startMillis);
+                cleanupOnce(ctx, cleaned);
+                unregisterTask(ctx);
+
+                /*
+                 * 任务结束（含暂停）后释放并发许可。
+                 *
+                 * release-once：暂停路径与 finally 都可能走到这里，
+                 * 由 ctx 的标记保证一次执行只释放一次；
+                 * 每个执行代次有独立 ctx，旧代次也无法释放新代次的许可。
+                 */
+                releaseConcurrencyPermit(ctx);
+                releaseHandoffLock(ctx);
+
+                /*
+                 * 这里不再单独收尾审批：
+                 * 终态与 FINISHED 已在 persistTerminal 里同事务提交。
+                 *
+                 * 单独再写一次会破坏原子性——若上面的事务提交失败，
+                 * 这一步会留下"审批 FINISHED、run 仍 RUNNING"的假完成。
+                 * 再次暂停时更不该写：旧审批由暂停事务收尾。
+                 */
+            }
+
+        }, agentExecutor).whenComplete((result, error) -> {
+            /*
+             * 异步任务真正执行完后，把结果回写到预先注册的句柄。
+             * 若句柄已被取消接口 cancel，这里的 complete 会静默失败，无副作用。
+             */
+            if (error != null) {
+                runningTask.future().completeExceptionally(error);
+            } else {
+                runningTask.future().complete(null);
+            }
+        });
+
+        emitter.onTimeout(() -> {
+            /*
+             * 只处理"自己这一次执行"的回调。
+             *
+             * 审批恢复会给同一个 runId 注册新句柄；
+             * 旧连接的 onTimeout 如果迟到一步，绝不能去中断新线程、
+             * 删新任务或释放新许可。按句柄对象身份比较，
+             * 比比较 ctx.epoch（旧对象自比较，永远相等）可靠。
+             */
+            if (!isCurrentExecution(runId, runningTask)) {
+                log.info("忽略过期的 SSE 超时回调：runId={}, epoch={}",
+                        runId, ctx.getExecutionEpoch());
+                return;
+            }
+
+            /*
+             * SSE 连接超时：优先把任务标记为 TIMED_OUT。
+             * 若任务线程已先到达其他终态，本调用会被拒绝，不会覆盖。
+             */
+            ctx.transitionTo(AgentState.TIMED_OUT);
+
+            log.warn(
+                    "SSE 连接超时：runId={}, state={}, step={}, thread={}, duration={}ms",
+                    runId,
+                    ctx.getState(),
+                    ctx.getCurrentStep(),
+                    Thread.currentThread().getName(),
+                    System.currentTimeMillis() - startMillis
+            );
+
+            /*
+             * 尝试中断后台 Agent 任务。
+             *
+             * 注意 1：CompletableFuture.cancel(true) 不会中断执行线程，
+             * 必须再显式中断 ctx 中记录的执行线程；
+             * 注意 2：不保证底层模型 HTTP 调用一定立即停止。
+             */
+            runningTask.future().cancel(true);
+            ctx.interruptExecutingThread();
+
+            cleanupOnce(ctx, cleaned);
+            unregisterTask(ctx);
+        });
+
+        emitter.onCompletion(() -> {
+            /*
+             * 同样只处理自己这一次执行。
+             */
+            if (!isCurrentExecution(runId, runningTask)) {
+                log.info("忽略过期的 SSE 完成回调：runId={}, epoch={}",
+                        runId, ctx.getExecutionEpoch());
+                return;
+            }
+
+            /*
+             * 审批恢复的续流：客户端断开**不取消**任务，后台继续执行。
+             *
+             * 与普通入口的区别来自语义：普通 runStream 的断连等于"用户不要这个结果了"，
+             * 恢复流的断连只说明"这条 SSE 连接没了"，用户已经付过一次人工确认，
+             * 此时取消等于把确认结果丢掉，且没有任何途径重来。
+             *
+             * 不在这里注销句柄、不释放许可：任务还在跑，取消接口与
+             * 并发计数都必须继续看得见它；收尾统一由任务线程的 finally 完成。
+             */
+            if (resumed) {
+                log.info("审批恢复流已断开，任务转入后台继续：runId={}, state={}, step={}",
+                        runId, ctx.getState(), ctx.getCurrentStep());
+                return;
+            }
+
+            /*
+             * 完成时仍是 RUNNING，说明任务没有正常走到终态，
+             * 通常是客户端提前断开，视为取消。
+             *
+             * 正常完成时，任务线程已在 emitter.complete() 之前
+             * 设置 SUCCEEDED（或其他终态），不会进入本分支，
+             * 这是避免把正常完成误判为 CANCELLED 的关键。
+             *
+             * WAITING_APPROVAL 也不进入本分支：暂停时连接是"正常关闭"，
+             * 不是客户端掉线，把挂起任务判成 CANCELLED 会让批准无从谈起。
+             */
+            if (ctx.getState() == AgentState.RUNNING) {
+                ctx.transitionTo(AgentState.CANCELLED);
+
+                log.warn(
+                        "客户端提前断开，任务已取消：runId={}, state={}, step={}, thread={}, duration={}ms",
+                        runId,
+                        ctx.getState(),
+                        ctx.getCurrentStep(),
+                        Thread.currentThread().getName(),
+                        System.currentTimeMillis() - startMillis
+                );
+
+                runningTask.future().cancel(true);
+                ctx.interruptExecutingThread();
+            } else {
+                log.info(
+                        "SSE 连接完成：runId={}, state={}",
+                        runId,
+                        ctx.getState()
+                );
+            }
+
+            cleanupOnce(ctx, cleaned);
+            unregisterTask(ctx);
+        });
+
+
     }
 }

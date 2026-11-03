@@ -70,6 +70,45 @@ public class ApprovalPauseService implements ApprovalPauseGateway {
         }
 
         String runId = ctx.getRunId().toString();
+
+        /*
+         * 单任务审批次数上限（R4）：recordPause 已经把 approval_count +1，
+         * 这里读回**递增后**的值来判断是否越界。
+         *
+         * 越界时抛异常让整个事务回滚——approval_count 复原、检查点不写、
+         * 审批记录不插，然后由 ToolCallAgent 把任务判成 APPROVAL_LIMIT_REACHED。
+         * 先写再判而不是"先查再写"：只有这样才能让并发暂停也受同一个上限约束。
+         */
+        Integer approvalCount = jdbcTemplate.queryForObject(
+                "SELECT approval_count FROM agent_run WHERE run_id = ?",
+                Integer.class, runId);
+
+        if (approvalCount != null && approvalCount > properties.getMaxPerRun()) {
+            throw new PauseLimitReachedException(
+                    "审批次数已达上限：" + properties.getMaxPerRun()
+                            + "，runId=" + runId);
+        }
+
+        /*
+         * 恢复后再次暂停：旧审批的执行阶段到此结束（FINISHED），
+         * 新审批紧接着以 PENDING 插入。
+         *
+         * 必须在同一个事务里做，否则会出现"旧审批还 RUNNING、新审批已 PENDING"
+         * 的重叠窗口；也不能等到任务终态才收尾——run 此时仍是 WAITING_APPROVAL，
+         * 永远等不到终态。
+         */
+        if (ctx.getResumeApprovalId() != null) {
+            int finished = jdbcTemplate.update(
+                    "UPDATE agent_approval "
+                            + "SET resume_state = 'FINISHED', updated_at = CURRENT_TIMESTAMP "
+                            + "WHERE approval_id = ? "
+                            + "  AND resume_state IN ('RUNNING', 'CLAIMED')",
+                    ctx.getResumeApprovalId()
+            );
+            log.info("再次暂停：上一条审批执行阶段已收尾：approvalId={}, rows={}",
+                    ctx.getResumeApprovalId(), finished);
+        }
+
         String payload = CheckpointCodec.encode(checkpoint);
 
         /*

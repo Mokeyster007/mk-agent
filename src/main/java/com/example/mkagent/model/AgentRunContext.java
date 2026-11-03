@@ -1,5 +1,6 @@
 package com.example.mkagent.model;
 
+import com.example.mkagent.approval.ApprovalCheckpoint;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.resilience.ToolTargetExhaustionTracker;
 import org.springframework.ai.chat.messages.Message;
@@ -74,6 +75,42 @@ public class AgentRunContext {
         ctx.executionEpoch = executionEpoch;
         ctx.segmentStartedAt = Instant.now();
         return ctx;
+    }
+
+    /**
+     * 用检查点恢复进度类字段（批次 2）。
+     *
+     * 只由 {@code CheckpointRestorer} 调用：
+     * 恢复不是"重新开始"，步数、工具次数、消息历史与用量都必须原样接上，
+     * 否则会出现"恢复后步数归零、预算翻倍"或"历史丢失、toolCallId 断裂"。
+     *
+     * @param currentStep      已计步的轮数（暂停那一轮已计入，恢复不再 +1）
+     * @param toolCallCount    已执行的工具次数
+     * @param history          本轮之前的历史（不含 pendingAssistant）
+     */
+    public void restoreProgress(
+            int currentStep,
+            int toolCallCount,
+            List<Message> history,
+            String model,
+            long promptTokens,
+            long completionTokens,
+            long totalTokens,
+            int modelCallCount,
+            long totalModelCallMillis
+    ) {
+        this.currentStep = currentStep;
+        this.toolCallCount = toolCallCount;
+        this.messages.clear();
+        if (history != null) {
+            this.messages.addAll(history);
+        }
+        this.model = model;
+        this.promptTokens = promptTokens;
+        this.completionTokens = completionTokens;
+        this.totalTokens = totalTokens;
+        this.modelCallCount = modelCallCount;
+        this.totalModelCallMillis = totalModelCallMillis;
     }
 
     /**
@@ -257,6 +294,30 @@ public class AgentRunContext {
      * 提前释放会让批准请求抢在收尾之前，造成两段执行重叠。
      */
     private boolean handoffLockHeld;
+
+    /**
+     * 本次恢复所依据的检查点（批次 2）。
+     *
+     * 只存在于内存：暂停轮执行完就没用了，不参与任何序列化。
+     * 未恢复的普通任务为 null。
+     */
+    private ApprovalCheckpoint checkpoint;
+
+    /**
+     * 本次恢复来自哪条审批（批次 2）。
+     *
+     * 与 {@link #approvalId}（本次执行**新建**的审批）分开：
+     * 恢复后可能再次暂停，那时会生成新的 approvalId，
+     * 而这条旧审批必须在暂停事务里标成 FINISHED。
+     */
+    private String resumeApprovalId;
+
+    /**
+     * 恢复模式：APPROVED / REJECTED（批次 2）。
+     *
+     * 决定"恢复后先执行暂停轮，还是先回填拒绝回执"。
+     */
+    private String resumeMode;
 
     /**
      * 当前一轮 think() 调用模型后得到的响应。
@@ -622,6 +683,30 @@ public class AgentRunContext {
 
     public void setConfigVersion(String configVersion) {
         this.configVersion = configVersion;
+    }
+
+    public ApprovalCheckpoint getCheckpoint() {
+        return checkpoint;
+    }
+
+    public void setCheckpoint(ApprovalCheckpoint checkpoint) {
+        this.checkpoint = checkpoint;
+    }
+
+    public String getResumeApprovalId() {
+        return resumeApprovalId;
+    }
+
+    public void setResumeApprovalId(String resumeApprovalId) {
+        this.resumeApprovalId = resumeApprovalId;
+    }
+
+    public String getResumeMode() {
+        return resumeMode;
+    }
+
+    public void setResumeMode(String resumeMode) {
+        this.resumeMode = resumeMode;
     }
 
     public boolean isHandoffLockHeld() {

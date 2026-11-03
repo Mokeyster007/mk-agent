@@ -56,6 +56,27 @@ public class ApprovalProperties {
      */
     private Duration leaseWait = Duration.ofSeconds(3);
 
+    /**
+     * 已决定但尚未启动的等待期限（批次 2）。
+     *
+     * 与 {@link #ttl} 是两回事：
+     * - ttl 管"人什么时候必须做决定"（PENDING 的有效期）；
+     * - resumeStartTimeout 管"决定之后多久之内必须真正跑起来"。
+     *
+     * 超过这个期限还起不来（一直抢不到并发许可 / 执行器持续拒绝），
+     * 任务进入明确失败态，而不是无限期挂在 APPROVED。
+     * 这类等待不消耗"实际执行失败次数"。
+     */
+    private Duration resumeStartTimeout = Duration.ofMinutes(5);
+
+    public Duration getResumeStartTimeout() {
+        return resumeStartTimeout;
+    }
+
+    public void setResumeStartTimeout(Duration resumeStartTimeout) {
+        this.resumeStartTimeout = resumeStartTimeout;
+    }
+
     public boolean isEnabled() {
         return enabled;
     }

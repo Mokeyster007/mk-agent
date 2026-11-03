@@ -9,6 +9,7 @@ import org.springframework.web.context.request.async.AsyncRequestNotUsableExcept
 import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -29,19 +30,27 @@ public class GlobalExceptionHandler {
 
     /**
      * 业务异常：返回异常自带的状态码与消息。
+     *
+     * 带原因码时额外返回 {@code code}（稳定常量，客户端按它分支），
+     * 不带时响应体与老版本完全一致——老接口的返回结构不能被这次改动改变。
      */
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<Map<String, Object>> handleBusinessException(
             BusinessException e
     ) {
-        log.warn("业务异常：status={}, message={}", e.getHttpStatus(), e.getMessage());
+        log.warn("业务异常：status={}, code={}, message={}",
+                e.getHttpStatus(), e.getCode(), e.getMessage());
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("success", false);
+        if (e.getCode() != null) {
+            body.put("code", e.getCode());
+        }
+        body.put("message", e.getMessage());
 
         return ResponseEntity
                 .status(e.getHttpStatus())
-                .body(Map.of(
-                        "success", false,
-                        "message", e.getMessage()
-                ));
+                .body(body);
     }
 
     /**

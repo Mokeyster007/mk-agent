@@ -163,6 +163,14 @@ CREATE INDEX IF NOT EXISTS idx_agent_approval_resume
 CREATE INDEX IF NOT EXISTS idx_agent_approval_user
     ON agent_approval (user_id);
 
+-- claimed_epoch：领取时写入的执行代次（M3 批次 2）。
+-- 后台线程必须用 (approval_id, resume_state='CLAIMED', claimed_epoch=?) 做条件更新
+-- 把 CLAIMED 改成 RUNNING，0 行就说明"这次领取已经失效/已被别人启动"，
+-- 此时一个模型调用、一个工具都不能执行。
+ALTER TABLE agent_approval ADD COLUMN IF NOT EXISTS claimed_epoch INT;
+
+COMMENT ON COLUMN agent_approval.claimed_epoch IS '领取时绑定的执行代次；启动时与 execution_epoch 一起做条件更新';
+
 COMMENT ON TABLE agent_approval IS '审批记录：一次写工具暂停一行（M3）';
 COMMENT ON COLUMN agent_approval.summary_text IS '用户可读摘要（≤500 字符，不含参数原文/密钥）';
 COMMENT ON COLUMN agent_approval.args_hash IS '整轮 pending 工具调用的规范化参数哈希，批准即绑定该组参数';

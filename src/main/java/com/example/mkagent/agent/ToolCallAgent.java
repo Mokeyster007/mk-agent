@@ -5,8 +5,10 @@ import com.example.mkagent.approval.ApprovalCheckpoint;
 import com.example.mkagent.approval.ApprovalPauseGateway;
 import com.example.mkagent.approval.ApprovalSummary;
 import com.example.mkagent.approval.ApprovalSummaryBuilder;
+import com.example.mkagent.approval.ApprovalRecord;
 import com.example.mkagent.approval.ApprovalToolPolicy;
 import com.example.mkagent.approval.CheckpointCodec;
+import com.example.mkagent.approval.PauseLimitReachedException;
 import com.example.mkagent.approval.PauseRejectedException;
 import com.example.mkagent.approval.PauseResult;
 import com.example.mkagent.approval.RunHandoffLocks;
@@ -1202,6 +1204,17 @@ public class ToolCallAgent extends ReActAgent {
              * 不能在事务内部 catch 后继续提交。
              */
             result = approvalPauseGateway.persist(ctx, checkpoint, summary);
+        } catch (PauseLimitReachedException e) {
+            /*
+             * 审批次数触顶：这次暂停没有成立（事务已回滚，approval_count 复原），
+             * 任务必须终止而不是继续等人工确认——否则模型可以靠反复触发写工具
+             * 把一次任务无限拖长。
+             *
+             * 不执行任何写工具，也不创建下一条审批。
+             */
+            ctx.transitionTo(AgentState.RUNNING);
+            ctx.setErrorCode("APPROVAL_LIMIT_REACHED");
+            throw new IllegalStateException("审批次数已达上限，任务终止", e);
         } catch (PauseRejectedException e) {
             /*
              * CAS 未命中（被取消/代次已变）：暂停根本没成立，
@@ -1536,4 +1549,176 @@ public class ToolCallAgent extends ReActAgent {
                 ))
                 .collect(Collectors.joining("\n"));
     }
+
+    /**
+     * 拒绝回填的工具结果文本。
+     *
+     * 只说明"这一步没做"，不解释原因、不带参数、不带内部信息：
+     * 模型据此改口即可，用户看到的是它随后的自然语言回答。
+     */
+    static final String REJECTION_RESULT_TEXT = "用户拒绝执行该操作，未做任何修改。";
+
+    // ===== 审批恢复（M3 批次 2） =====
+
+    /**
+     * 当前 Agent 的配置指纹（恢复前与检查点比对）。
+     *
+     * 与暂停时用的是同一个算法，否则"自己跟自己比"必然不相等。
+     */
+    public String currentConfigVersion() {
+        return AgentConfigFingerprint.compute(
+                getAgentType(),
+                getSystemPrompt(),
+                availableTools,
+                approvalToolPolicy == null ? Set.of() : approvalToolPolicy.requiredToolNames()
+        );
+    }
+
+    /**
+     * 当前 Agent 的白名单哈希（恢复前与检查点比对）。
+     */
+    public String currentWhitelistHash() {
+        return AgentConfigFingerprint.whitelistHash(availableTools);
+    }
+
+    /**
+     * 恢复钩子：进入循环前补做"暂停那一轮"。
+     *
+     * 批准 → 执行这一轮工具；拒绝 → 回填拒绝回执。
+     * 两条路径都**不重复 nextStep**：暂停那一轮已经计过步。
+     */
+    @Override
+    protected void afterResume(AgentRunContext ctx) {
+        ApprovalCheckpoint checkpoint = ctx.getCheckpoint();
+        if (checkpoint == null) {
+            return;
+        }
+
+        if (ApprovalRecord.STATUS_REJECTED.equals(ctx.getResumeMode())) {
+            backfillRejection(ctx, checkpoint);
+            return;
+        }
+
+        executeApprovedRound(ctx, checkpoint);
+    }
+
+    /**
+     * 批准：执行暂停时被冻结的那一整轮工具。
+     *
+     * 执行前检查两件事（缺一不可）：
+     * 1. 剩余执行时间 > 0 —— 否则恢复即超时，发模型调用没有意义；
+     * 2. 剩余工具额度 ≥ 本轮调用数 —— 不足就整轮不执行，绝不"执行一半"。
+     */
+    private void executeApprovedRound(AgentRunContext ctx, ApprovalCheckpoint checkpoint) {
+        List<AssistantMessage.ToolCall> calls = toToolCalls(checkpoint);
+
+        if (ctx.elapsed().compareTo(ctx.effectiveTimeout(getTimeout())) >= 0) {
+            ctx.setErrorCode("BUDGET_EXHAUSTED_ON_RESUME");
+            ctx.transitionTo(AgentState.TIMED_OUT);
+            log.warn("恢复即超时，跳过暂停轮：runId={}, elapsed={}ms",
+                    ctx.getRunId(), ctx.getActiveElapsedMillis());
+            return;
+        }
+
+        int remainingTools = getMaxToolCalls() - ctx.getToolCallCount();
+        if (remainingTools < calls.size()) {
+            /*
+             * 额度不足时整轮放弃：执行一半会让模型看到"部分工具成功"的
+             * 假象，而另一半永远没执行，且没有任何记录说明为什么。
+             */
+            ctx.setErrorCode("TOOL_BUDGET_INSUFFICIENT");
+            ctx.transitionTo(AgentState.MAX_STEPS_REACHED);
+            log.warn("恢复时工具额度不足，整轮不执行：runId={}, remaining={}, need={}",
+                    ctx.getRunId(), remainingTools, calls.size());
+            return;
+        }
+
+        AssistantMessage pendingAssistant = (AssistantMessage) CheckpointCodec.toMessage(
+                checkpoint.pendingAssistant());
+
+        ChatResponse response = new ChatResponse(
+                List.of(new Generation(pendingAssistant)));
+
+        Prompt prompt = new Prompt(ctx.getMessages(), buildToolCallingOptions());
+
+        calls.forEach(call -> sendEvent(
+                ctx,
+                AgentEventType.TOOL_START,
+                toolEventMessageProvider.startMessage(call.name())
+        ));
+
+        ToolExecutionResult executionResult;
+        AgentRunContext previousRunContext = AgentRunContextHolder.bind(ctx);
+        ToolTargetExhaustionTracker previousTracker = ToolTargetExhaustionTracker.current();
+        ToolTargetExhaustionTracker.bind(ctx.getToolTargetExhaustionTracker());
+
+        try {
+            /*
+             * 关键：pendingAssistant 只通过 ChatResponse 交给框架追加一次。
+             * 预先 add 进 messages 会让 assistant 出现两次、toolCallId 对不上。
+             */
+            executionResult = toolCallingManager.executeToolCalls(prompt, response);
+        } finally {
+            ToolTargetExhaustionTracker.bind(previousTracker);
+            AgentRunContextHolder.restore(previousRunContext);
+        }
+
+        ctx.getMessages().clear();
+        ctx.getMessages().addAll(executionResult.conversationHistory());
+
+        Message lastMessage = ctx.getMessages().get(ctx.getMessages().size() - 1);
+        if (!(lastMessage instanceof ToolResponseMessage toolResponseMessage)) {
+            throw new IllegalStateException(
+                    "恢复执行后，最后一条消息不是 ToolResponseMessage");
+        }
+
+        toolResponseMessage.getResponses().forEach(item -> {
+            sendEvent(ctx, AgentEventType.TOOL_RESULT,
+                    toolEventMessageProvider.resultMessage(item.name(), item.responseData()));
+            ctx.recordToolName(item.name());
+            log.info("恢复轮工具执行完成：runId={}, toolName={}, result={}",
+                    ctx.getRunId(), item.name(), abbreviateForLog(item.responseData()));
+        });
+
+        ctx.addToolCallCount(toolResponseMessage.getResponses().size());
+
+        log.info("暂停轮已执行完成：runId={}, tools={}, step={}",
+                ctx.getRunId(), toolResponseMessage.getResponses().size(),
+                ctx.getCurrentStep());
+    }
+
+    /**
+     * 拒绝：为每个 pending toolCallId 回填一条匹配的拒绝结果。
+     *
+     * 不执行任何工具、不增加 toolCallCount、不要求工具额度——
+     * 拒绝路径只是把"这一步没做"如实告诉模型，让它改口。
+     *
+     * 配对规则与执行路径一致：assistant(toolCalls) 一次，
+     * 每个 id 一条 ToolResponse，数量与顺序完全对应。
+     */
+    private void backfillRejection(AgentRunContext ctx, ApprovalCheckpoint checkpoint) {
+        AssistantMessage pendingAssistant = (AssistantMessage) CheckpointCodec.toMessage(
+                checkpoint.pendingAssistant());
+
+        List<ToolResponseMessage.ToolResponse> responses = new ArrayList<>();
+        for (AssistantMessage.ToolCall call : pendingAssistant.getToolCalls()) {
+            responses.add(new ToolResponseMessage.ToolResponse(
+                    call.id(), call.name(), REJECTION_RESULT_TEXT));
+        }
+
+        ctx.getMessages().add(pendingAssistant);
+        ctx.getMessages().add(new ToolResponseMessage(responses));
+
+        log.info("拒绝回执已回填：runId={}, step={}, calls={}",
+                ctx.getRunId(), ctx.getCurrentStep(), responses.size());
+    }
+
+    private List<AssistantMessage.ToolCall> toToolCalls(ApprovalCheckpoint checkpoint) {
+        List<AssistantMessage.ToolCall> calls = new ArrayList<>();
+        checkpoint.pendingToolCalls().forEach(call -> calls.add(
+                new AssistantMessage.ToolCall(
+                        call.id(), call.type(), call.name(), call.arguments())));
+        return calls;
+    }
+
 }

@@ -2,6 +2,8 @@ package com.example.mkagent.config;
 
 import com.example.mkagent.agent.AgentTaskRegistry;
 import com.example.mkagent.agent.MusicAgent;
+import com.example.mkagent.approval.ApprovalClaimService;
+import com.example.mkagent.approval.ApprovalExecutionCompletionService;
 import com.example.mkagent.approval.ApprovalPauseGateway;
 import com.example.mkagent.approval.ApprovalSummaryBuilder;
 import com.example.mkagent.approval.ApprovalToolPolicy;
@@ -49,6 +51,8 @@ public class MusicAgentConfig {
             AgentConcurrencyGuard agentConcurrencyGuard,
             ApprovalToolPolicy approvalToolPolicy,
             ApprovalPauseGateway approvalPauseGateway,
+            ApprovalClaimService approvalClaimService,
+            ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
@@ -76,6 +80,8 @@ public class MusicAgentConfig {
                 agentConcurrencyGuard,
                 approvalToolPolicy,
                 approvalPauseGateway,
+                approvalClaimService,
+                approvalCompletionService,
                 approvalSummaryBuilder,
                 runHandoffLocks,
                 maxSteps,
@@ -98,6 +104,8 @@ public class MusicAgentConfig {
             AgentConcurrencyGuard agentConcurrencyGuard,
             ApprovalToolPolicy approvalToolPolicy,
             ApprovalPauseGateway approvalPauseGateway,
+            ApprovalClaimService approvalClaimService,
+            ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
@@ -125,6 +133,8 @@ public class MusicAgentConfig {
                 agentConcurrencyGuard,
                 approvalToolPolicy,
                 approvalPauseGateway,
+                approvalClaimService,
+                approvalCompletionService,
                 approvalSummaryBuilder,
                 runHandoffLocks,
                 maxSteps,
@@ -155,6 +165,8 @@ public class MusicAgentConfig {
             AgentConcurrencyGuard agentConcurrencyGuard,
             ApprovalToolPolicy approvalToolPolicy,
             ApprovalPauseGateway approvalPauseGateway,
+            ApprovalClaimService approvalClaimService,
+            ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
             int maxSteps,
@@ -188,6 +200,20 @@ public class MusicAgentConfig {
         agent.setApprovalPauseGateway(approvalPauseGateway);
         agent.setApprovalSummaryBuilder(approvalSummaryBuilder);
         agent.setHandoffLocks(runHandoffLocks);
+
+        /*
+         * 批次 2：恢复执行的启动标记与收尾都走 ApprovalClaimService。
+         * 不装配的后果是"恢复后审批永远停在 CLAIMED"——
+         * 任务能跑完，但用户查到的审批状态永远是执行中。
+         */
+        agent.setApprovalClaimService(approvalClaimService);
+
+        /*
+         * 批次 2：恢复执行的终态与审批收尾同事务提交。
+         * 不装配会退化为"先写 run 终态、再写审批 FINISHED"，
+         * 顺序仍正确但不再原子。
+         */
+        agent.setApprovalCompletionService(approvalCompletionService);
 
         agent.applyBudget(maxSteps, maxToolCalls, timeout, sseBuffer);
 
