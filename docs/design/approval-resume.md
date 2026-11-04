@@ -474,23 +474,155 @@ SSE emitter 超时 = **剩余执行时间 + buffer**（不是原始总超时）�
 | F. 暂停事务半提交 | 不可能（单事务） | 若 `WAITING_APPROVAL` 但 approval 缺失 → `CHECKPOINT_CORRUPT` + `FAILED` |
 | G. 配置版本不符 | `WAITING_APPROVAL` + 旧版本 | `409 CHECKPOINT_CONFIG_MISMATCH`；approval `INVALIDATED`；run `FAILED` |
 
-## 9. 幂等（批次 3）
+## 9. 幂等（批次 3B：同库音乐写工具）
 
-同一 `@Transactional` 内：占位 → 业务写入 → `status='DONE' + result_json`。
+### 9.1 范围与前提
+
+只覆盖 `create_playlist` / `add_songs_to_playlist` 两个**同库**写工具。
+`write_file` / `generate_pdf` / `download_resource` 属于外部或本地文件副作用，
+既没有稳定幂等键也没有结果查询能力，**本批不做**，也不宣称 exactly-once。
+
+**"整轮一起批准"不等于"整轮一个事务"。**
+审批粒度是整轮（一个写工具触发，整轮都不执行），
+但执行时是**每一次逻辑写调用一个独立事务**，不承诺整轮业务原子性。
+
+**生产启用边界不变**：`MusicWriteToolConfig` 只装配幂等包装，
+这个 Bean **不进入任何 `AgentType` 白名单**，写工具对模型仍然不可见。
+本批只把链路装配好并测透，打开白名单是后续批次的事。
+
+### 9.2 逻辑身份
 
 ```
-INSERT ... ON CONFLICT (user_id, idempotency_key) DO NOTHING
-  0 行 → SELECT ... FOR UPDATE
-          hash 不同 → IDEMPOTENCY_CONFLICT（失败关闭）
-          status='DONE' → 回放 result_json
-          其它 → 失败关闭（绝不回放未完成结果）
-业务写入 → UPDATE status='DONE', result_json
+idempotency_key = sha256("v2|u{len}:{userId}|r{runId}|s{step}|c{len}:{toolCallId}")
+request_hash    = sha256("{toolName}\n{canonicalJson(args)}")
 ```
 
-- 异常穿过事务边界回滚后，**外层**再转脱敏工具结果；事务内不 catch 转 `ok=false`。
-- 并发命中在唯一索引处阻塞，提交后读到 `DONE` 才回放。
-- `@Transactional` 必须跨 Bean 调用才走代理：`MusicPlaylistWriteService` 是独立 `@Service`，由 `IdempotentWriteExecutor` 注入调用；测试断言 `AopUtils.isAopProxy`。
-- H2 与 PG 差异：`ON CONFLICT` 需真实执行验证（不以 Parser 符号为证据）；`@Tag("pg")` 用例**在默认构建中显式排除**，PG 验证使用隔离测试数据，不删现有示例业务数据。
+- 身份是 **toolCallId**，不是参数：同名同参的两次独立调用必须各自执行，
+  用参数做身份会把它们静默合并；
+- **不含 execution_epoch**：epoch 每次恢复 +1，放进身份会让"同一调用跨恢复"变成两条记录；
+- `step` 参与身份：`toolCallId` 只在一次模型响应内唯一，跨轮复用同一个 id 时靠它分开；
+  暂停轮在恢复后 step 不变（恢复路径不 `nextStep`），身份因此稳定；
+- 自由文本字段用**长度前缀**编码，避免 `("ab","c")` 与 `("a","bc")` 拼接碰撞；
+- 参数哈希只做一致性校验：同一身份、不同工具名或参数 → `IDEMPOTENCY_CONFLICT`，不执行也不回放。
+
+### 9.3 toolCallId 怎么传到回调
+
+`ToolCallback`（spring-ai-model 1.0.0）只有 `call(String)` / `call(String, ToolContext)`，
+**拿不到 toolCallId**（已核对接口签名）。因此：
+
+1. `ToolCallAgent.act()` / `executeApprovedRound()` 在执行前把整轮 `ToolCall`
+   登记成 `ToolCallPlan`，绑定到 `ToolCallPlanHolder`（ThreadLocal，finally 里 restore）；
+2. 回调按**工具名 + 声明顺序**认领；
+3. 认领时再比对一次规范化参数，并校验"仍在登记它的那个线程上"。
+
+**依赖的运行契约**（已核对 `DefaultToolCallingManager` 用 `Iterator` 串行遍历，
+无线程池/并行流）：同一线程、按声明顺序、每条 ToolCall 恰好一次回调。
+
+**能被发现的破坏**：换线程（跨线程认领直接拒绝，且不消耗队列）、
+乱序且参数不同（参数比对失败）、多调/少调（队列空）、
+id 缺失或同轮重复（整轮拒绝）。
+
+**无法发现的残余风险**：同一线程内乱序分发、且两条调用的工具名与参数**完全相同**、
+只有 id 不同时，认领只能按队列发号，会把副作用记到另一条调用的身份上。
+仅凭 (工具名, 参数) 不可能识别这种交换，**不宣称能识别**；
+根治需要框架把 toolCallId 传进回调，超出本批范围。
+
+**缺失 / 空白 / 同轮重复 id**：整轮写工具拒绝执行（不碰数据库、零副作用），
+返回稳定脱敏错误。**不做**"用参数派生"的退化——那会把两次真实写操作合并成一次。
+
+### 9.4 一个调用一个事务
+
+```
+TX: SET LOCAL lock_timeout（仅 PG，事务级）
+    代次/归属/状态守卫（agent_run 行锁 SELECT ... FOR UPDATE）
+    INSERT 幂等占位行           ← 第一条写入语句，唯一索引在这里裁决并发
+    业务写入（MusicPlaylistWriteService，REQUIRED 加入本事务）
+    UPDATE 成功结果，校验影响行数 = 1
+    COMMIT
+```
+
+- 占位、业务、结果同生共死：提交了就一定有可回放的成功结果；回滚了就一定没有副作用，
+  也不会留下"占位但没结果"的残留行；
+- 因此**不加 `status` 列**：单事务下"行存在"即"已完成"，中间态不可表达；
+- INSERT 必须在业务写入之前：PG 上唯一键冲突会让整个事务 abort，
+  只有把可能冲突的语句放最前面，才谈得上"冲突就整体回滚"；
+- 工具返回 `ok=false` 信封时，执行器抛内部异常回滚占位行，
+  **外层**（事务代理之外）再把原始信封原样还给模型；事务内不 catch 后正常返回；
+- 执行入口必须**不在**事务里（回调显式检查并拒绝），否则"回滚后换新事务读赢家结果"不成立。
+
+### 9.5 冲突分类：只认幂等记录插入冲突
+
+只有那一条 `INSERT INTO music_tool_idempotency` 的 `DuplicateKeyException`
+被转换成 `IdempotencyRecordConflictException`。
+业务表（同名歌单、歌单歌曲主键）的唯一键冲突**不是**幂等命中，
+走原有业务错误处理，绝不伪装成回放。
+
+### 9.6 等待有界
+
+- 删除"重试 3×50ms 即可保证有界"的说法：真正的等待发生在数据库的唯一索引上；
+- PostgreSQL：事务开头 `SET LOCAL lock_timeout = 5s`（`mkagent.music.idempotency.lock-timeout-millis`），
+  **只作用于当前事务**，事务结束自动失效，不污染连接池、不改全局配置；
+  超时抛的是锁超时（55P03）而**不是** DuplicateKeyException，
+  调用方按"正在处理中，请稍后重试"返回，不重复执行业务；
+- H2：**没有** `SET LOCAL`，代码在非 PG 上直接跳过；
+  锁等待由连接上的 `LOCK_TIMEOUT` 决定（H2 2.3.232 默认 2000ms，测试数据源未改）。
+  两者作用域**不等价**：H2 的 `SET LOCK_TIMEOUT` 是 session 级、回滚也不恢复，
+  运行期临时改过会跟着连接回到池里；因此本批在 H2 上不做任何运行期超时设置。
+
+### 9.7 回放
+
+冲突事务回滚之后，用**新事务**读取已提交记录：
+
+- 工具名或 `request_hash` 不符 → 冲突，失败关闭；
+- `result_json` 为空、非法、或不是成功信封 → 失败关闭；
+  **不删除后重执行**（那等于用一次新副作用掩盖历史不一致）；
+- 回放前复核访问权：`agent_run` 仍属于当前用户，且结果涉及的歌单当前仍归当前用户；
+  失去访问权返回稳定权限错误，**不代表历史操作被撤销**；
+- 回放计入 `tool_call_count`（一次调用就是一次调用），不额外追加工具回执。
+
+### 9.8 旧代次
+
+幂等键不含 epoch，但"能不能写"仍由代次与任务状态决定：
+
+- 事务开头对 `agent_run` 这一行做**加锁读**（`SELECT ... FOR UPDATE`），
+  同时校验 `user_id`、`state='RUNNING'`、`execution_epoch == ctx.executionEpoch`；
+- 为什么要锁：代次推进是 `UPDATE agent_run SET execution_epoch=? WHERE run_id=?
+  AND state='WAITING_APPROVAL'`。普通 SELECT 只证明"读的那一刻还对"，
+  读完之后、提交之前代次仍可能被推进，旧执行照样写出副作用。
+  加锁后两条路径在同一行上串行化：
+  - 写事务先拿锁 → 推进被阻塞到写事务提交；此时 state 是 `RUNNING`，
+    推进语句的 `state='WAITING_APPROVAL'` 不成立、影响 0 行。
+    即：这次写是在资格失效**之前**完成的合法执行，不是"被拦下的旧执行"；
+  - 推进先拿锁 → 写事务读到新代次，守卫失败，零副作用。
+- 锁顺序：先锁 `agent_run`，再写幂等表与业务表；没有"先锁业务表再锁 run"的路径，
+  因此不引入新的死锁环。
+- 只看代次不够：状态不是 `RUNNING`（暂停中、已终态）同样拒绝写入。
+
+### 9.9 结果不明
+
+同库事务保证"业务写入与成功记录同生共死"，但**提交确认可能丢失**：
+客户端看到报错不等于数据库回滚。因此：
+
+- 不自动换新身份重试，不清除记录后重执行；
+- 同一稳定身份再次合法到达时，由记录裁决是否回放；
+- 本批不实现扫描器，也不自动重领卡住的 `RUNNING` 审批。
+
+### 9.10 验证方式
+
+- H2（默认真实事务）：并发同 key 只写一次、业务异常/错误信封共同回滚、
+  结果更新 0 行回滚、跨 epoch 身份稳定、回放权限、旧记录失败关闭、
+  代次推进被行锁阻塞（线性化）、非 `RUNNING`/非本人任务拒绝写入、
+  `AopUtils.isAopProxy`；
+- `@Tag("pg")`（默认排除，需真实 PG）：唯一索引上的等待/提交/回滚、
+  赢家提交后输家用干净事务读到并回放、aborted 事务不可继续读、
+  `SET LOCAL lock_timeout` 生效且不泄漏、超时方无提交、
+  行锁阻塞代次推进。运行命令见 `PostgresIdempotencyConcurrencyTest` 类注释；
+  用例只建带随机后缀的探针表，**不碰业务表**。
+- 现状（2026-11-04）：已在隔离的便携版 PostgreSQL 16.15 上实际执行，
+  6 条 `pg` 用例 **6 passed / 0 failed / 0 skipped**；
+  证据是**直接 JDBC 探针**（真实等待 332ms 后 23505、锁超时 321ms 后 55P03），
+  **不是** `IdempotentWriteExecutor` 的 PG 端到端验证——
+  执行器、`@Transactional`、Spring 事务在 PG 上的行为仍只有 H2 覆盖。
 
 ## 10. 审批摘要与安全
 

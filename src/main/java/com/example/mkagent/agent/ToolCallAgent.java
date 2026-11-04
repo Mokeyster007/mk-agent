@@ -18,6 +18,9 @@ import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
 import com.example.mkagent.resilience.ToolTargetExhaustionTracker;
+import com.example.mkagent.tools.IdempotentToolCallback;
+import com.example.mkagent.tools.ToolCallPlan;
+import com.example.mkagent.tools.ToolCallPlanHolder;
 import com.example.mkagent.tools.ToolEventMessageProvider;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -46,6 +49,7 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -1413,6 +1417,18 @@ public class ToolCallAgent extends ReActAgent {
                 ToolTargetExhaustionTracker.current();
         ToolTargetExhaustionTracker.bind(ctx.getToolTargetExhaustionTracker());
 
+        /*
+         * 幂等身份计划：ToolCallback 拿不到 toolCallId，
+         * 只能在这里把整轮 ToolCall（含 id）登记下来，回调执行时按顺序认领。
+         * 写工具身份不可判定时计划被标记为拒绝，该轮写工具不会执行。
+         */
+        ToolCallPlan previousPlan = ToolCallPlanHolder.bind(
+                ToolCallPlan.build(
+                        response.getResult().getOutput().getToolCalls(),
+                        idempotentToolNames()
+                )
+        );
+
         ToolExecutionResult executionResult;
         try {
             executionResult = toolCallingManager.executeToolCalls(
@@ -1421,6 +1437,7 @@ public class ToolCallAgent extends ReActAgent {
             );
         } finally {
             // 恢复而不是无脑清除：嵌套执行时不能把外层绑定弄丢。
+            ToolCallPlanHolder.restore(previousPlan);
             ToolTargetExhaustionTracker.bind(previousTracker);
             AgentRunContextHolder.restore(previousRunContext);
         }
@@ -1652,6 +1669,14 @@ public class ToolCallAgent extends ReActAgent {
         ToolTargetExhaustionTracker previousTracker = ToolTargetExhaustionTracker.current();
         ToolTargetExhaustionTracker.bind(ctx.getToolTargetExhaustionTracker());
 
+        /*
+         * 恢复路径同样要绑定身份计划：检查点里的 toolCallId 原样重建，
+         * 因此同一逻辑调用在恢复前后算出同一个幂等键。
+         */
+        ToolCallPlan previousPlan = ToolCallPlanHolder.bind(
+                ToolCallPlan.build(calls, idempotentToolNames())
+        );
+
         try {
             /*
              * 关键：pendingAssistant 只通过 ChatResponse 交给框架追加一次。
@@ -1659,6 +1684,7 @@ public class ToolCallAgent extends ReActAgent {
              */
             executionResult = toolCallingManager.executeToolCalls(prompt, response);
         } finally {
+            ToolCallPlanHolder.restore(previousPlan);
             ToolTargetExhaustionTracker.bind(previousTracker);
             AgentRunContextHolder.restore(previousRunContext);
         }
@@ -1711,6 +1737,26 @@ public class ToolCallAgent extends ReActAgent {
 
         log.info("拒绝回执已回填：runId={}, step={}, calls={}",
                 ctx.getRunId(), ctx.getCurrentStep(), responses.size());
+    }
+
+    /**
+     * 需要幂等身份的工具名：被 {@link IdempotentToolCallback} 装饰过的那些。
+     *
+     * 从实际装配的工具里推导，而不是维护一份名单——
+     * 名单会和装配分家，分家后要么漏保护、要么把只读工具也拖进身份校验。
+     */
+    private Set<String> idempotentToolNames() {
+        if (availableTools == null || availableTools.length == 0) {
+            return Set.of();
+        }
+
+        Set<String> names = new HashSet<>();
+        for (ToolCallback callback : availableTools) {
+            if (callback instanceof IdempotentToolCallback) {
+                names.add(callback.getToolDefinition().name());
+            }
+        }
+        return names;
     }
 
     private List<AssistantMessage.ToolCall> toToolCalls(ApprovalCheckpoint checkpoint) {

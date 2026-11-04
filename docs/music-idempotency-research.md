@@ -7,6 +7,19 @@
 >
 > 本文只做调研，M2 不实现（`music_tool_idempotency` 只建表，M3 启用）。
 
+> **批次 3B 更新（已实现，取代本文方案 A）**
+>
+> 身份改为 `sha256(userId, runId, step, toolCallId)`，参数只进 `request_hash`。
+> 原因：本文方案 A 用参数做身份，会把"同名同参的两次独立调用"静默合并成一次——
+> 那是两次真实的写操作，不能合并。
+>
+> toolCallId 仍然拿不到（本文第 2 节的结论不变），改为由 `ToolCallPlan` 补齐：
+> 执行前把整轮 `ToolCall` 登记到 ThreadLocal，回调按"工具名 + 声明顺序"认领并比对参数。
+> 实现见 `tools/ToolCallPlan`、`tools/IdempotentToolCallback`、`music/IdempotentWriteExecutor`，
+> 设计口径见 `docs/design/approval-resume.md` §9。
+>
+> 下文的方案 A 与第 4 节冲突分析保留为当时的研究记录，不再代表当前实现。
+
 ---
 
 ## 1. 问题
@@ -89,7 +102,7 @@ call(input, 非空 Map)  → UnsupportedOperationException
 
 ## 3. 替代方案
 
-### 方案 A（已采纳）：`userId + runId + toolName + 规范化参数`
+### 方案 A（**已被 3B 取代**）：`userId + runId + toolName + 规范化参数`
 
 ```
 idempotency_key = sha256(userId | runId | toolName | canonicalJson(args))
