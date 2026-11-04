@@ -11,14 +11,15 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 幂等键派生（纯函数，不启动 Spring、不连库）。
+ * 幂等身份与请求哈希（纯函数，不启动 Spring、不连库）。
  *
- * 三条性质决定这个键能不能用：
- * 1. **稳定**：同样的调用必须算出同样的键，否则幂等失效；
- * 2. **区分**：不同参数 / 不同任务必须算出不同的键，
- *    否则用户隔天说的"加这首歌"会被当成重复请求吞掉；
- * 3. **不依赖格式**：JSON 键顺序、空白、数字写法不能影响结果，
- *    否则同一意图会因为序列化差异被算成两次。
+ * 四条性质决定这套派生能不能用：
+ * 1. **稳定**：同一次逻辑调用跨恢复、跨 epoch 必须算出同一个键；
+ * 2. **区分**：不同用户 / 不同任务 / 不同调用 ID 必须算出不同的键，
+ *    尤其"同名同参、不同 ID"的两次独立调用不能被合并；
+ * 3. **无歧义**：自由文本字段用长度前缀编码，拼接不产生碰撞；
+ * 4. **哈希只做一致性校验**：参数变化不改变身份，但会让请求哈希不同，
+ *    从而在回放时被识别为冲突。
  */
 class IdempotencyKeysTest {
 
@@ -29,145 +30,164 @@ class IdempotencyKeysTest {
 
     private static final String TOOL = "add_songs_to_playlist";
 
+    private static final String CALL_ID = "call-abc-1";
+
+    // ==================== 1. 稳定性 ====================
+
     @Test
-    @DisplayName("同一调用 → 同一键")
+    @DisplayName("同一逻辑调用 → 同一键")
     void sameCallProducesSameKey() {
-        String args = "{\"playlistId\":2001,\"songIds\":[1001,1002]}";
-
         assertEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL, args),
-                IdempotencyKeys.derive(USER, RUN, TOOL, args)
+                IdempotencyKeys.callKey(USER, RUN, 3, CALL_ID),
+                IdempotencyKeys.callKey(USER, RUN, 3, CALL_ID)
         );
     }
 
     @Test
-    @DisplayName("参数 JSON 键顺序不同 → 同一键")
-    void keyOrderDoesNotMatter() {
-        String a = "{\"playlistId\":2001,\"songIds\":[1001]}";
-        String b = "{\"songIds\":[1001],\"playlistId\":2001}";
-
-        assertEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL, a),
-                IdempotencyKeys.derive(USER, RUN, TOOL, b)
-        );
-    }
-
-    @Test
-    @DisplayName("空白与换行不同 → 同一键")
-    void whitespaceDoesNotMatter() {
-        String a = "{\"playlistId\":2001,\"songIds\":[1001]}";
-        String b = "{ \"playlistId\" : 2001 ,\n  \"songIds\" : [ 1001 ] }";
-
-        assertEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL, a),
-                IdempotencyKeys.derive(USER, RUN, TOOL, b)
-        );
-    }
-
-    @Test
-    @DisplayName("数字写法不同（1 / 1.0 / 1e0）→ 同一键")
-    void numberRepresentationIsNormalized() {
-        String a = "{\"limit\":1}";
-        String b = "{\"limit\":1.0}";
-        String c = "{\"limit\":1e0}";
-        String d = "{\"limit\":1.000}";
-
-        String base = IdempotencyKeys.derive(USER, RUN, TOOL, a);
-        assertEquals(base, IdempotencyKeys.derive(USER, RUN, TOOL, b));
-        assertEquals(base, IdempotencyKeys.derive(USER, RUN, TOOL, c));
-        assertEquals(base, IdempotencyKeys.derive(USER, RUN, TOOL, d));
-
-        // 真正不同的小数不能被归一掉。
-        assertNotEquals(base,
-                IdempotencyKeys.derive(USER, RUN, TOOL, "{\"limit\":1.5}"));
-    }
-
-    @Test
-    @DisplayName("数组顺序不同 → 不同键（顺序可能改变语义）")
-    void arrayOrderMatters() {
-        String a = "{\"songIds\":[1001,1002]}";
-        String b = "{\"songIds\":[1002,1001]}";
-
-        assertNotEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL, a),
-                IdempotencyKeys.derive(USER, RUN, TOOL, b),
-                "数组顺序决定 position，不能排序"
-        );
-    }
-
-    @Test
-    @DisplayName("参数不同 → 不同键")
-    void differentArgsProduceDifferentKeys() {
-        assertNotEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL,
-                        "{\"playlistId\":2001,\"songIds\":[1001]}"),
-                IdempotencyKeys.derive(USER, RUN, TOOL,
-                        "{\"playlistId\":2001,\"songIds\":[1002]}")
-        );
-    }
-
-    @Test
-    @DisplayName("不同 runId → 不同键（跨任务不会被回放）")
-    void differentRunProducesDifferentKey() {
-        String args = "{\"playlistId\":2001,\"songIds\":[1001]}";
-
-        assertNotEquals(
-                IdempotencyKeys.derive(USER, RUN, TOOL, args),
-                IdempotencyKeys.derive(USER, UUID.randomUUID(), TOOL, args)
-        );
-    }
-
-    @Test
-    @DisplayName("不同用户 / 不同工具 → 不同键")
-    void userAndToolParticipateInKey() {
-        String args = "{\"playlistId\":2001,\"songIds\":[1001]}";
-        String base = IdempotencyKeys.derive(USER, RUN, TOOL, args);
-
-        assertNotEquals(base,
-                IdempotencyKeys.derive("music-user-2", RUN, TOOL, args));
-        assertNotEquals(base,
-                IdempotencyKeys.derive(USER, RUN, "create_playlist", args));
-    }
-
-    @Test
-    @DisplayName("无参数工具：null 与 {} 等价")
-    void nullArgsEqualEmptyObject() {
-        assertEquals(
-                IdempotencyKeys.derive(USER, RUN, "get_user_playlists", null),
-                IdempotencyKeys.derive(USER, RUN, "get_user_playlists", "{}")
-        );
-        assertEquals(
-                IdempotencyKeys.derive(USER, RUN, "get_user_playlists", "  "),
-                IdempotencyKeys.derive(USER, RUN, "get_user_playlists", "{}")
-        );
-    }
-
-    @Test
-    @DisplayName("键是 64 位小写十六进制")
-    void keyIsSha256Hex() {
-        String key = IdempotencyKeys.derive(USER, RUN, TOOL, "{}");
-
-        assertEquals(64, key.length());
+    @DisplayName("键是 64 位十六进制 sha256，可直接存 VARCHAR(128)")
+    void keyShapeIsStable() {
+        String key = IdempotencyKeys.callKey(USER, RUN, 3, CALL_ID);
+        assertEquals(64, key.length(), "sha256 十六进制长度");
         assertTrue(key.matches("[0-9a-f]{64}"), key);
     }
 
+    // ==================== 2. 区分 ====================
+
     @Test
-    @DisplayName("缺少必填要素 → 抛异常（不静默生成一个可能碰撞的键）")
-    void missingInputsAreRejected() {
-        assertThrows(IllegalArgumentException.class,
-                () -> IdempotencyKeys.derive(null, RUN, TOOL, "{}"));
-        assertThrows(IllegalArgumentException.class,
-                () -> IdempotencyKeys.derive("  ", RUN, TOOL, "{}"));
-        assertThrows(IllegalArgumentException.class,
-                () -> IdempotencyKeys.derive(USER, null, TOOL, "{}"));
-        assertThrows(IllegalArgumentException.class,
-                () -> IdempotencyKeys.derive(USER, RUN, "", "{}"));
+    @DisplayName("同名同参、不同调用 ID → 不同的键（不能被合并）")
+    void differentCallIdsNeverMerge() {
+        assertNotEquals(
+                IdempotencyKeys.callKey(USER, RUN, 3, "call-1"),
+                IdempotencyKeys.callKey(USER, RUN, 3, "call-2")
+        );
     }
 
     @Test
-    @DisplayName("参数不是合法 JSON → 抛异常（不回退成原始字符串）")
-    void malformedArgsAreRejected() {
+    @DisplayName("不同步号 → 不同的键（模型跨轮复用同一个 ID 时靠它分开）")
+    void differentStepProducesDifferentKey() {
+        assertNotEquals(
+                IdempotencyKeys.callKey(USER, RUN, 1, CALL_ID),
+                IdempotencyKeys.callKey(USER, RUN, 2, CALL_ID)
+        );
+    }
+
+    @Test
+    @DisplayName("不同任务 → 不同的键（用户隔天再说一次会真的执行）")
+    void differentRunProducesDifferentKey() {
+        assertNotEquals(
+                IdempotencyKeys.callKey(USER, RUN, 1, CALL_ID),
+                IdempotencyKeys.callKey(USER, UUID.randomUUID(), 1, CALL_ID)
+        );
+    }
+
+    @Test
+    @DisplayName("不同用户 → 不同的键")
+    void differentUserProducesDifferentKey() {
+        assertNotEquals(
+                IdempotencyKeys.callKey(USER, RUN, 1, CALL_ID),
+                IdempotencyKeys.callKey("music-user-2", RUN, 1, CALL_ID)
+        );
+    }
+
+    // ==================== 3. 编码无歧义 ====================
+
+    @Test
+    @DisplayName("长度前缀消除拼接歧义：(ab,c) 与 (a,bc) 不得碰撞")
+    void lengthPrefixAvoidsAmbiguity() {
+        assertNotEquals(
+                IdempotencyKeys.callKey("ab", RUN, 1, "c"),
+                IdempotencyKeys.callKey("a", RUN, 1, "bc")
+        );
+    }
+
+    @Test
+    @DisplayName("含分隔符的自由文本也不会串味")
+    void separatorCharactersAreSafe() {
+        assertNotEquals(
+                IdempotencyKeys.callKey("u|1", RUN, 1, CALL_ID),
+                IdempotencyKeys.callKey("u", RUN, 1, "1|" + CALL_ID)
+        );
+    }
+
+    // ==================== 4. 请求哈希 ====================
+
+    @Test
+    @DisplayName("参数 JSON 键顺序不同 → 同一请求哈希")
+    void keyOrderDoesNotMatterForRequestHash() {
+        assertEquals(
+                IdempotencyKeys.requestHash(TOOL, "{\"playlistId\":2001,\"songIds\":[1001]}"),
+                IdempotencyKeys.requestHash(TOOL, "{\"songIds\":[1001],\"playlistId\":2001}")
+        );
+    }
+
+    @Test
+    @DisplayName("空白与数字写法不同 → 同一请求哈希")
+    void formattingDoesNotMatterForRequestHash() {
+        String base = IdempotencyKeys.requestHash(TOOL, "{\"limit\":1,\"x\":[1,2]}");
+
+        assertEquals(base, IdempotencyKeys.requestHash(
+                TOOL, "{ \"limit\" : 1 ,\n  \"x\" : [ 1 , 2 ] }"));
+        assertEquals(base, IdempotencyKeys.requestHash(
+                TOOL, "{\"limit\":1.0,\"x\":[1,2]}"));
+        assertEquals(base, IdempotencyKeys.requestHash(
+                TOOL, "{\"limit\":1e0,\"x\":[1,2]}"));
+    }
+
+    @Test
+    @DisplayName("数组顺序不同 → 不同请求哈希（顺序可能改变语义）")
+    void arrayOrderMatters() {
+        assertNotEquals(
+                IdempotencyKeys.requestHash(TOOL, "{\"songIds\":[1001,1002]}"),
+                IdempotencyKeys.requestHash(TOOL, "{\"songIds\":[1002,1001]}")
+        );
+    }
+
+    @Test
+    @DisplayName("参数不同 / 工具名不同 → 不同请求哈希")
+    void differentRequestProducesDifferentHash() {
+        String base = IdempotencyKeys.requestHash(TOOL, "{\"playlistId\":2001}");
+
+        assertNotEquals(base,
+                IdempotencyKeys.requestHash(TOOL, "{\"playlistId\":2002}"));
+        assertNotEquals(base,
+                IdempotencyKeys.requestHash("create_playlist", "{\"playlistId\":2001}"));
+    }
+
+    @Test
+    @DisplayName("null / 空白参数按 {} 处理")
+    void nullArgumentsTreatedAsEmptyObject() {
+        String empty = IdempotencyKeys.requestHash(TOOL, "{}");
+
+        assertEquals(empty, IdempotencyKeys.requestHash(TOOL, null));
+        assertEquals(empty, IdempotencyKeys.requestHash(TOOL, "   "));
+    }
+
+    // ==================== 5. 失败关闭 ====================
+
+    @Test
+    @DisplayName("缺少关键输入 → 直接抛异常，不产出'半个键'")
+    void missingInputsAreRejected() {
         assertThrows(IllegalArgumentException.class,
-                () -> IdempotencyKeys.derive(USER, RUN, TOOL, "{not json"));
+                () -> IdempotencyKeys.callKey(null, RUN, 1, CALL_ID));
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.callKey("  ", RUN, 1, CALL_ID));
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.callKey(USER, null, 1, CALL_ID));
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.callKey(USER, RUN, 1, ""));
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.callKey(USER, RUN, 1, "   "));
+
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.requestHash(null, "{}"));
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.requestHash("  ", "{}"));
+    }
+
+    @Test
+    @DisplayName("参数不是合法 JSON → 抛异常，不回退成原始字符串")
+    void invalidJsonIsRejected() {
+        assertThrows(IllegalArgumentException.class,
+                () -> IdempotencyKeys.requestHash(TOOL, "{not json"));
     }
 }

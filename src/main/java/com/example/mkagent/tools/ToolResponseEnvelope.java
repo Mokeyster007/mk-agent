@@ -146,6 +146,65 @@ public final class ToolResponseEnvelope {
     }
 
     /**
+     * 判断一个工具返回值是否是**成功**信封。
+     *
+     * 幂等执行器只缓存成功结果：失败信封（ok=false）不能变成可回放的历史结果，
+     * 否则一次"歌单重名"的失败会被永久当成这次调用的答案。
+     *
+     * 兼容两种形态：直接是信封 JSON，或（MethodToolCallback 把 String 返回值
+     * 再序列化后的）带引号的 JSON 字符串。解析不了按"不是成功"处理——失败关闭。
+     */
+    public static boolean isSuccess(String resultJson) {
+        JsonNode root = parseEnvelope(resultJson);
+        return root != null
+                && root.get("ok") != null
+                && root.get("ok").isBoolean()
+                && root.get("ok").booleanValue();
+    }
+
+    /**
+     * 从工具结果里取歌单 ID（没有就返回 null）。
+     *
+     * 幂等回放要按"当前访问规则"复核资源归属，先得知道结果涉及哪个歌单。
+     */
+    public static Long playlistIdOf(String resultJson) {
+        JsonNode root = parseEnvelope(resultJson);
+        if (root == null) {
+            return null;
+        }
+
+        JsonNode data = root.get("data");
+        if (data == null || !data.isObject()) {
+            return null;
+        }
+
+        JsonNode playlistId = data.get("playlistId");
+        if (playlistId == null || !playlistId.isNumber()) {
+            return null;
+        }
+        return playlistId.asLong();
+    }
+
+    /**
+     * 解析信封；无法解析或不是对象时返回 null（调用方按失败处理）。
+     */
+    private static JsonNode parseEnvelope(String resultJson) {
+        if (resultJson == null || resultJson.isBlank()) {
+            return null;
+        }
+
+        try {
+            JsonNode node = MAPPER.readTree(resultJson);
+            if (node != null && node.isTextual()) {
+                node = MAPPER.readTree(node.asText());
+            }
+            return node != null && node.isObject() ? node : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
      * 序列化信封。count 取实际返回的条目数（截断后就是"实际给了几条"）。
      */
     private static String render(Object data, boolean truncated, String hint) {

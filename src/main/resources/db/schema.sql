@@ -310,6 +310,22 @@ CREATE TABLE IF NOT EXISTS music_tool_idempotency
     CONSTRAINT pk_music_tool_idempotency PRIMARY KEY (user_id, idempotency_key)
 );
 
+-- =============================================================
+-- music_tool_idempotency 增量升级（批次 3，幂等）：
+--
+-- 1. 身份判定只看 idempotency_key，请求一致性只看 request_hash，
+--    run_id / step / tool_call_id 只是**排查字段**，不能替代前两者；
+-- 2. tool_call_id 由模型给出，长度不可控，且**截断会改变身份**，
+--    因此用 TEXT 而不是 VARCHAR(n)；
+-- 3. 不新增 status 列：占位行与业务写入、成功结果在同一事务提交，
+--    "行存在"即"业务已提交且结果可回放"，没有中间态可表达。
+-- =============================================================
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS run_id VARCHAR(64);
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS step INT;
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+ALTER TABLE music_tool_idempotency
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
 COMMENT ON TABLE music_song IS '曲库（虚构种子数据，不含真实版权内容）';
 COMMENT ON COLUMN music_song.duration_seconds IS '时长（秒）';
 COMMENT ON COLUMN music_song.release_year IS '发行年份';
