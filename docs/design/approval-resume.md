@@ -1,7 +1,8 @@
 # 审批暂停与恢复（M3）设计
 
-> 状态：批次 1 已实现，批次 2–4 待实现。
+> 状态：批次 1、2、3B、4B 已实现；白名单开放与提示词调整未做（另开批次，见 §14）。
 > 范围：`create_playlist`、`add_songs_to_playlist` 两个写工具；单实例；只恢复"审批暂停点"，不恢复任意步骤。
+> 启动收尾（§14）**默认关闭**，且以"当前进程独占该数据库"为启用前提——系统不提供跨进程单实例保证。
 
 ## 1. 目标与非目标
 
@@ -56,9 +57,9 @@ stateDiagram-v2
 
 | resume_state | 含义 | run.state | 崩溃后处理 |
 |---|---|---|---|
-| `PENDING_RESUME` | 决定已持久化，**待领取** | `WAITING_APPROVAL` | 扫描/`POST /resume` 重新领取 |
-| `CLAIMED` | 已领取执行权（锁 + 许可 + epoch），**尚未提交执行** | `RUNNING`（新 epoch） | 进程重启：可安全回退到 `PENDING_RESUME`（任务线程从未启动，不可能写业务数据）——**该回退由批次 4 的扫描器实现，本批只有手动 `/resume` 与补偿路径** |
-| `RUNNING` | 已启动（任务线程已开始执行） | `RUNNING`（新 epoch） | 进程重启：`FAILED` + `PROCESS_RESTART`（可能已写，不自动恢复） |
+| `PENDING_RESUME` | 决定已持久化，**待领取** | `WAITING_APPROVAL` | 不动它（正常等待）；用户手动 `/resume` 领取 |
+| `CLAIMED` | 已领取执行权（锁 + 许可 + epoch），**尚未提交执行** | `RUNNING`（新 epoch） | 进程重启：启动收尾（§14）退回 `PENDING_RESUME`，**不自动重执行**，等用户手动 `/resume`。依据：任务体第一句才是 `markStarted`，此刻线程从未开始执行，不可能写业务数据 |
+| `RUNNING` | 已启动（任务线程已开始执行） | `RUNNING`（新 epoch） | 进程重启：`FAILED` + `PROCESS_RESTART`（可能已写，不自动恢复），由启动收尾（§14）执行 |
 | `FINISHED` / `FAILED` | 执行结束 | 终态 | 不再处理 |
 
 **关键约束**：approve 事务**不**把 run 改成 `RUNNING`。决定持久化后 run 仍是 `WAITING_APPROVAL`，直到领取成功才 CAS 到 `RUNNING`。
@@ -74,6 +75,8 @@ stateDiagram-v2
 | 未批准绝不写业务表 | 拦截点在 `executeToolCalls` 之前 |
 | 批准不可替换工具/参数 | 接口只收 `approvalId`；执行只读检查点 |
 | 旧代次不得覆盖新代次 | 所有执行期写库带 `execution_epoch` 条件 |
+| 终态不得被另一个终态覆盖 | `recordFinish` 的终态谓词（§5.5）：只允许"非终态 → 任意终态"或"终态 → 同一终态" |
+| 同一 run 同一时刻最多一条未结束审批 | **不是** `UNIQUE (run_id, step)` 保证的（它只管同一 step）。真正的强制点是"暂停必须先赢 `run.state='RUNNING' AND execution_epoch=?` 的 CAS"+"`markStarted` 是任务体第一条写"；详见 §14.9 |
 
 ## 3. 表结构
 
@@ -147,11 +150,20 @@ CREATE TABLE IF NOT EXISTS agent_checkpoint
 );
 ```
 
-### 3.4 `music_tool_idempotency`（批次 3 使用）
+### 3.4 `music_tool_idempotency`（批次 3 已实现）
 
 ```sql
-ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'DONE';
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS run_id VARCHAR(64);
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS step INT;
+ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+ALTER TABLE music_tool_idempotency
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
 ```
+
+**没有 `status` 列，而且是有意不加**：占位行、业务写入、成功结果在**同一事务**提交，
+"行存在"即"业务已提交且结果可回放"，中间态不可表达（理由见 §9.4）。
+早期草案里的 `ADD COLUMN status VARCHAR(16) DEFAULT 'DONE'` 是**废弃方案**，不要按它实现。
+`tool_call_id` 用 `TEXT`：它由模型给出、长度不可控，而**截断会改变幂等身份**。
 
 ## 4. 检查点
 
@@ -267,11 +279,14 @@ POST /resume（或 approve/reject 内部）
   两步在**同一事务**：第一步 0 行直接返回；第一步成功而第二步 0 行时，
   只有"run 已是 `WAITING_APPROVAL` 且代次仍是本次代次"（别人已补偿，等价目标状态）按幂等接受，
   其余情况抛异常回滚第一步，绝不提交"审批退回、run 没退"的半截补偿。
-- 崩溃在 `CLAIMED`：本批**不**自动重领（避免与仍在执行的领取者并行），
+- 崩溃在 `CLAIMED`：`/resume` **不**自动重领（避免与仍在执行的领取者并行），
   `requireResumable` 对"`CLAIMED`/`RUNNING` 且没有活跃句柄"一律返回
-  `409 RESUME_IN_PROGRESS`——**期限内与期限后都一样**，不猜、不自动改状态；
-  自动重领与超期收尾留给批次 4 的扫描器。
-- 崩溃在 `RUNNING`：由批次 4 的扫描器按 `PROCESS_RESTART` 收尾。
+  `409 RESUME_IN_PROGRESS`——**期限内与期限后都一样**，不猜、不自动改状态。
+  重启后的回退由**启动收尾 R1**（§14）完成：退到 `PENDING_RESUME` 后仍需用户手动 `/resume`，
+  **不会**自动重执行。
+- 崩溃在 `RUNNING`：由启动收尾 R3（§14）按 `PROCESS_RESTART` 收尾。
+- **不实现主动过期扫描（R2）**：审批过期仍只在 `/resume` 等入口按 `expires_at` 判定，
+  启动收尾不遍历 `PENDING` 做超期判定，避免同一份"过期"语义出现两个实现。
 
 ### 5.3 reject / cancel / 过期
 
@@ -311,8 +326,25 @@ POST /resume（或 approve/reject 内部）
 | `recordStart` | 无（INSERT） | 首次建行，`execution_epoch=0`、`active_elapsed_millis=0`、`approval_count=0` |
 | `recordProgress` | `run_id` + `execution_epoch`，且 `ctx.state != WAITING_APPROVAL` | 暂停行由 `recordPause` 与检查点同事务写；进度写入抢在前面会留下"等待审批但没有审批记录"的坏行 |
 | `recordPause` | `run_id` + `state='RUNNING'` + `execution_epoch` | 唯一需要"必须是 RUNNING"的路径：暂停的前提是任务正在跑 |
-| `recordFinish` | `run_id` + `execution_epoch`，且 `ctx.state != WAITING_APPROVAL` | 不要求 `RUNNING`：正常完成/失败/取消/超时都要能写进去 |
+| `recordFinish` | `run_id` + `execution_epoch` + `ctx.state != WAITING_APPROVAL` + **（库里不是终态 或 库里终态 == `ctx.state`）** | 不要求 `RUNNING`：正常完成/失败/取消/超时都要能写进去；终态只允许被**同一个终态**重写 |
 | 领取恢复（批次 2） | `approval.resume_state='PENDING_RESUME'` + `run.state='WAITING_APPROVAL'` | 两条 CAS 在同一事务里，任一失败即整体回滚 |
+| 启动收尾 R1（批次 4B） | `approval.resume_state='CLAIMED' AND claimed_epoch=?` + `run.state='RUNNING' AND execution_epoch=?` | 先审批后 run；0 行时按三值结果区分"别人已回收 / 不属于本次" |
+| 启动收尾 R3（批次 4B） | `run.state='RUNNING' AND execution_epoch=?`，再 `approval.resume_state='RUNNING' AND claimed_epoch=?` | 先 run 后审批，与 `complete` 同序 |
+
+**为什么 `recordFinish` 多了"终态"这一项（批次 4B 核验后修正）**：启动收尾 R3 会在**另一个线程**里、
+用**同一个 epoch** 把 `RUNNING` 写成 `FAILED + PROCESS_RESTART`。旧执行者随后收尾时，
+`run_id + execution_epoch` 两个条件**仍然成立**——只靠代次挡不住它，会把 `FAILED` 覆盖成 `SUCCEEDED`，
+即"库里有终态、客户端却收到成功"。修正只加了一个谓词：
+
+| 库里的状态 | `ctx.state` | 结果 |
+|---|---|---|
+| `RUNNING` | 任意终态 | 1 行（正常完成/失败/取消/超时都不受影响） |
+| 终态 | 同一个终态 | 1 行（重复收尾是合法幂等） |
+| 终态 | 另一个终态 | **0 行**（拒绝覆盖） |
+
+终态集合由 `AgentState.isTerminal()` 推导，不手写枚举，避免以后加状态时漏改。
+`complete()` 返回该行数是否命中；`persistTerminal` 把它原样返回给调用方，
+**0 行时不发 `final_answer` / `done`，`finally` 也不再补一次伪造的完成**。
 
 旧代次不能覆盖新代次靠 `execution_epoch` 相等实现：恢复后 epoch+1，
 上一代线程迟到的写入影响 0 行。
@@ -382,8 +414,20 @@ POST /resume（或 approve/reject 内部）
 2. 发一条脱敏 error："执行结果未能保存，请稍后查询任务状态。"
 3. emitter.complete()
 4. finally 再试一次 persistTerminal；仍失败则保持 run=RUNNING、审批=RUNNING，
-   由批次 4 的扫描器按启动期限 / PROCESS_RESTART 收尾
+   由启动收尾（§14）按启动期限 / PROCESS_RESTART 收尾
 ```
+
+**"写入未命中"不是"写入失败"**，两者对事件的影响相同但原因不同，不能混为一谈：
+
+| 情况 | 判定方式 | 是否发成功事件 | 是否需要重试 |
+|---|---|---|---|
+| 异常（连接断、约束错） | `catch (RuntimeException)` | 否 | `finally` 再试一次 |
+| 0 行：终态已被别人写（启动收尾判中断 / 新代次接管） | `complete()` 返回 `false` | **否** | **不重试**：这是条件更新的确定性结果 |
+| 0 行：`ctx.state == WAITING_APPROVAL` | `recordFinishStrict` 直接返回 0 | 否（本来就不该写） | 不重试 |
+| 1 行 | 行数 = 1 | 是 | — |
+
+0 行时**不重置** `persisted` 标记，`finally` 因此不会"补写"出一个库里不存在的完成；
+否则就会出现"客户端看到成功、`agent_run` 却是 `FAILED`"的假完成。
 
 再次暂停（恢复后又命中写工具）的真实顺序：
 
@@ -401,7 +445,7 @@ POST /resume（或 approve/reject 内部）
 四条约束：
 
 1. **不允许出现"审批 FINISHED、run 未终态"的提交结果**：两条写入同事务，要么都生效要么都不生效。
-   提交失败时 run 仍是 `RUNNING`、审批仍是 `RUNNING`，由批次 4 的扫描器收尾，
+   提交失败时 run 仍是 `RUNNING`、审批仍是 `RUNNING`，由启动收尾（§14）按 `PROCESS_RESTART` 收尾，
    不会出现"看起来完成了、其实没落库"的假完成。
 2. **不允许静默提交"run 终态、审批未收尾"**：`finish` 的 0 行只有"已是 FINISHED"可按幂等接受，
    其余一律回滚整个事务。
@@ -451,7 +495,7 @@ SSE emitter 超时 = **剩余执行时间 + buffer**（不是原始总超时）�
 | 无关 Bean 取类型失败 | 只记 WARN，不阻断启动（这类 Bean 不会被执行，不需要审批元数据） |
 | Agent 暴露了扫不到的工具 | **失败关闭**：`verifyExposedTools` 抛异常 → `error_code=APPROVAL_POLICY_INCOMPLETE`，绝不按普通工具执行 |
 | 扫描未完成就查询名单 | **失败关闭**：抛异常，不返回空集合（空集合等于"没有工具需要审批"） |
-| 生产白名单 | 写工具仍不在任何生产 Agent 的工具列表里；批次 4 才开放 |
+| 生产白名单 | 写工具仍不在任何生产 Agent 的工具列表里；开放白名单是**独立批次**的事（§14.7），不在启动收尾批次里做 |
 
 验证用两条独立链路（缺一即可能失败放行）：
 
@@ -467,12 +511,27 @@ SSE emitter 超时 = **剩余执行时间 + buffer**（不是原始总超时）�
 | 窗口 | 崩溃后 DB | 处理 |
 |---|---|---|
 | A. 暂停已提交，未释放许可 | `PENDING` + `WAITING_APPROVAL`，epoch=E | 进程内锁/注册表为空，approve 直接领取 |
-| B. 决定已提交，未领取 | `APPROVED` + `PENDING_RESUME` + `WAITING_APPROVAL` | 扫描/`POST /resume` 领取；**不会**被判 `FAILED` |
-| C. 已领取，未提交执行 | `APPROVED` + `CLAIMED` + `RUNNING` epoch=E+1 | 启动扫描回退 `PENDING_RESUME` 并重试（线程从未启动，无业务写入） |
-| D. 已启动，工具执行中崩溃 | `APPROVED` + `RUNNING` + `RUNNING` | `FAILED` + `PROCESS_RESTART`；查询结果提示"操作可能已生效，请先核对" |
-| E. 业务已提交，检查点未更新 | 同 D | 同 D；不承诺新 run 重试一定不重复 |
+| B. 决定已提交，未领取 | `APPROVED` + `PENDING_RESUME` + `WAITING_APPROVAL` | `POST /resume` 领取；**不会**被判 `FAILED`；启动收尾也不碰它 |
+| C. 已领取，未提交执行 | `APPROVED` + `CLAIMED` + `RUNNING` epoch=E+1 | 启动收尾 **R1**：退回 `PENDING_RESUME`，`claimed_epoch` 清空，**不自动重执行**，等用户手动 `/resume`。依据：任务体第一句才是 `markStarted`，线程从未启动，无业务写入 |
+| D. 已启动，工具执行中崩溃 | `APPROVED` + `RUNNING` + `RUNNING` | 启动收尾 **R3**：`FAILED` + `PROCESS_RESTART`，审批进 `FAILED`；查询结果提示"执行被进程重启中断，此前已提交的操作可能仍然有效，请核对" |
+| E. 业务已提交，检查点未更新 | 同 D | 同 D；**不承诺**历史副作用不存在，也不承诺新 run 重试一定不重复 |
 | F. 暂停事务半提交 | 不可能（单事务） | 若 `WAITING_APPROVAL` 但 approval 缺失 → `CHECKPOINT_CORRUPT` + `FAILED` |
 | G. 配置版本不符 | `WAITING_APPROVAL` + 旧版本 | `409 CHECKPOINT_CONFIG_MISMATCH`；approval `INVALIDATED`；run `FAILED` |
+
+**"回退"不等于"重试"**：窗口 C 只把记录退回到"待用户决定"的位置，
+不重新领取、不自动执行。自动重试会把"用户批准过的一次执行"变成"系统自己又跑了一次"，
+而批准绑定的是暂停那一刻的参数与配置版本，重启后是否仍然成立不该由系统替用户判断。
+
+**窗口 C 的两个竞争**（R1 与 `markStarted` 谁先）都必须给出确定结果，不允许"看起来对"：
+
+| 顺序 | 结果 |
+|---|---|
+| R1 先命中 | 审批 `PENDING_RESUME`（`claimed_epoch` 空），run `WAITING_APPROVAL`；旧执行者的 `markStarted` 随后 0 行，不会启动任何执行 |
+| `markStarted` 先命中 | 审批 `RUNNING`，R1 的条件不再成立（0 行）；若本进程无句柄，则由 R3 按中断收尾——**不是**退回等待，而是明确判失败 |
+| 两者都没命中（新代次已接管） | 一律跳过并计入摘要，不改任何行 |
+
+R1 **不撤销用户决定**：`status` 仍是 `APPROVED`/`REJECTED`，`decided_at` 不变，
+检查点不删不改，代次不回退。它只把"执行权"退回未领取状态。
 
 ## 9. 幂等（批次 3B：同库音乐写工具）
 
@@ -605,7 +664,7 @@ TX: SET LOCAL lock_timeout（仅 PG，事务级）
 
 - 不自动换新身份重试，不清除记录后重执行；
 - 同一稳定身份再次合法到达时，由记录裁决是否回放；
-- 本批不实现扫描器，也不自动重领卡住的 `RUNNING` 审批。
+- 本批不自动重领卡住的 `RUNNING` 审批；重启后的收尾只发生在**启动时**（§14），不做周期扫描。
 
 ### 9.10 验证方式
 
@@ -668,7 +727,7 @@ TX: SET LOCAL lock_timeout（仅 PG，事务级）
 | 10 | 过期 | `FAILED` + `APPROVAL_EXPIRED` |
 | 11 | 配置版本不符 | `INVALIDATED`；不执行 pending round |
 | 12 | 幂等重放/冲突/回滚 | 一次写入；回滚后两表都干净 |
-| 13 | 崩溃窗口 B/C/D | B 可续跑；C 回退重试；D 标 `PROCESS_RESTART` |
+| 13 | 崩溃窗口 B/C/D | B 可续跑；C 回退 `PENDING_RESUME` 且**不自动重执行**；D 标 `PROCESS_RESTART` |
 | 14 | 旧句柄 | 旧代次 remove/finish 不影响新代次 |
 | 15 | 审批次数上限 | 达上限不再暂停 |
 | 16 | 摘要脱敏 | 无参数原文/密钥；控制字符折叠 |
@@ -688,6 +747,18 @@ TX: SET LOCAL lock_timeout（仅 PG，事务级）
 | 30 | 再次暂停 | 旧审批 `FINISHED`、新审批 `PENDING`、run 仍 `WAITING_APPROVAL`；第二轮可继续走完 |
 | 31 | 审批次数触顶 | `FAILED` + `APPROVAL_LIMIT_REACHED`；不建新审批；第二轮不执行 |
 | 32 | 续流断开 | 客户端断开后任务仍 `SUCCEEDED` 且结果可查；普通入口语义不变 |
+| 33 | 启动收尾 R1 | `CLAIMED` → `PENDING_RESUME`；`status`/`decided_at`/代次/检查点不变 |
+| 34 | R1 与启动门禁竞争 | `markStarted` 先赢 → 不回收；R1 先赢 → `markStarted` 0 行、零执行 |
+| 35 | 启动收尾 R3 | `FAILED` + `PROCESS_RESTART` + `finished_at`；审批进 `FAILED`；业务表/幂等记录/检查点不变 |
+| 36 | 正常等待与终态 | `PENDING`/`PENDING_RESUME`/已终态行零变更 |
+| 37 | 终态不被覆盖（G7） | 扫描先赢 → 旧执行终态写入 0 行；正常完成 → 扫描不覆盖 |
+| 38 | 未命中不发成功事件 | 无 `FINAL_ANSWER`/`DONE`；库内状态不变；`finally` 不补写 |
+| 39 | 单行失败回滚 | 注入数据库异常 → 该行整体回滚（`RUNNING` 保持、`finished_at` 空），前一行结果保留，摘要 `TRANSIENT_FAILURES` 且未完成 |
+| 40 | 两个收尾者 | 并发各扫一遍 → 单次效果 |
+| 41 | 游标与预算 | 坏记录不占满批次；预算耗尽 → `BUDGET_OR_LIMIT_EXHAUSTED`、门禁不开 |
+| 42 | 启动门禁覆盖真实入口 | 建任务/审批/恢复/取消 → 503 且**零写入**；扫描完成后正常；关闭时行为不变 |
+| 43 | 收尾零调用 | 扫描全程零模型调用、零工具调用 |
+| 44 | 查询暴露原因码 | `error_code` 映射到 `AgentRunVO.errorCode`；响应字段集合 = 原字段 + `errorCode`（不删不改名） |
 
 ## 13. 实现批次
 
@@ -695,5 +766,276 @@ TX: SET LOCAL lock_timeout（仅 PG，事务级）
 |---|---|---|
 | 1 | `WAITING_APPROVAL`、检查点 DTO/编解码、计时与预算快照、epoch/句柄保护、暂停事务与 `recordPause`、审批摘要、暂停 SSE 出口 | **已实现** |
 | 2 | approve/reject/resume 接口、条件更新、领取与代次、续流、查询接口、cancel 扩展 | **已实现** |
-| 3 | 幂等执行器、`status` 列、并发/回滚/代理测试、PG 隔离验证 | 待实现 |
-| 4 | 白名单开放、`WriteToolGuardTest` 调整、提示词、启动扫描与 30s 扫描、文档与手动复测 | 待实现 |
+| 3 | 幂等执行器、并发/回滚/代理测试、H2 真实事务验证、PG 隔离探针（6 条 `pg` 用例实际执行） | **已实现（3B）**；幂等表**不加** `status` 列（§3.4） |
+| 4 | 启动收尾 R1/R3、启动门禁、终态覆盖修正（G7）、文档同步 | **已实现（4B）**，见 §14；PG 锁等待、阻塞 UPDATE 重新求值、真实 Spring 事务收尾均已在隔离 PG 16.2 上实测（§14.8） |
+| 5 | 写工具白名单开放、`WriteToolGuardTest` 调整、提示词、手动复测 | 待实现（独立批次，与收尾无关） |
+
+## 14. 启动收尾（批次 4B）
+
+### 14.1 范围与默认值
+
+只做两件事，**默认关闭**：
+
+| 配置 | 默认 | 含义 |
+|---|---|---|
+| `mkagent.approval.recovery-enabled` | `false` | 总开关。关闭时不扫描、门禁不生效，行为与批次 2/3B 完全一致 |
+| `mkagent.approval.recovery-batch-size` | `50` | 每批取多少行 |
+| `mkagent.approval.recovery-max-rows` | `200` | 单次启动最多处理多少行（硬上限） |
+| `mkagent.approval.recovery-max-duration` | `10s` | 单次启动墙钟上限 |
+| `mkagent.approval.recovery-lock-timeout` | `2s` | 单行事务的锁等待上限（仅 PG 生效） |
+
+不做：**周期扫描**（没有 `@EnableScheduling`、没有 30s 任务）、**R2 主动过期扫描**、
+**自动重执行**、**新管理端点**、**分布式租约**、**数据库全局锁**。
+
+### 14.2 启用前提（是部署约定，不是系统保证）
+
+`recovery-enabled=true` 意味着运维**声明**：旧进程已退出，当前进程**独占**该数据库，
+并且不会再有一个旧实例连同一个库。
+
+系统**不提供**跨进程单实例保证：没有 owner 字段、没有心跳、没有租约、没有 `SKIP LOCKED` 抢占。
+进程内的 `AgentTaskRegistry` 只能证明"本进程没有该 run 的句柄"，**不能**证明别的进程没有。因此：
+
+- 启用**不等于**证明其他实例已死；
+- 多实例部署、"滚动发布新旧并存"期间必须保持关闭；
+- 关闭时的行为是"什么都不做"：残留记录停在 `CLAIMED`/`RUNNING`，由人工或下次单实例启动处理。
+
+### 14.3 启动门禁
+
+只靠"查询时注册表里没有句柄"不成立——查询与扫描之间可以插进一次新执行。
+门禁是**前置条件**，注册表检查只是第二道保险。
+
+| 项 | 实现 |
+|---|---|
+| 状态 | 单例 `RecoveryGate`，一个 `AtomicReference<State>`：`CLOSED` / `OPEN` |
+| 初始值 | 开启恢复时**构造即 `CLOSED`**——Web 端口开始接受请求之前就已生效，没有"启动瞬间的缝" |
+| 关闭时 | 构造即 `OPEN`，`requireOpen()` 直接返回，行为与批次 2/3B 一致 |
+| 拒绝方式 | `BusinessException(503, "RECOVERY_IN_PROGRESS", 固定文案)` |
+| 放行时机 | 启动 runner 仅在 `summary.completed() == true` 时 `open()` |
+
+被拒的入口（都在**服务 / Agent 层**，不只是 Controller）：
+
+| 入口 | 拦截点 | 为什么在这里 |
+|---|---|---|
+| 创建任务（同步 / 异步） | `BaseAgent.run` / `runStream` 开头 | 覆盖 Controller 之外的调用方（内部 runner、测试、未来的定时任务） |
+| approve / reject | `ApprovalDecisionService.decide` **第一条语句** | 必须在写决定**之前**拒绝，否则会留下"决定已落库、执行起不来"的半截状态 |
+| cancel（暂停任务） | `ApprovalDecisionService.cancel` 第一条语句 | 同上 |
+| `/resume` | `ApprovalResumeService.resume` 开头（先于归属校验） | 领取会推进 epoch，属于"改变待扫描状态" |
+| 取消运行中的任务 | `AgentTaskCanceller.cancel` 第一条语句 | 会把 run 改成 `CANCELLED`，同样是待扫描状态 |
+
+不被拒的：查询（`GET /runs/{id}`、`GET /approvals/{id}`）、健康检查、静态资源。
+扫描期间它们读到的就是"收尾前的真实状态"，不需要假装可用。
+
+**Spring readiness 不能替代门禁**：就绪探针只影响是否被摘流，
+挡不住已经在进程内的调用方，也挡不住 `ApplicationRunner` 之前的请求。
+
+### 14.4 R1：`CLAIMED` → `PENDING_RESUME`
+
+条件（同一事务）：approval `resume_state='CLAIMED' AND claimed_epoch=?`，
+run `state='RUNNING' AND execution_epoch=?`。
+
+| 规则 | 说明 |
+|---|---|
+| 匹配同一次 run + 审批 + 领取代次 | 三者都对上才动手 |
+| 只改执行子状态 | approval → `PENDING_RESUME` 并清空 `claimed_epoch`；run → `WAITING_APPROVAL` |
+| 不动用户决定 | `status`、`decided_at`、`args_hash`、`summary_*` 全不变；`APPROVED`/`REJECTED` 不会被撤销或改写 |
+| 不动检查点 | `agent_checkpoint` 一行不删、一列不改 |
+| 不回退代次 | 领取时已 +1，回退会让旧代次迟到的写入重新生效 |
+| 不自动重执行 | 回到 `PENDING_RESUME` 后仍需用户手动 `/resume` |
+| `markStarted` 先赢 | 审批已是 `RUNNING`，R1 的 0 行是**正确结果**：已开始的执行不能被"退回等待" |
+| R1 先赢 | 旧执行者的 `markStarted` 随后 0 行，不会启动任何执行 |
+| 0 行不等于一致 | 用三值结果 `RECLAIMED` / `ALREADY_RECLAIMED` / `NOT_CLAIMED` 区分，不从行数推断"状态已一致" |
+
+### 14.5 R3：`RUNNING` 且无本进程句柄 → 中断收尾
+
+条件（同一事务）：run `state='RUNNING' AND execution_epoch=?`；
+对应审批（若有）`resume_state='RUNNING' AND claimed_epoch=?`。
+
+| 规则 | 说明 |
+|---|---|
+| 先 run 后 approval | 与 `complete` 同序，避免同一对行出现两个方向的锁顺序 |
+| 不伪造业务结论 | 只写 `state='FAILED'`、`error_code='PROCESS_RESTART'`、`finished_at`、`error_message`；**不写** `final_answer` |
+| 用户文案固定 | "执行被进程重启中断，此前已提交的操作可能仍然有效，请核对" |
+| 审批进既有失败子状态 | `resume_state='FAILED'`（批次 2 已有），不新增枚举 |
+| 不删任何业务数据 | 业务表、成功的幂等记录、检查点一律不动 |
+| 正常等待不终止 | `PENDING` / `PENDING_RESUME` 不在候选里 |
+| 终态不重写 | 已终态行不进候选；即使进了，条件更新也是 0 行 |
+| 组合不一致 | 代次不匹配、审批仍在 `CLAIMED`、审批代次与 run 不一致 → **不猜修复值**，隔离 + 脱敏日志 + 计入摘要 |
+| 多行一个事务 | run 与 approval 同生共死；审批 0 行且不是幂等结果 → 回滚，不留"run 已失败、审批还 `RUNNING`" |
+
+**R3 不保证历史副作用不存在**：进程是在工具执行中途死的，业务写入可能已经提交。
+文案只说"可能仍然有效，请核对"，不给"没有发生"的承诺。
+
+### 14.6 事务、锁顺序、进展与完成
+
+**一条记录一个短事务**（`TransactionTemplate` + `PROPAGATION_REQUIRES_NEW`）。
+不用同类 `@Transactional`：自调用不走代理，注解会静默失效。
+
+实际锁顺序与**首条 SQL 的 WHERE**（行号以当前代码为准）：
+
+| 路径 | 第一把锁 | 首条 SQL 的 WHERE | 第二把锁 |
+|---|---|---|---|
+| `claim`（`ApprovalClaimService:97`） | `agent_approval` | `approval_id=? AND status IN ('APPROVED','REJECTED') AND resume_state='PENDING_RESUME'` | `agent_run`：`run_id=? AND state='WAITING_APPROVAL' AND execution_epoch=?` |
+| R1 `compensate`（`:202`） | `agent_approval` | `approval_id=? AND resume_state='CLAIMED' AND claimed_epoch=?` | `agent_run`：`run_id=? AND state='RUNNING' AND execution_epoch=?` |
+| `markStarted`（`:153`） | `agent_approval` | `approval_id=? AND resume_state='CLAIMED' AND claimed_epoch=?` | 无 |
+| `decide`（`ApprovalDecisionService:99`） | `agent_approval` | `approval_id=? AND status='PENDING' AND expires_at > CURRENT_TIMESTAMP` | 无 |
+| `cancel`（`:148`） | `agent_approval` | `approval_id=? AND status='PENDING'` | `agent_run`：`run_id=? AND state='WAITING_APPROVAL'` |
+| `complete`（`ApprovalExecutionCompletionService:64`） | `agent_run` | `run_id=? AND execution_epoch=? AND (state NOT IN 终态 OR state=ctx.state)` | `agent_approval`（`finish`）：`approval_id=? AND resume_state IN ('RUNNING','CLAIMED')` |
+| R3 `failInterrupted`（`:295`） | `agent_run` | `run_id=? AND state='RUNNING' AND execution_epoch=?` | `agent_approval`：`approval_id=? AND resume_state='RUNNING' AND claimed_epoch=?` |
+| 暂停 `persist`（`:66`） | `agent_run` | `run_id=? AND state='RUNNING' AND execution_epoch=?` | `agent_approval`：`approval_id=? AND resume_state IN ('RUNNING','CLAIMED')`，再 `agent_checkpoint` |
+| 写工具幂等 | `agent_run` | `FOR UPDATE` | `music_tool_idempotency` → 业务表 |
+
+**0 行即退出**：每条两步路径都在第一句之后检查行数，不为 1 就抛异常/返回，**不会去拿第二把锁**
+（`claim:107`、`compensate:211`、`failInterrupted:304`、`complete:66`、`persist:67`）。
+所以"等待"只可能发生在**已经拿到第一把锁、正在请求第二把锁**的瞬间。
+
+确实存在两个方向，不能只凭"复用了现有锁顺序"就说没有死锁。让环不闭合的是三条事实：
+
+**事实 1：PG 的 `UPDATE` 只对满足 `WHERE` 的行加锁。**
+不满足条件的行即使被别的事务持有，读取走 MVCC 旧版本，**不产生等待**。
+这条决定了"第二把锁的 WHERE 不成立时不会等"，是下面论证的物理基础。
+
+**事实 2：两个方向要求的状态互斥。**
+
+- 先 `agent_approval` 后 `agent_run` 的路径，要求
+  `status='PENDING'`（`decide`/`cancel`）或 `resume_state IN ('PENDING_RESUME','CLAIMED')`（`claim`/R1/`markStarted`）；
+- 先 `agent_run` 后 `agent_approval` 的路径，要求 `run.state='RUNNING'`。
+
+而 `status='PENDING'` 与 `resume_state='PENDING_RESUME'` 都意味着 run 处于 `WAITING_APPROVAL`
+（暂停事务同时写入，R1 同时回退），此时 run 侧路径的第一句 `WHERE state='RUNNING'` **必然 0 行**，
+根本不会持有 run 行锁。
+
+**事实 3：`CLAIMED` 这个唯一的交叉窗口，被"`markStarted` 是任务体第一条写"关掉。**
+`resume_state='CLAIMED'` 且 `run.state='RUNNING'` 是唯一同时满足两个方向前置条件的状态。
+但此时执行体还没有开始：`BaseAgent:1402` 在**任何模型/工具调用之前**先做 `CLAIMED→RUNNING`（独立事务，`markStarted`）。
+于是：
+
+- 若 `markStarted` 未提交，审批仍是 `CLAIMED`，执行体不可能发起暂停/收尾 → run 侧路径不存在；
+- 若 `markStarted` 已提交，审批是 `RUNNING`，R1 的第一句 `WHERE resume_state='CLAIMED'` 0 行 → 不拿 run 锁。
+
+两条合起来：**持有 approval 锁的一方，其 run 锁请求的 `WHERE` 在对方持有期间必然不成立；
+持有 run 锁的一方，其 approval 锁请求同样不成立。** 环因此不闭合。
+
+这个论证依赖 §14.9 的"一个 run 只有一条未结束审批"：
+若同一 run 上存在两条未结束审批，`resume_state` 就不再唯一决定 `run.state`，上述互斥失效。
+
+**等待之后如何重新检查**：READ COMMITTED 下，被阻塞的 `UPDATE` 在锁释放后**对最新已提交版本重新求值**，
+不满足就返回 0 行（而不是"按快照继续写"）。两类证据都有：
+探针 `blockedUpdateReevaluatesWhereAndReturnsZeroRows`（PG 实测输家 0 行）、
+真实路径 `claimWaitsThenReevaluatesWithoutTakingRunLock`（PG 实测：等锁 → 重新求值 → 抛异常 → run 代次未动）。
+
+**死锁处理**：按上述论证，现有路径**不构成环**，因此没有"可发生的死锁"可复现。
+仍然做了兜底：扫描器对 `TransactionTemplate` 抛出的任何 `RuntimeException`（含 40P01 死锁、55P03 锁超时）
+**先回滚、后分类**，一律计入 `transientFailed` 并让本次扫描报未完成（`RecoverySweeper:298`）。
+`lock_timeout` 只用来**限定等待上限**，不作为"无死锁"的论据。
+
+进展与完成：
+
+| 项 | 做法 |
+|---|---|
+| 分页 | 主键游标：`approval_id > ?` / `run_id > ?`，`ORDER BY ... LIMIT batch` |
+| 游标推进 | **处理每条之前**推进，坏记录不会反复占满批次 |
+| 重新校验 | 每条在事务内重读状态与代次，不信任扫描快照；真正的裁决仍是条件更新 |
+| 预算 | 行数上限 + 墙钟上限，**每行之前**检查，不是只在批与批之间 |
+| 单行等待 | PG 上 `SET LOCAL lock_timeout`，作用域限于该事务，单行不会无限拖住总预算 |
+| 完成定义 | 两阶段游标都读到结尾 **且** 没有暂时失败 |
+| 未完成 | 摘要 `reason=BUDGET_OR_LIMIT_EXHAUSTED` / `TRANSIENT_FAILURES`，**门禁保持关闭** |
+| 摘要分类 | `visited` / `reclaimed` / `interrupted` / `skippedLive` / `skippedChanged` / `isolated` / `transientFailed` / `remaining` |
+
+**没有周期扫描，所以不存在"下一轮再收尾"**：达到上限即按未完成结束，门禁不开。
+
+异常分类：锁超时、死锁、`TransactionSystemException` 等并发异常在**事务退出并回滚之后**才分类，
+不在已经失败的事务里继续操作；未知数据库异常不当成"可忽略的竞争"，
+一律计入 `transientFailed`，本次扫描报未完成。
+
+**批量未完成 vs 启动失败：选择"启动继续、门禁不开放"。**
+
+- 不 fail-fast：查询、健康检查、静态资源仍可用，运维能看到日志与摘要；
+- 执行类入口返回 503 `RECOVERY_IN_PROGRESS`，**不会**在状态不明的库上创建新执行；
+- 恢复办法是修掉原因后重启（重启会重新扫描）；**不提供**手工开门端点——
+  那等于把门禁变成随时可绕过的开关；
+- 扫描本身抛异常时同样保持关闭并记 ERROR，不静默放行。
+
+### 14.7 本批明确不做
+
+| 项 | 原因 |
+|---|---|
+| 写工具白名单开放、提示词调整 | 与收尾无关，属独立批次；本批**不开**任何白名单 |
+| R2 主动过期扫描 | 过期语义已在 `/resume` 等入口实现，再加一套会出现两个判定 |
+| 周期扫描 / 30s 任务 | 单实例启动一次即可；没有租约时周期扫描会反复碰别人的执行 |
+| 多实例 / 租约 / 心跳 | 需要 schema 与运维配合，本批只把前提写清楚 |
+| 新管理端点 | 不扩大对外接口面 |
+| `resume_attempts` 新语义 | 保持批次 2 的计数含义，不借它统计"未完成" |
+
+### 14.8 未验证与残余风险
+
+| 项 | 状态 |
+|---|---|
+| H2 真实事务下的 R1 / R3 / 门禁 / 终态覆盖 | **已验证**（默认全量通过，本批新增 41 条） |
+| PG 事务级锁等待（`SET LOCAL lock_timeout` 生效且不泄漏） | **已验证**（PG 16.2，实测 315ms 超时、SQLState `55P03`，`PostgresRecoveryConcurrencyTest`） |
+| PG 上被阻塞 UPDATE 的重新求值（"输家拿 0 行"） | **已验证**（探针：输家 0 行；真实路径：`claim` 等锁后重新求值、抛异常、run 代次未动） |
+| PG 上真实 Spring 事务下的 R1 / R3 / 共同回滚 / 锁超时分类 | **已验证**（`PostgresRecoveryServiceTest` 10 条，真实 `RecoverySweeper` + 真实事务代理） |
+| PG 上的**死锁复现** | **未实测到，且不承诺"绝无死锁"**：§14.6 的三条事实只说明**现有路径**不构成环，因此构造不出可复现的死锁；只有"兜底分类"证据（`transientFailed`）。该论证依赖 §14.9 的不变量与单实例前提，**不能外推到新增写入路径、多实例或任意并发场景** |
+| 多实例并发 | **不适用，也不承诺安全**：本批不支持多实例，没有租约/心跳/owner 字段；多实例下 `hasLiveHandle` 失效、两个进程可能同时收尾，只能靠 §14.2 的部署前提排除 |
+| 门禁对"非 HTTP 内部入口"的覆盖 | 已覆盖 5 类已知入口（`BaseAgent.run/runStream`、`decide`、`cancel`、`resume`、`AgentTaskCanceller.cancel`）；新增入口需自己调用 `requireOpen()`，**没有编译期强制** |
+| 不变量"一个 run 只有一条未结束审批" | **应用层保证，非数据库约束**（§14.9）；新增写入路径必须复用 `ApprovalPauseService.persist` 的 CAS，否则论证失效 |
+
+运行 PG 专项（需要一个**独立测试库**，不碰业务表）。两类用例都要跑：
+
+```
+MKAGENT_PG_URL=jdbc:postgresql://127.0.0.1:55432/mk_probe \
+MKAGENT_PG_USER=postgres MKAGENT_PG_PASSWORD=*** \
+./mvnw -B test -Dmkagent.test.excluded-groups=live -Dgroups=pg \
+    -Dtest='PostgresRecoveryConcurrencyTest,PostgresRecoveryServiceTest'
+```
+
+### 14.9 "一个 run 只有一条未结束审批"到底由什么保证
+
+上一版把这条不变量归给 `UNIQUE (run_id, step)`，**依据不足**：该索引只限制同一 run 的同一 step，
+不排除同一 run 在 step 1 与 step 2 上各有一条未结束审批。PG 实测确认了这一点
+（`uniqueRunStepIndexDoesNotPreventSecondUnfinishedApproval`：两条不同 step 的 `PENDING_RESUME` 可以并存）。
+
+按保证强度分三层：
+
+**A. 数据库强制保证**
+
+| 约束 | 保证什么 | 不保证什么 |
+|---|---|---|
+| `pk_agent_approval (approval_id)` | 主键唯一 | 与 run 无关 |
+| `uk_agent_approval_run_step (run_id, step)` | 同一 run 同一 step 只有一行 | **不同 step 的多条未结束审批** |
+
+**B. 应用代码在既定前提下保证**
+
+前提链条（缺一条论证就不成立）：
+
+1. `agent_approval` 的**唯一插入点**是 `ApprovalPauseService.persist:137`（全仓 `grep` 确认无第二处）；
+2. `persist` 先做 `recordPause`（`AgentRunRecorder`）：`UPDATE agent_run ... WHERE run_id=? AND state='RUNNING' AND execution_epoch=?`，
+   0 行就抛 `PauseRejectedException` 并整体回滚，**插入不会发生**；
+3. `agent_run.state` 变成 `RUNNING` 只有两条路：新建 run（全新 `run_id`，此前不可能有审批），
+   或 `ApprovalClaimService.claim:114`（要求审批处于 `PENDING_RESUME`，并把代次 +1）；
+4. 走 `claim` 之后，恢复上下文由 `CheckpointRestorer.restore:75` 构建，
+   `resumeApprovalId` **必然**等于刚领取的那条审批；
+5. 同一执行内下一次 `persist`，在插入新审批的**同一事务**里把 `resumeApprovalId` 从
+   `('RUNNING','CLAIMED')` 收尾为 `FINISHED`（`ApprovalPauseService:100-110`）。
+
+于是"插入第二条审批"这一刻，上一条必然已经在同一事务里结束。
+
+实测证据：`concurrentPauseInsertsAtMostOneApproval`（PG，两个线程、不同 step、同一代次并发暂停）
+→ 只有 1 个成功、库里只有 1 条审批。注意：**拦住它的是第 2 步的 run 状态 CAS，不是唯一索引**。
+
+**C. 尚未保证的设计假设**
+
+| 假设 | 风险 |
+|---|---|
+| 不存在绕过 `persist` 直接插入审批的新代码 | 一旦新增插入路径，B 的链条断裂，可能并存两条未结束审批 |
+| 不存在绕过 `claim` 把 run 置为 `RUNNING` 的新代码 | 同上（`grep` 显示目前只有 `claim:114` 一处 `SET state='RUNNING'`） |
+| 单实例、单写者 | 多实例下 `hasLiveHandle` 失效，但 CAS 仍成立；真正的风险在"两个进程同时收尾"，已由 §14.2 的启用前提排除 |
+| 同一 run 的暂停都在同一执行代次内 | 代次由 `claim` 单调 +1，回退被禁止 |
+
+**"未结束"的准确范围**：`resume_state IN ('PENDING_RESUME','CLAIMED','RUNNING')`。
+`FINISHED` / `FAILED` 不算未结束（`FAILED` 可能对应 `status='CANCELLED'/'EXPIRED'/'INVALIDATED'`，同样是终局）。
+`status` 的 `PENDING/APPROVED/REJECTED/CANCELLED/EXPIRED/INVALIDATED` **不参与**这条判定——
+它表达"用户决定"，`resume_state` 表达"执行阶段"，两者正交。
+
+**没有新增约束**：本批不改 DDL。若要升级为数据库强制，可选方案是
+"部分唯一索引 `UNIQUE (run_id) WHERE resume_state IN (...)`"（PG 支持，H2 不支持），
+但那会改变 H2 测试基线并需要迁移，**超出本批范围**，仅作为后续建议记录。
