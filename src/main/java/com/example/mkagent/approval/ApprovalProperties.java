@@ -69,6 +69,82 @@ public class ApprovalProperties {
      */
     private Duration resumeStartTimeout = Duration.ofMinutes(5);
 
+    /**
+     * 启动收尾扫描开关（批次 4B）。**默认关闭**。
+     *
+     * <p>打开它的前提是**部署约定**，不是代码能证明的事实：
+     * 1. 上一次的进程已经退出；
+     * 2. 当前实例独占使用这个业务库（没有第二个实例同时在跑）。
+     *
+     * <p>系统本批**不提供**跨进程的单实例强制保证，也没有 owner/租约/心跳字段。
+     * 因此这个开关不能被理解为"已经证明其他实例死亡"——
+     * 在多实例或部署约定不明确的环境里打开它，会把别的实例正在执行的任务判成中断。
+     */
+    private boolean recoveryEnabled = false;
+
+    /**
+     * 每批读取的候选行数（分页大小）。
+     */
+    private int recoveryBatchSize = 50;
+
+    /**
+     * 单次扫描最多处理多少行。
+     *
+     * 达到上限仍有候选时，扫描按"未完成"结束，执行入口保持关闭，
+     * 不会把剩余记录留给一个不存在的"下一轮"。
+     */
+    private int recoveryMaxRows = 200;
+
+    /**
+     * 单次扫描的墙钟预算（不是"批次之间"才检查，每处理一条之前都检查）。
+     */
+    private Duration recoveryMaxDuration = Duration.ofSeconds(10);
+
+    /**
+     * 单条记录事务的锁等待上限（仅 PostgreSQL，作用于当前事务）。
+     */
+    private Duration recoveryLockTimeout = Duration.ofSeconds(2);
+
+    public boolean isRecoveryEnabled() {
+        return recoveryEnabled;
+    }
+
+    public void setRecoveryEnabled(boolean recoveryEnabled) {
+        this.recoveryEnabled = recoveryEnabled;
+    }
+
+    public int getRecoveryBatchSize() {
+        return recoveryBatchSize;
+    }
+
+    public void setRecoveryBatchSize(int recoveryBatchSize) {
+        this.recoveryBatchSize = recoveryBatchSize;
+    }
+
+    public int getRecoveryMaxRows() {
+        return recoveryMaxRows;
+    }
+
+    public void setRecoveryMaxRows(int recoveryMaxRows) {
+        this.recoveryMaxRows = recoveryMaxRows;
+    }
+
+    public Duration getRecoveryMaxDuration() {
+        return recoveryMaxDuration;
+    }
+
+    public void setRecoveryMaxDuration(Duration recoveryMaxDuration) {
+        this.recoveryMaxDuration = recoveryMaxDuration;
+    }
+
+    public Duration getRecoveryLockTimeout() {
+        return recoveryLockTimeout;
+    }
+
+    public void setRecoveryLockTimeout(Duration recoveryLockTimeout) {
+        this.recoveryLockTimeout = recoveryLockTimeout;
+    }
+
     public Duration getResumeStartTimeout() {
         return resumeStartTimeout;
     }

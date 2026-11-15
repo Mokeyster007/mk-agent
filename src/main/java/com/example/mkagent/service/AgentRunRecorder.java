@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -56,6 +57,16 @@ public class AgentRunRecorder {
      * 也不会让一行 TEXT 无限增长。
      */
     private static final int MAX_TOOL_TRACE_LENGTH = 2000;
+
+    /**
+     * 终态名字集合，直接由 {@link AgentState#isTerminal()} 推导。
+     *
+     * 不手写一份名单：手写会与状态机分家，分家后新增终态就悄悄失去保护。
+     */
+    private static final List<String> TERMINAL_STATE_NAMES = Arrays.stream(AgentState.values())
+            .filter(AgentState::isTerminal)
+            .map(Enum::name)
+            .toList();
 
     private final AgentRunMapper agentRunMapper;
 
@@ -280,6 +291,24 @@ public class AgentRunRecorder {
                 new LambdaUpdateWrapper<AgentRunEntity>()
                         .eq(AgentRunEntity::getRunId, ctx.getRunId().toString())
                         .eq(AgentRunEntity::getExecutionEpoch, ctx.getExecutionEpoch())
+                        /*
+                         * 已成立的终态不能被另一次执行覆盖（批次 4B，G7 修正）。
+                         *
+                         * 代次只能拦住"恢复后旧线程的迟到写入"，拦不住同一代次里的
+                         * 两条不同结论：启动收尾把遗留记录判成 FAILED + PROCESS_RESTART 后，
+                         * 若那个执行线程其实还活着并走到终态，代次仍然相等，
+                         * 单靠 run_id + epoch 就会把 FAILED 改写成 SUCCEEDED——
+                         * 客户端看到成功，库里却是"中断"，两种说法互相打脸。
+                         *
+                         * 因此这里加一条：**终态只允许被同一个终态重写**。
+                         * - 正常完成（RUNNING → SUCCEEDED）：通过；
+                         * - 失败/取消/超时/预算（RUNNING → 对应终态）：通过；
+                         * - 合法重复完成（SUCCEEDED → SUCCEEDED，提交确认丢失后的重试）：通过且幂等；
+                         * - 失效执行想用另一个终态覆盖（FAILED → SUCCEEDED）：0 行，由调用方判定。
+                         */
+                        .and(w -> w.notIn(AgentRunEntity::getState, TERMINAL_STATE_NAMES)
+                                .or()
+                                .eq(AgentRunEntity::getState, ctx.getState().name()))
                         .set(AgentRunEntity::getState, ctx.getState().name())
                         .set(AgentRunEntity::getCurrentStep, ctx.getCurrentStep())
                         .set(AgentRunEntity::getToolCallCount, ctx.getToolCallCount())

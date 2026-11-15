@@ -1,5 +1,6 @@
 package com.example.mkagent.agent;
 
+import com.example.mkagent.approval.RecoveryGate;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.AgentEvent;
 import com.example.mkagent.model.AgentEventType;
@@ -35,6 +36,12 @@ public class AgentTaskCanceller {
     private static final Logger log =
             LoggerFactory.getLogger(AgentTaskCanceller.class);
 
+    private final RecoveryGate recoveryGate;
+
+    public AgentTaskCanceller(RecoveryGate recoveryGate) {
+        this.recoveryGate = recoveryGate;
+    }
+
     /**
      * 取消结果：终态名与提示消息。
      */
@@ -47,6 +54,13 @@ public class AgentTaskCanceller {
      * @throws BusinessException 409 任务已是终态或状态竞态下无法取消
      */
     public CancelResult cancel(RunningAgentTask task) {
+        /*
+         * 启动收尾期间不推进任何执行状态：收尾要判定的是"谁还有执行权"，
+         * 此时插进来一次取消，会让判定与用户意图互相覆盖。
+         * 窗口很短（收尾完成后立即开放），拒绝比"猜"更安全。
+         */
+        recoveryGate.requireOpen();
+
         AgentRunContext ctx = task.context();
 
         if (ctx.getState().isTerminal()) {

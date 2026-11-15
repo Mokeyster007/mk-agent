@@ -192,9 +192,13 @@ public class ApprovalClaimService {
      * 绝不提交"审批退回、run 没退"的半截补偿。
      *
      * 代次**不回退**：epoch 只增不减，回退会让"旧代次迟到的写入"重新变得有效。
+     *
+     * @return 本次补偿的实际结果。调用方（启动收尾）必须据此区分
+     *         "真的退回去了"、"别人已经退过（等价态）"与"这次领取已经越过了执行起点"，
+     *         不能只看第一条更新是否 0 行就宣称状态一致
      */
     @Transactional
-    public void compensate(String approvalId, String runId, int epoch) {
+    public CompensateResult compensate(String approvalId, String runId, int epoch) {
         int approvalRows = jdbcTemplate.update(
                 "UPDATE agent_approval "
                         + "SET resume_state = 'PENDING_RESUME', claimed_epoch = NULL, "
@@ -208,7 +212,7 @@ public class ApprovalClaimService {
             log.warn("审批补偿已跳过：执行阶段已越过 CLAIMED，不回退运行状态。"
                             + "approvalId={}, runId={}, epoch={}",
                     approvalId, runId, epoch);
-            return;
+            return CompensateResult.NOT_CLAIMED;
         }
 
         int runRows = jdbcTemplate.update(
@@ -221,7 +225,7 @@ public class ApprovalClaimService {
         if (runRows == 1) {
             log.warn("审批恢复已补偿：approvalId={}, runId={}, epoch={}, runRows={}",
                     approvalId, runId, epoch, runRows);
-            return;
+            return CompensateResult.RECLAIMED;
         }
 
         RunState run = findRunState(runId);
@@ -236,7 +240,7 @@ public class ApprovalClaimService {
             log.warn("审批补偿：任务已处于等价目标状态，按幂等处理。"
                             + "approvalId={}, runId={}, epoch={}",
                     approvalId, runId, epoch);
-            return;
+            return CompensateResult.ALREADY_RECLAIMED;
         }
 
         /*
@@ -247,6 +251,94 @@ public class ApprovalClaimService {
                 "补偿失败：任务状态已变化，不能单独回退审批。approvalId=" + approvalId
                         + ", runId=" + runId + ", epoch=" + epoch
                         + ", run=" + run);
+    }
+
+    /**
+     * 补偿的实际结果（批次 4B：启动收尾需要区分，不能只看行数猜）。
+     */
+    public enum CompensateResult {
+
+        /** 本次把审批与任务都退回了可重试状态。 */
+        RECLAIMED,
+
+        /** 审批已退回，任务本来就处于等价目标状态（别人先补偿过），按幂等接受。 */
+        ALREADY_RECLAIMED,
+
+        /** 审批已不在"本次代次的 CLAIMED"，本次什么都没改。 */
+        NOT_CLAIMED
+    }
+
+    /**
+     * 中断收尾：把"已开始执行但执行者已消失"的记录明确判为失败（批次 4B）。
+     *
+     * <h2>它证明什么、不证明什么</h2>
+     *
+     * 只证明"这次执行不会再继续"：写 `FAILED + PROCESS_RESTART + finished_at`。
+     * **不**证明此前的业务写入不存在——同库事务可能已经提交过工具副作用，
+     * 因此不删幂等凭证、不删业务数据、不写 `final_answer`、也不声称回滚。
+     * 用户文案必须写成"可能已生效，请核对"。
+     *
+     * <h2>顺序与 0 行语义</h2>
+     *
+     * 与 {@link ApprovalExecutionCompletionService} 保持一致：**先 run、后 approval**。
+     * 两条写入同事务，因此不会留下"run 已 FAILED、审批还在 RUNNING"的中间态。
+     *
+     * - run 0 行：状态或代次已变（别人先收尾了），本次什么都不写，返回 false；
+     * - approval 0 行：只有"已经是 FAILED"按幂等接受，其余抛异常回滚 run 终态。
+     *
+     * @param approvalId 关联的恢复审批；普通首次执行没有审批，传 {@code null}
+     * @return true 表示本次确实收尾了这条任务
+     */
+    @Transactional
+    public boolean failInterrupted(
+            String approvalId, String runId, int epoch, String message) {
+        int runRows = jdbcTemplate.update(
+                "UPDATE agent_run "
+                        + "SET state = 'FAILED', error_code = 'PROCESS_RESTART', "
+                        + "    error_message = ?, finished_at = CURRENT_TIMESTAMP, "
+                        + "    updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE run_id = ? AND state = 'RUNNING' AND execution_epoch = ?",
+                message, runId, epoch
+        );
+
+        if (runRows != 1) {
+            log.warn("中断收尾未命中（状态或代次已变化）：runId={}, epoch={}, rows={}",
+                    runId, epoch, runRows);
+            return false;
+        }
+
+        if (approvalId == null) {
+            log.warn("任务已按中断收尾（无关联审批）：runId={}, epoch={}", runId, epoch);
+            return true;
+        }
+
+        int approvalRows = jdbcTemplate.update(
+                "UPDATE agent_approval "
+                        + "SET resume_state = 'FAILED', updated_at = CURRENT_TIMESTAMP "
+                        + "WHERE approval_id = ? AND resume_state = 'RUNNING' "
+                        + "  AND claimed_epoch = ?",
+                approvalId, epoch
+        );
+
+        if (approvalRows != 1) {
+            ApprovalRecord record = find(approvalId);
+            String resumeState = record == null ? null : record.resumeState();
+
+            if (ApprovalRecord.RESUME_FAILED.equals(resumeState)) {
+                log.warn("审批已是 FAILED（重复收尾），按幂等处理：runId={}, approvalId={}",
+                        runId, approvalId);
+                return true;
+            }
+
+            throw new IllegalStateException(
+                    "中断收尾未命中审批，回滚 run 终态：runId=" + runId
+                            + ", approvalId=" + approvalId
+                            + ", resumeState=" + resumeState
+                            + ", rows=" + approvalRows);
+        }
+
+        log.warn("任务已按中断收尾：runId={}, approvalId={}, epoch={}", runId, approvalId, epoch);
+        return true;
     }
 
     /**

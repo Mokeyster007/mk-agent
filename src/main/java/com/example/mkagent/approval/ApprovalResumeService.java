@@ -7,6 +7,7 @@ import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -51,14 +52,30 @@ public class ApprovalResumeService {
      */
     private final List<BaseAgent> agents;
 
+    /**
+     * 启动收尾门禁（批次 4B）。为 null 时不做入口限制（纯单测直接 new 的场景）。
+     */
+    private final RecoveryGate recoveryGate;
+
     public ApprovalResumeService(
             ApprovalClaimService claimService,
             ApprovalProperties properties,
             List<BaseAgent> agents
     ) {
+        this(claimService, properties, agents, null);
+    }
+
+    @Autowired
+    public ApprovalResumeService(
+            ApprovalClaimService claimService,
+            ApprovalProperties properties,
+            List<BaseAgent> agents,
+            RecoveryGate recoveryGate
+    ) {
         this.claimService = claimService;
         this.properties = properties;
         this.agents = agents == null ? List.of() : agents;
+        this.recoveryGate = recoveryGate;
     }
 
     /**
@@ -76,6 +93,15 @@ public class ApprovalResumeService {
      * 此时**不会**有任何工具被执行，也不会产生半截领取。
      */
     public SseEmitter resume(String approvalId, String userId) {
+        /*
+         * 门禁最先判断：启动收尾期间不能领取、不能建 ctx、不能提交执行。
+         * 放在归属校验之前是有意的——收尾期间连"这条审批能不能恢复"都不该被判定，
+         * 否则会基于一个正在被收尾修改的快照给用户一个会过期的结论。
+         */
+        if (recoveryGate != null) {
+            recoveryGate.requireOpen();
+        }
+
         ApprovalRecord record = requireOwned(approvalId, userId);
 
         requireResumable(record);

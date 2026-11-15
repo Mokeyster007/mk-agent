@@ -3,6 +3,7 @@ package com.example.mkagent.agent;
 import com.example.mkagent.config.AgentExecutorConfig;
 import com.example.mkagent.approval.ApprovalClaimService;
 import com.example.mkagent.approval.ApprovalExecutionCompletionService;
+import com.example.mkagent.approval.RecoveryGate;
 import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
@@ -19,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -153,6 +155,14 @@ public abstract class BaseAgent {
     private ApprovalExecutionCompletionService approvalCompletionService;
 
     /**
+     * 启动收尾门禁（批次 4B，可选）。
+     *
+     * 收尾期间必须拒绝"创建/启动任务"的入口，否则新任务会落进扫描窗口，
+     * 或者与扫描器争同一条 run。为 null 时不设门禁（纯单测/未启用收尾）。
+     */
+    private RecoveryGate recoveryGate;
+
+    /**
      * AgentRun 生命周期记录器（可选）。
      *
      * 由具体 Agent（MkManus）通过 setter 注入。
@@ -228,6 +238,12 @@ public abstract class BaseAgent {
         if (ctx == null) {
             throw new IllegalArgumentException("AgentRunContext 不能为空");
         }
+
+        /*
+         * 启动收尾门禁：必须在取并发许可之前判断。
+         * 先取许可再拒绝会白占一个名额，且拒绝路径没有配对的释放点。
+         */
+        requireExecutionAllowed();
 
         /*
          * 全局并发控制：获取不到许可直接拒绝（429），
@@ -408,6 +424,12 @@ public abstract class BaseAgent {
         if (userPrompt == null || userPrompt.isBlank()) {
             throw new IllegalArgumentException("用户任务不能为空");
         }
+
+        /*
+         * 启动收尾门禁：在建流、取许可、写 agent_run 之前判断。
+         * 否则会先落一条 RUNNING 记录，再被拒绝——那正好是扫描器要收的东西。
+         */
+        requireExecutionAllowed();
 
         /*
          * 全局并发控制：同步段（仍在 Web 线程）获取许可，
@@ -849,7 +871,8 @@ public abstract class BaseAgent {
      *
      * 返回值只表示"这次调用是否把终态安全处理完"：
      * true  = 已提交，或按规则本来就不该写（旧代次 / 仍在等待审批）；
-     * false = 写入失败（异常）。调用方据此决定能不能发"执行成功"的事件。
+     * false = 本次没有提交任何终态（写入失败，或这次代次已不拥有该行）。
+     * 调用方据此决定能不能发"执行成功"的事件。
      *
      * 这里不承诺 emitter.complete() 会保证数据库提交：
      * 提交发生在 complete 之前的这次调用里，complete 只负责关闭连接。
@@ -869,24 +892,42 @@ public abstract class BaseAgent {
             long costMillis = System.currentTimeMillis() - startMillis;
 
             if (approvalCompletionService != null && ctx.getResumeApprovalId() != null) {
-                approvalCompletionService.complete(ctx, errorMessage, costMillis);
-            } else {
                 /*
-                 * 非恢复执行（或未装配原子收尾服务）：单条 UPDATE 自带提交。
-                 * 用严格版拿到行数，才能区分"写失败"与"本来就不该写"：
-                 * 0 行是旧代次/暂停中，此时**不能**再去收尾审批——
-                 * 那条审批已经归新代次或仍待执行。
+                 * 收尾服务的 false 必须原样传出去（批次 4B，G7 修正）。
+                 *
+                 * false 的确切含义是"run 终态没有命中本次代次"——要么这条记录已经被
+                 * 启动收尾判成中断，要么已经被新代次接管。两种情况都说明
+                 * **本次执行不再是这条 run 的结论来源**；此时若仍然发 final_answer / done，
+                 * 客户端会收到一个库里并不存在的成功结果。
+                 *
+                 * 注意 false 不是"再试一次就好"：它是条件更新的确定性结果，
+                 * 所以这里不重置 persisted，finally 不会迟到补出一个假完成。
                  */
-                int rows = runRecorder == null
-                        ? 0
-                        : runRecorder.recordFinishStrict(ctx, errorMessage, costMillis);
+                boolean completed =
+                        approvalCompletionService.complete(ctx, errorMessage, costMillis);
 
-                if (rows == 1) {
-                    finishResumeApproval(ctx);
-                } else {
-                    log.warn("终态写入未命中（旧代次或暂停中）：runId={}, epoch={}, state={}, rows={}",
-                            ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState(), rows);
+                if (!completed) {
+                    log.warn("终态未命中本次代次，不发送成功事件：runId={}, epoch={}, state={}",
+                            ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState());
                 }
+                return completed;
+            }
+
+            /*
+             * 非恢复执行（或未装配原子收尾服务）：单条 UPDATE 自带提交。
+             * 用严格版拿到行数，才能区分"写失败"与"本来就不该写"：
+             * 0 行是旧代次/暂停中，此时**不能**再去收尾审批——
+             * 那条审批已经归新代次或仍待执行。
+             */
+            int rows = runRecorder == null
+                    ? 0
+                    : runRecorder.recordFinishStrict(ctx, errorMessage, costMillis);
+
+            if (rows == 1) {
+                finishResumeApproval(ctx);
+            } else {
+                log.warn("终态写入未命中（旧代次或暂停中）：runId={}, epoch={}, state={}, rows={}",
+                        ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState(), rows);
             }
             return true;
         } catch (RuntimeException e) {
@@ -1183,6 +1224,27 @@ public abstract class BaseAgent {
     public void setApprovalCompletionService(
             ApprovalExecutionCompletionService approvalCompletionService) {
         this.approvalCompletionService = approvalCompletionService;
+    }
+
+    /**
+     * 注入启动收尾门禁（批次 4B）。为 null 时不做入口限制。
+     *
+     * 用 setter 而不是构造参数：{@link MkManus} 等子类的构造签名已固定，
+     * 而且纯单测会直接 new 出 Agent，不该被迫传一个门禁。
+     * Spring 环境下由容器自动调用（{@code @Autowired(required = false)}）。
+     */
+    @Autowired(required = false)
+    public void setRecoveryGate(RecoveryGate recoveryGate) {
+        this.recoveryGate = recoveryGate;
+    }
+
+    /**
+     * 启动收尾期间的入口门禁：关闭时抛 503，任务一行都不会创建。
+     */
+    private void requireExecutionAllowed() {
+        if (recoveryGate != null) {
+            recoveryGate.requireOpen();
+        }
     }
 
     /**

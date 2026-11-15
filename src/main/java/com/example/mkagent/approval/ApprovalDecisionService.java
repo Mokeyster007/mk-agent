@@ -29,12 +29,16 @@ public class ApprovalDecisionService {
 
     private final ApprovalClaimService claimService;
 
+    private final RecoveryGate recoveryGate;
+
     public ApprovalDecisionService(
             JdbcTemplate jdbcTemplate,
-            ApprovalClaimService claimService
+            ApprovalClaimService claimService,
+            RecoveryGate recoveryGate
     ) {
         this.jdbcTemplate = jdbcTemplate;
         this.claimService = claimService;
+        this.recoveryGate = recoveryGate;
     }
 
     /**
@@ -62,6 +66,13 @@ public class ApprovalDecisionService {
      */
     @Transactional
     public DecisionResult decide(String approvalId, String userId, boolean approve) {
+        /*
+         * 门禁必须在**任何写入之前**：approve/reject 一次调用会顺带触发恢复，
+         * 启动收尾期间放它进来，就会出现"决定已落库、执行却被收尾判成中断"的部分操作。
+         * 因此这里直接拒绝，连 status 都不改，用户重启后可以原样重试。
+         */
+        recoveryGate.requireOpen();
+
         ApprovalRecord record = claimService.find(approvalId);
 
         if (record == null || !record.userId().equals(userId)) {
@@ -122,6 +133,8 @@ public class ApprovalDecisionService {
      */
     @Transactional
     public DecisionResult cancel(String runId, String userId) {
+        recoveryGate.requireOpen();
+
         ApprovalRecord record = findPendingByRun(runId);
 
         if (record == null || !record.userId().equals(userId)) {

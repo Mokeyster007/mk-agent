@@ -36,6 +36,17 @@ public class AgentRunVO {
     private String errorMessage;
 
     /**
+     * 稳定原因码（批次 4B 新增）。
+     *
+     * 前端应只认这个码，不解析中文 {@link #errorMessage}。
+     * 典型值：{@code PROCESS_RESTART}（执行被进程重启中断，历史副作用可能仍有效）、
+     * {@code APPROVAL_EXPIRED}、{@code USER_CANCELLED} 等。
+     *
+     * 新增字段是向后兼容的：老客户端忽略未知字段即可，原有字段语义不变。
+     */
+    private String errorCode;
+
+    /**
      * 本次任务使用的模型名（成本观测）。
      */
     private String model;
@@ -69,6 +80,7 @@ public class AgentRunVO {
         vo.toolTrace = entity.getToolTrace();
         vo.finalAnswer = entity.getFinalAnswer();
         vo.errorMessage = entity.getErrorMessage();
+        vo.errorCode = entity.getErrorCode();
         vo.model = entity.getModel();
         vo.promptTokens = entity.getPromptTokens();
         vo.completionTokens = entity.getCompletionTokens();
@@ -118,6 +130,14 @@ public class AgentRunVO {
 
     public String getErrorMessage() {
         return errorMessage;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public void setErrorCode(String errorCode) {
+        this.errorCode = errorCode;
     }
 
     public String getModel() {
