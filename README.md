@@ -197,6 +197,55 @@ mk-agent
 cd mk-image-search-mcp-server && ./mvnw spring-boot:run
 ```
 
+### 2.1 本地演示：V1 闭环（推荐第一次这样跑）
+
+不依赖 PostgreSQL、不依赖 MCP，数据库是 H2 文件库，**重启不丢数据**。
+
+```bash
+# 终端 1：后端（demo profile，需要真实模型凭据）
+#   只在本终端设置，不要写进脚本或仓库
+export MKAGENT_MODEL_API_KEY=<你的 DashScope Key>
+./mvnw -Pdemo spring-boot:run -Dspring-boot.run.profiles=demo
+
+# 终端 2：前端
+cd web
+npm install     # 首次
+npm run dev     # http://localhost:5173
+```
+
+打开 `http://localhost:5173`，左下角应显示开发联调身份 `music-user-1`，
+顶部能力徽标应显示 **审批写**（该值来自后端 `GET /ai/music/capabilities`，
+不是前端写死的）。
+
+演示脚本（一条走完就算验收）：
+
+1. 输入「帮我找一下夜航星的歌」→ 看真实曲库结果；
+2. 输入「帮我建一个歌单叫「清晨慢跑」，先放《城市霓虹》这一首」→ 出现审批卡；
+3. 点**批准** → 任务继续执行，返回创建结果；
+4. 左侧「我的歌单」→ 点**刷新** → 看到「清晨慢跑」和它的曲目；
+5. 输入「把《深夜电台》加到「清晨慢跑」里」→ 再次审批 → 批准 → 刷新可见 2 首；
+6. 任一步点**拒绝** → 数据库里不会出现对应改动（可点刷新核对）。
+
+要点：
+
+- 数据在 `./tmp/demo-db/`（H2 文件，`tmp/` 已忽略）。删掉该目录即重置为种子数据。
+- 种子数据：3 个用户（`music-user-1` / `music-user-2` / `music-admin-1`）、
+  60 首歌、3 个歌单、30 条播放记录，全部虚构。
+- 演示模式的差异只有"数据库 + 打开写工具 + 关掉 RAG/MCP"，
+  审批、归属校验、幂等与事务与生产完全一致。
+- 生产默认仍是只读：`mkagent.agent.music.write-enabled=false`，
+  模型拿不到写工具，提示词也用只读版本。
+
+三个界面状态（真实运行截图，身份 `music-user-1`，模型 `qwen-plus`）：
+
+| 待审批 | 批准后（真实完成） | 我的歌单（数据库查询） |
+| --- | --- | --- |
+| ![待审批卡片](docs/images/v1-approval.png) | ![批准后](docs/images/v1-approved.png) | ![歌单侧栏](docs/images/v1-library.png) |
+
+注意：点「批准」之后，审批卡要等模型写完最终回答才会从"等待恢复"变成
+"恢复执行已结束"（实测 2–8 秒，取决于模型）。这段时间里左侧步骤、
+最终回答和「我的歌单」已经是真实结果，以它们为准；卡片状态只是晚一步。
+
 ### 3. 接口文档
 
 启动后访问：`http://localhost:8123/api/doc.html`（Knife4j）
@@ -214,6 +263,9 @@ cd mk-image-search-mcp-server && ./mvnw spring-boot:run
 | `GET /api/ai/manus/chat?message=...` | Agent 任务（SSE），需请求头 `X-User-Id` |
 | `GET /api/ai/music/chat?message=...` | 音乐助手（`MUSIC_USER`），需 `X-User-Id`，用户须在 `music_user` 表中 |
 | `GET /api/ai/music/admin/chat?message=...` | 音乐统计（`MUSIC_ADMIN`），角色必须是 ADMIN |
+| `GET /api/ai/music/playlists` | 当前用户自己的歌单（含歌曲数），页面"我的歌单"用 |
+| `GET /api/ai/music/playlists/{id}/songs` | 某个本人歌单的曲目（非本人 → 404） |
+| `GET /api/ai/music/capabilities` | 当前装配是否开放审批写 + 提示词版本 |
 | `POST /api/ai/manus/{runId}/cancel` | 主动取消运行中的 Agent 任务（音乐任务沿用此接口，仅本人可取消） |
 | `GET /api/ai/runs/{runId}` | 查询任务详情 |
 | `GET /api/ai/runs/page` | 分页查询任务历史 |
