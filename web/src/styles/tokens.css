@@ -1,0 +1,107 @@
+/**
+ * 设计变量
+ * ---------------------------------------------------------------
+ * 单一柔和强调色（periwinkle），中性深色底，其余状态色只做小面积点缀。
+ * 所有颜色都成对定义：前景色在对应底色上的对比度均高于 4.5:1，
+ * 半透明表面只用于"浮起"层级，不用于承载正文。
+ */
+:root {
+  /* ---- 底色层级（越靠上层越亮，靠明度而不是靠阴影区分） ---- */
+  --c-bg: #0c0e12;
+  --c-bg-soft: #0f1217;
+  --c-surface: #14181e;
+  --c-surface-2: #191e26;
+  --c-surface-3: #1f2630;
+  --c-surface-hover: #1c222b;
+
+  /* ---- 描边 ---- */
+  --c-line: #232a34;
+  --c-line-soft: #1b2129;
+  --c-line-strong: #333d4b;
+
+  /* ---- 文字 ---- */
+  --c-text: #e9ecf2;
+  --c-text-2: #a6afbd;
+  --c-text-3: #737d8c;
+  --c-text-inverse: #0c0e12;
+
+  /* ---- 强调色 ---- */
+  --c-accent: #7f8ffa;
+  --c-accent-ink: #b4bdff;
+  --c-accent-weak: rgba(127, 143, 250, 0.14);
+  --c-accent-weak-2: rgba(127, 143, 250, 0.08);
+  --c-accent-line: rgba(127, 143, 250, 0.32);
+
+  /* ---- 语义色 ---- */
+  --c-ok: #4ec2a0;
+  --c-ok-weak: rgba(78, 194, 160, 0.13);
+  --c-warn: #e2b45e;
+  --c-warn-weak: rgba(226, 180, 94, 0.13);
+  --c-danger: #e2796f;
+  --c-danger-weak: rgba(226, 121, 111, 0.13);
+  --c-info: #6fb6e8;
+  --c-info-weak: rgba(111, 182, 232, 0.13);
+
+  /* ---- 字体 ---- */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  --fs-xs: 11px;
+  --fs-sm: 12.5px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 21px;
+  --fs-2xl: 26px;
+
+  --lh-tight: 1.35;
+  --lh-base: 1.62;
+  --lh-relaxed: 1.78;
+
+  /* ---- 间距（4 的倍数） ---- */
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
+  --s-16: 64px;
+
+  /* ---- 圆角 ---- */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 22px;
+  --r-pill: 999px;
+
+  /* ---- 阴影：只在需要"脱离平面"的元素上使用 ---- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --shadow-md: 0 8px 24px -12px rgba(0, 0, 0, 0.7);
+  --shadow-lg: 0 24px 60px -24px rgba(0, 0, 0, 0.8);
+
+  /* ---- 布局 ---- */
+  --nav-w: 264px;
+  --panel-w: 372px;
+  --center-max: 744px;
+  --header-h: 60px;
+
+  /* ---- 动效 ---- */
+  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+  --dur-slow: 320ms;
+
+  /* ---- 毛玻璃（局部使用，始终叠加不透明底以保证可读性） ---- */
+  --frost: rgba(20, 24, 30, 0.72);
+  --frost-blur: saturate(1.25) blur(18px);
+
+  --z-drawer: 40;
+  --z-overlay: 50;
+  --z-toast: 60;
+}

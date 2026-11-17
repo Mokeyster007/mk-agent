@@ -1,0 +1,277 @@
+/**
+ * 基础样式：重置 + 通用排版 + 少量共享原语（按钮、输入、卡片、徽标）。
+ * 组件私有样式放在各自的 <style scoped> 里，这里只放跨组件复用的部分。
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--c-bg);
+  color: var(--c-text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#app {
+  height: 100%;
+}
+
+h1,
+h2,
+h3,
+h4,
+p,
+figure {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: var(--c-accent-ink);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* ---- 焦点可见性：键盘用户必须能看到焦点，鼠标点击不显示 ---- */
+:focus-visible {
+  outline: 2px solid var(--c-accent);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* ---- 滚动条：细、低对比，不抢视觉 ---- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--c-line-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--c-line-strong);
+  border-radius: var(--r-pill);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ==================== 共享原语 ==================== */
+
+.mk-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: 36px;
+  padding: 0 var(--s-4);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--c-line);
+  background: var(--c-surface-2);
+  color: var(--c-text);
+  font-size: var(--fs-base);
+  font-weight: 500;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.mk-btn:hover:not(:disabled) {
+  background: var(--c-surface-3);
+  border-color: var(--c-line-strong);
+}
+
+.mk-btn:disabled {
+  opacity: 0.45;
+}
+
+/* 主按钮禁用时必须"看起来就是不能点"，否则预览/已处理状态下仍像可操作 */
+.mk-btn--primary:disabled {
+  opacity: 1;
+  background: var(--c-surface-3);
+  border-color: var(--c-line);
+  color: var(--c-text-3);
+}
+
+.mk-btn--primary {
+  background: var(--c-accent);
+  border-color: var(--c-accent);
+  color: #0b0d12;
+  font-weight: 600;
+}
+
+.mk-btn--primary:hover:not(:disabled) {
+  background: #93a0ff;
+  border-color: #93a0ff;
+}
+
+.mk-btn--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--c-text-2);
+}
+
+.mk-btn--ghost:hover:not(:disabled) {
+  background: var(--c-surface-2);
+  color: var(--c-text);
+}
+
+.mk-btn--danger {
+  border-color: rgba(226, 121, 111, 0.4);
+  color: var(--c-danger);
+  background: var(--c-danger-weak);
+}
+
+.mk-btn--danger:hover:not(:disabled) {
+  background: rgba(226, 121, 111, 0.2);
+}
+
+.mk-btn--sm {
+  height: 30px;
+  padding: 0 var(--s-3);
+  font-size: var(--fs-sm);
+}
+
+.mk-btn--block {
+  width: 100%;
+}
+
+.mk-input {
+  width: 100%;
+  height: 36px;
+  padding: 0 var(--s-3);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--c-line);
+  background: var(--c-bg-soft);
+  color: var(--c-text);
+  font-size: var(--fs-base);
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.mk-input::placeholder {
+  color: var(--c-text-3);
+}
+
+.mk-input:focus {
+  outline: none;
+  border-color: var(--c-accent-line);
+}
+
+.mk-card {
+  border: 1px solid var(--c-line);
+  border-radius: var(--r-md);
+  background: var(--c-surface);
+}
+
+.mk-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--c-line);
+  background: var(--c-surface-2);
+  color: var(--c-text-2);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.mk-eyebrow {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--c-text-3);
+}
+
+.mk-mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  letter-spacing: -0.01em;
+}
+
+.mk-divider {
+  height: 1px;
+  background: var(--c-line-soft);
+  border: 0;
+  margin: 0;
+}
+
+/* 仅屏幕阅读器可见 */
+.mk-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* 长串不换行内容（runId、工具名）必须有兜底，否则手机上会横向溢出 */
+.mk-break {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
