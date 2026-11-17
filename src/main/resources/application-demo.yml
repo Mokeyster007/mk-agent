@@ -1,0 +1,75 @@
+# =============================================================
+# 本地演示 profile（demo）：不依赖 PostgreSQL 的完整闭环。
+#
+# 启动方式（需要真实模型凭据）：
+#   先给环境变量 MKAGENT_MODEL_API_KEY 赋上真实值，再执行
+#   ./mvnw -Pdemo spring-boot:run -Dspring-boot.run.profiles=demo
+#   （文档里不写 "KEY=值" 形式，避免被密钥扫描当成明文赋值）
+#
+# 为什么是**只**激活 demo，而不是 local,demo：
+# 仓库根 config/application-local.yml（本机真实值）优先级高于 classpath，
+# 它里面写死了 PostgreSQL 的 datasource.url，会把本文件的 H2 覆盖掉——
+# 这正是 docs/SECURITY.md 7.2.1 记的"外部文件写死属性 → 来源覆盖"。
+# 所以 demo 自带一份凭据占位符，凭据只从环境变量来。
+#
+# 与生产的差异只有四处：
+#   1. 数据库换成 H2 文件库（./tmp/demo-db，tmp/ 已被 .gitignore 忽略）；
+#   2. MCP / pgvector / RAG 全部关闭，启动阶段不连任何外部服务；
+#   3. 打开 mkagent.agent.music.write-enabled → 模型可以使用审批写工具；
+#   4. 其余（提示词契约、审批、归属校验、幂等、事务）与生产完全一致。
+#
+# ⚠️ 这不是公网部署形态：没有真实认证，身份仍是 X-User-Id 占位。
+# =============================================================
+spring:
+  # 覆盖 application.yml 的同名列表（该属性整体替换，不合并），
+  # 因此必须把生产已经排除的 DashScopeChatAutoConfiguration 一并列出。
+  autoconfigure:
+    exclude:
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.McpClientAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.McpToolCallbackAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.StdioTransportAutoConfiguration
+      - org.springframework.ai.mcp.client.autoconfigure.SseHttpClientTransportAutoConfiguration
+      - org.springframework.ai.vectorstore.pgvector.autoconfigure.PgVectorStoreAutoConfiguration
+
+  # 文件库而不是内存库：刷新页面、重启应用之后仍能核对已产生的业务数据。
+  # MODE=PostgreSQL 是为了让 db/schema.sql 的方言（IDENTITY / TEXT）可用。
+  datasource:
+    url: jdbc:h2:file:./tmp/demo-db/mk-agent;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+
+  ai:
+    mcp:
+      client:
+        # 双保险：自动配置已排除，这里再关一次，避免拉起 npx 子进程。
+        enabled: false
+
+    dashscope:
+      # 只从环境变量注入；本文件不含任何真实值。
+      api-key: ${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}
+      chat:
+        options:
+          model: ${MKAGENT_CHAT_MODEL:qwen-plus}
+          enable-thinking: false
+
+# 搜索工具是 Spring Bean，装配期要求凭据非空；演示闭环不使用它，
+# 这里给一个明显的占位符（真被调用会 401，不会静默返回假结果）。
+search-api:
+  api-key: ${MKAGENT_SEARCH_API_KEY:your-search-api-key}
+
+mkagent:
+  rag:
+    # RAG 需要 Embedding + 向量库；演示闭环用不到，关掉以免启动期发起模型调用。
+    enabled: false
+    pgvector:
+      # H2 没有 vector 扩展。
+      enabled: false
+
+  agent:
+    music:
+      # 演示的唯一目的：让"创建歌单 / 添加歌曲"这条链路真正可用。
+      # 写操作仍然必须经页面批准（ApprovalToolPolicy 按注解扫描，不受本开关影响）。
+      write-enabled: true

@@ -53,11 +53,28 @@ public class ApprovalSummaryBuilder {
     }
 
     /**
-     * 根据本轮待执行的工具调用构造摘要。
+     * 根据本轮待执行的工具调用构造摘要（无用户上下文）。
+     *
+     * <p>保留这个单参重载是为了既有调用方与单测：拿不到用户时，
+     * 需要反查歌单名的场景会退化成"未指定歌单名"——宁可不显示，
+     * 也不跨用户查。
      *
      * @param toolCalls 本轮全部工具调用（整轮暂停，可能多于一个）
      */
     public ApprovalSummary build(List<AssistantMessage.ToolCall> toolCalls) {
+        return build(toolCalls, null);
+    }
+
+    /**
+     * 根据本轮待执行的工具调用构造摘要。
+     *
+     * @param toolCalls 本轮全部工具调用（整轮暂停，可能多于一个）
+     * @param userId    当前任务的用户；用于反查"要改的是哪个歌单"，可为 null
+     */
+    public ApprovalSummary build(
+            List<AssistantMessage.ToolCall> toolCalls,
+            String userId
+    ) {
         if (toolCalls == null || toolCalls.isEmpty()) {
             throw new IllegalArgumentException("审批摘要缺少工具调用");
         }
@@ -74,6 +91,15 @@ public class ApprovalSummaryBuilder {
         if (args != null) {
             if (args.hasNonNull("name")) {
                 playlistName = sanitize(args.get("name").asText(), 60);
+            } else if (args.hasNonNull("playlistId")) {
+                /*
+                 * 加歌类工具的参数只有 playlistId。审批卡必须让用户看清
+                 * "往哪个歌单里加"，所以这里补一次只读查询（只查本人歌单）。
+                 *
+                 * 查不到（别人的歌单 / 已删除 / 无上下文）时保持 null，
+                 * 前端会显示"未指定歌单名"——不猜、不编。
+                 */
+                playlistName = lookupPlaylistName(args.get("playlistId").asLong(), userId);
             }
             List<Long> songIds = readSongIds(args);
             if (!songIds.isEmpty()) {
@@ -87,6 +113,29 @@ public class ApprovalSummaryBuilder {
 
         return new ApprovalSummary(
                 toolName, label, playlistName, songCount, songs, toolCalls.size(), text);
+    }
+
+    /**
+     * 按歌单 ID 取歌单名（仅本人）。
+     *
+     * <p>userId 由调用方显式传入，**不读 ThreadLocal**：摘要是在"模型刚返回
+     * 工具调用、尚未执行任何工具"的时刻构造的，那时 Agent 运行上下文
+     * 并没有绑定到当前线程（绑定只包住工具执行那一小段），
+     * 靠 {@code AgentRunContextHolder.current()} 只会永远拿到 null。
+     *
+     * <p>查询失败返回 null：摘要只是辅助信息，不能因为它让审批流程失败。
+     */
+    private String lookupPlaylistName(long playlistId, String userId) {
+        if (playlistId <= 0 || userId == null || userId.isBlank()) {
+            return null;
+        }
+
+        try {
+            String name = songTitleLookup.playlistName(playlistId, userId);
+            return name == null ? null : sanitize(name, 60);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

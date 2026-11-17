@@ -1179,7 +1179,7 @@ public class ToolCallAgent extends ReActAgent {
         ApprovalCheckpoint checkpoint =
                 buildCheckpoint(ctx, assistantMessage, configVersion);
 
-        ApprovalSummary summary = approvalSummaryBuilder.build(toolCalls);
+        ApprovalSummary summary = approvalSummaryBuilder.build(toolCalls, ctx.getUserId());
 
         String runId = ctx.getRunId().toString();
         RunHandoffLocks locks = getHandoffLocks();

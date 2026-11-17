@@ -65,4 +65,27 @@ public class JdbcSongTitleLookup implements SongTitleLookup {
         }
         return result;
     }
+
+    /**
+     * 查本人歌单名。
+     *
+     * <p>带 {@code user_id} 条件而不是只按 id 查：审批卡是给当前用户看的，
+     * 万一模型传了别人的歌单 ID，这里不应该把别人的歌单名显示出来
+     * （执行阶段本来也会因为归属校验失败）。
+     */
+    @Override
+    public String playlistName(long playlistId, String userId) {
+        if (playlistId <= 0 || userId == null || userId.isBlank()) {
+            return null;
+        }
+
+        List<String> names = jdbcTemplate.queryForList(
+                "SELECT name FROM music_playlist WHERE id = ? AND user_id = ?",
+                String.class,
+                playlistId,
+                userId
+        );
+
+        return names.isEmpty() ? null : names.get(0);
+    }
 }

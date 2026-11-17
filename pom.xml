@@ -357,6 +357,26 @@
                 <mkagent.test.excluded-groups>none</mkagent.test.excluded-groups>
             </properties>
         </profile>
+
+        <profile>
+            <!--
+                本地演示 / 私有演示：不依赖 PostgreSQL 的完整闭环。
+
+                  mvnw -Pdemo spring-boot:run -Dspring-boot.run.profiles=demo
+
+                H2 只在 demo profile 下进入运行时 classpath：
+                默认构建（以及打包出的 jar）仍然只带 PostgreSQL 驱动，
+                不会因为"要演示"就让生产产物多背一个数据库引擎。
+            -->
+            <id>demo</id>
+            <dependencies>
+                <dependency>
+                    <groupId>com.h2database</groupId>
+                    <artifactId>h2</artifactId>
+                    <scope>runtime</scope>
+                </dependency>
+            </dependencies>
+        </profile>
     </profiles>
 
 </project>

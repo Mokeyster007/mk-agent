@@ -43,7 +43,12 @@ public class MusicAgentConfig {
     @Bean("musicUserAgent")
     public MusicAgent musicUserAgent(
             ChatModel chatModel,
-            @Qualifier("musicUserToolCallbacks") ToolCallback[] tools,
+            @Qualifier("musicUserToolCallbacks") ToolCallback[] readTools,
+            /*
+             * 写工具 Bean 一直存在（幂等包装已装配好），但是否交给模型由
+             * mkagent.agent.music.write-enabled 决定。生产默认 false。
+             */
+            @Qualifier("musicWriteToolCallbacks") ToolCallback[] writeTools,
             @Qualifier("agentExecutor") Executor agentExecutor,
             ToolEventMessageProvider toolEventMessageProvider,
             AgentTaskRegistry agentTaskRegistry,
@@ -55,6 +60,7 @@ public class MusicAgentConfig {
             ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
+            @Value("${mkagent.agent.music.write-enabled:false}") boolean writeEnabled,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
@@ -70,8 +76,13 @@ public class MusicAgentConfig {
         return build(
                 AgentType.MUSIC_USER,
                 "MusicUserAgent",
-                MusicAgent.USER_SYSTEM_PROMPT,
-                tools,
+                /*
+                 * 工具与提示词成对切换，不能只改一边（见 application.yml 注释）。
+                 */
+                writeEnabled
+                        ? MusicAgent.USER_WRITE_SYSTEM_PROMPT
+                        : MusicAgent.USER_SYSTEM_PROMPT,
+                writeEnabled ? concat(readTools, writeTools) : readTools,
                 chatModel,
                 agentExecutor,
                 toolEventMessageProvider,
@@ -144,6 +155,21 @@ public class MusicAgentConfig {
                 budgetWarningSteps,
                 forceFinalAnswer
         );
+    }
+
+    /**
+     * 只读工具 + 写工具（写工具在后，模型选择时不受顺序影响）。
+     *
+     * 不在这里做去重或过滤：两个 Bean 的来源不同（一个走重试包装、
+     * 一个是幂等包装），名字重复意味着装配出错，应该让
+     * {@code ApprovalToolPolicy#verifyExposedTools} 或测试直接暴露，
+     * 而不是在这里悄悄吞掉。
+     */
+    private static ToolCallback[] concat(ToolCallback[] read, ToolCallback[] write) {
+        ToolCallback[] merged = new ToolCallback[read.length + write.length];
+        System.arraycopy(read, 0, merged, 0, read.length);
+        System.arraycopy(write, 0, merged, read.length, write.length);
+        return merged;
     }
 
     /**
