@@ -53,12 +53,26 @@ public class WebSearchTool {
 
     /**
      * Spring 注入入口：api-key 与 engine 都来自配置。
+     *
+     * 凭据缺失时在装配阶段直接失败，并给出"该设哪个环境变量"的信息。
+     * 否则 {@code @Value("${search-api.api-key}")} 只会抛
+     * "Could not resolve placeholder"，看不出是凭据没注入还是属性名写错。
+     * 这里用 {@code :} 给一个空默认值，把错误交给下面这行显式校验，
+     * 保证启动即失败（而不是等第一次搜索才 401）。
      */
     @Autowired
     public WebSearchTool(
-            @Value("${search-api.api-key}") String apiKey,
+            @Value("${search-api.api-key:}") String apiKey,
             @Value("${search-api.engine:baidu}") String engine
     ) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException(
+                    "未配置搜索服务凭据：请设置环境变量 MKAGENT_SEARCH_API_KEY，"
+                            + "或配置 search-api.api-key。"
+                            + "本地开发可写入 config/application-local.yml"
+                            + "（file:./config/，不入库），详见 docs/SECURITY.md 第 7 节。"
+            );
+        }
         this.apiKey = apiKey;
         // 配了空串也回退默认值：空 engine 会被上游当成非法参数。
         this.engine = (engine == null || engine.isBlank())

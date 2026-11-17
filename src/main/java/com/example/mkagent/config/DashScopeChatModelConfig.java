@@ -19,6 +19,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.retry.support.RetryTemplate;
+import org.springframework.util.Assert;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.ResponseErrorHandler;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -93,6 +95,29 @@ public class DashScopeChatModelConfig {
             ObjectProvider<ToolExecutionEligibilityPredicate> eligibilityPredicateProvider,
             ResponseErrorHandler responseErrorHandler
     ) {
+        /*
+         * 凭据校验必须放在 resolveConnectionProperties **之前**。
+         *
+         * 这不是风格问题：DashScopeConnectionUtils.resolveConnectionProperties
+         * 内部自己就有一句 Assert.hasText(apiKey, "DashScope API key must be set...")，
+         * 而且它只在 apiKey == null 时才回退到 SDK 原生环境变量
+         * AI_DASHSCOPE_API_KEY（字节码是 Objects.isNull，不是 hasText）。
+         *
+         * 本项目的配置模板把属性解析成**空串**
+         * （`${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}`），
+         * 空串不是 null，所以库既不会走环境变量回退，也会在内部直接抛它自己的错。
+         * 校验放在后面就等于写了一段永远执行不到的死代码——
+         * 用户看到的仍是"只提属性名、不提环境变量"的框架报错。
+         */
+        Assert.hasText(
+                configuredApiKey(chatProperties, connectionProperties),
+                "未配置模型凭据：请设置环境变量 MKAGENT_MODEL_API_KEY，"
+                        + "或配置 spring.ai.dashscope.api-key"
+                        + "（模板已把 SDK 原生变量 AI_DASHSCOPE_API_KEY 作为兜底串进来）。"
+                        + "本地开发可写入 config/application-local.yml"
+                        + "（file:./config/，不入库），详见 docs/SECURITY.md 第 7 节。"
+        );
+
         ResolvedConnectionProperties resolved =
                 DashScopeConnectionUtils.resolveConnectionProperties(
                         connectionProperties,
@@ -146,6 +171,30 @@ public class DashScopeChatModelConfig {
         );
 
         return chatModel;
+    }
+
+    /**
+     * 解析"实际会用于发起请求的 api-key"。
+     *
+     * <p>顺序与 {@code DashScopeConnectionUtils#resolveConnectionProperties}
+     * 完全一致（已用 {@code javap -c} 核对字节码，不是按文档猜的）：
+     * <ol>
+     *   <li>{@code spring.ai.dashscope.chat.api-key}（hasText 才算，空串/空白不算）</li>
+     *   <li>{@code spring.ai.dashscope.api-key}</li>
+     * </ol>
+     *
+     * <p>刻意不在这里读 {@code AI_DASHSCOPE_API_KEY}：SDK 那条回退只在属性为
+     * <b>null</b> 时生效，而本项目的配置模板把属性解析成空串，库根本走不到那里。
+     * 环境变量的兼容由配置模板里的嵌套占位符完成（见 application-local.yml），
+     * 保证"哪个变量生效"只有一处定义，不会代码与配置两处打架。
+     */
+    static String configuredApiKey(
+            DashScopeChatProperties chatProperties,
+            DashScopeConnectionProperties connectionProperties) {
+        if (StringUtils.hasText(chatProperties.getApiKey())) {
+            return chatProperties.getApiKey();
+        }
+        return connectionProperties.getApiKey();
     }
 
     /**

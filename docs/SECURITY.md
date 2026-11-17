@@ -3,8 +3,9 @@
 本文档记录本项目的密钥管理、历史清理、提交前扫描与网络安全加固约定。
 
 > 约定：**文档中一律不写真实密钥，只写位置、类型与占位符。**
-> 需要真实值时，只放在 `application-local.yml`（已被 `.gitignore` 忽略）
-> 或运行环境变量里。
+> 需要真实值时，只放在仓库根的 `config/application-local.yml`
+> （已被 `.gitignore` 忽略、不在 classpath 上、不会被打包）或运行环境变量里。
+> `src/main/resources/application-local.yml` 已入库，**只允许 `${ENV:default}` 占位符**。
 
 ---
 
@@ -13,7 +14,7 @@
 | 项目 | 当前状态 | 谁来做 |
 |---|---|---|
 | 高德 Key 明文写在 `mcp-servers.json` | **已移除**，改为子进程继承环境变量 | 你：去控制台轮换该 Key |
-| `application-local.yml` 中的 4 处密钥 | 文件已被 `.gitignore` 忽略，从未进入版本库 | 你：逐一轮换 |
+| `application-local.yml` 中的 4 处密钥 | 真实值已迁到 `config/application-local.yml`（不入库、不打包）；classpath 上只留占位符 | 你：逐一轮换 |
 | 密钥是否进过 git 历史 | **未发现**（见第 2 节核查结论） | 无需强推 |
 | `tmp/` 是否进过 git 历史 | **未发现** | 无需清理历史 |
 | 提交前密钥扫描 | 已提供 gitleaks 方案 + 单测兜底 | 建议本地装 gitleaks |
@@ -45,7 +46,9 @@
 
 ### 1.3 轮换后怎么放
 
-- 数据库口令、DashScope Key：写回 `application-local.yml`（该文件不会进版本库）。
+- 数据库口令、DashScope Key：写进 `config/application-local.yml`（`file:./config/`，
+  不入库、不打包）或环境变量。**不要再写回 `src/main/resources/application-local.yml`**
+  ——该文件已入库，只允许 `${ENV:default}` 占位符，写进去等于随包分发。
 - 高德 Key：**不要写回 `mcp-servers.json`**，改用环境变量（见第 5 节）。
 
 ---
@@ -338,17 +341,108 @@ src/main/resources/mcp-servers.example.json
 
 ---
 
-## 7. `application-local.yml` 检查清单
+## 7. 配置分层与密钥外置（当前方案）
 
-该文件被 `.gitignore` 忽略，不会进版本库，但本机上仍以明文存在。请逐项确认：
+### 7.1 三层结构
 
-- [ ] 确认 `git check-ignore -v src/main/resources/application-local.yml` 有输出（确实被忽略）
-- [ ] 确认 `git ls-files | grep application-local` 为空（确实未被跟踪）
-- [ ] 轮换第 1 节清单中的全部密钥，并同步更新本文件
-- [ ] 检查是否还有**未列入清单**的 `password` / `secret` / `token` / `api-key` 字段
-- [ ] 确认该文件没有被复制到 `docs/`、`README.md`、截图、聊天记录或云笔记中
-- [ ] 确认 IDE 的"最近打开文件"、终端历史中没有粘贴过完整密钥
-- [ ] 若曾把该文件发给他人 / 上传网盘，按"已泄露"处理并立即轮换
+| 层 | 文件 / 来源 | 是否入库 | 是否进 jar | 放什么 |
+|---|---|---|---|---|
+| ① 公共默认 | `src/main/resources/application.yml` | 是 | 是 | 端口、预算、重试、限流、RAG、评测开关、模型名等**非敏感**配置 |
+| ② 本地差异 | `src/main/resources/application-local.yml` | 是 | 是 | 本地才有差异的**非敏感**值 + `${ENV:default}` 占位符 |
+| ③ 真实密钥 | 环境变量，或 `config/application-local.yml` | 否 | 否 | 模型 / 搜索 / 数据库口令 / Pexels 凭据 |
+
+关键点：② 里**没有任何真实值**，所以它进 jar 是安全的；③ 既不入库、也不在
+`src/main/resources` 下，因此**不会被打包**。
+
+### 7.2 属性 → 环境变量对照
+
+| 环境变量 | 属性 | 读取方（代码位置） |
+|---|---|---|
+| `MKAGENT_MODEL_API_KEY` | `spring.ai.dashscope.api-key` | `DashScopeChatModelConfig`（经 `DashScopeConnectionProperties`，前缀 `spring.ai.dashscope` 已用 javap 核对） |
+| `MKAGENT_MODEL_API_KEY` | `mkagent.model.api-key` | `OpenAiCompatibleChatModelConfig`（仅当配了 `mkagent.model.base-url`） |
+| `MKAGENT_SEARCH_API_KEY` | `search-api.api-key` | `WebSearchTool` |
+| `MKAGENT_DB_PASSWORD` | `spring.datasource.password` | Spring Boot 数据源自动配置 |
+| `MKAGENT_PEXELS_API_KEY` | `pexels.api-key` | 图片搜索子模块（主程序不读） |
+
+可选（覆盖非敏感默认值）：`MKAGENT_DB_URL`、`MKAGENT_DB_USERNAME`、`MKAGENT_CHAT_MODEL`。
+
+> **关于 `AI_DASHSCOPE_API_KEY`（SDK 原生变量）**：`DashScopeConnectionUtils`
+> 只在 apiKey 为 **null** 时才回退它，而本项目的模板把属性解析成**空串**
+> （非 null），所以库自己那条回退实际不会触发。兼容性由模板的嵌套占位符提供：
+> `spring.ai.dashscope.api-key: ${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}`
+> ——`MKAGENT_*` **未定义**时才退回 SDK 变量，两者都没有才是空串。
+> 解析顺序已用 `javap -c` 核对字节码，不依赖文档描述。
+>
+> 凭据校验放在 `resolveConnectionProperties` **之前**（`DashScopeChatModelConfig`）：
+> 库内部会先抛自己的 `DashScope API key must be set`，校验放后面等于死代码。
+> `ModelCredentialConfigTest` 守住"缺失即启动失败且报错点名环境变量"。
+
+### 7.2.1 来源覆盖 vs 占位符后备（实测结论）
+
+这两件事经常被写成一句"环境变量优先级最高"，那是错的。实测
+（`ModelCredentialSourcePriorityTest`，全部假值、不发起请求）：
+
+| 场景 | 属性**来源标签**（谁定义了这个属性） | 解析结果 | 结论 |
+|---|---|---|---|
+| 只有 `MKAGENT_MODEL_API_KEY` | `Config resource 'class path resource [application-local.yml]' via location 'optional:classpath:/'` | 该变量值 | **占位符后备**，不是来源覆盖 |
+| 只有 `AI_DASHSCOPE_API_KEY` | 同上（classpath 模板） | 该变量值 | 嵌套占位符的第二层后备 |
+| 主变量缺失 + SDK 变量有值 | 同上 | SDK 变量值 | 回退生效 |
+| 主变量**存在但为空串** + SDK 变量有值 | 同上 | **空串** → 启动失败 | 空 ≠ 缺失，**不回退** |
+| 只有外部 `config/application-local.yml` | `Config resource 'file [<path>/config/application-local.yml]' via location 'file:<path>/config/'` | 外部文件里的值 | 外部文件压过 classpath 模板 |
+| 自定义别名 `MKAGENT_MODEL_API_KEY` + 外部同名属性 | 外部文件（`file [...]`） | **外部文件的值**，别名不参与解析 | **来源覆盖**：模板占位符被整条替换 |
+
+由此得到两条可操作规则：
+
+1. **外部 `config/application-local.yml` 里写死属性后，失效的是"别名占位符"，不是环境变量这一层。**
+   外部文件直接定义了 `spring.ai.dashscope.api-key`，模板里的
+   `${MKAGENT_MODEL_API_KEY:...}` 整条被替换，该占位符不再参与解析，
+   所以别名变量不再有任何作用。
+   但**直接绑定目标属性**的环境变量（松散绑定名 `SPRING_AI_DASHSCOPE_API_KEY`）
+   是独立的属性源，按 Spring Boot 的属性源顺序（`systemEnvironment` 高于
+   config data 文件）生效，仍能压过外部文件里的字面量。
+   一句话：自定义别名只是占位符的输入，本身不是一个属性源。
+   （这一条依据 Spring Boot 的属性源顺序，本仓库测试集未单独覆盖。）
+2. **空串不等于没配。** `${A:${B:}}` 只在 A 未定义时用 B；`export A=` 会让结果变成空串，
+   最终以"未配置模型凭据"启动失败——这是预期行为，报错会点名 `MKAGENT_MODEL_API_KEY`。
+
+命令行参数（`--spring.ai.dashscope.api-key=...`）优先级最高，仅用于临时排查；
+`--spring.config.additional-location` 指定的目录同样按"外部文件"参与上面的比较。
+
+### 7.3 四种运行方式各自怎么给配置
+
+| 场景 | 配置来源 | 是否需要真实凭据 |
+|---|---|---|
+| 本地 IDE 运行 | 环境变量（Run Configuration）或 `config/application-local.yml`（工作目录须为仓库根） | 需要 |
+| `./mvnw test`（默认） | `@HermeticSpringBootTest` → `test` profile → `src/test/resources/application-test.yml`（H2 + 占位密钥） | **不需要** |
+| 真实评测（`-Plive` + `-Dmkagent.eval.music.enabled=true`） | `@ActiveProfiles("local")` → classpath 模板 + 环境变量 / `config/application-local.yml` | 需要 |
+| `java -jar app.jar` | 环境变量，或 `--spring.config.additional-location=file:/etc/mk-agent/`（目录下放 `application-local.yml`） | 需要 |
+
+### 7.4 为什么不用 Maven resource filtering
+
+`spring-boot-starter-parent` 默认对 `application*.yml` 打开 filtering（分隔符 `@...@`）。
+一旦有人在配置里写 `@MKAGENT_MODEL_API_KEY@`，构建时会把环境变量里的密钥
+**展开并写回** `target/classes`，再原样打进 jar：源码干净、产物带明文。
+因此 `pom.xml` 显式声明了 `<resources><filtering>false</filtering></resources>`，
+`${ENV:default}` 只在运行时由 Spring 解析。
+
+`ResourceSecretScanUnitTest#classpathCopyOfLocalConfigIsNotRewrittenByTheBuild`
+逐字节比对源码与 `target/classes` 上的同名文件，防止 filtering 被重新打开。
+
+### 7.5 检查清单
+
+- [ ] `git check-ignore -v config/application-local.yml` 有输出（真实值文件确实被忽略）
+- [ ] `git check-ignore src/main/resources/application-local.yml` **无输出、退出码 1**（模板必须入库）。
+      注意别用 `-v`：它会打印 `.gitignore` 里那条 `!` 例外规则并返回 0，看起来像"被忽略了"
+- [ ] `./mvnw test -Dtest=ResourceSecretScanUnitTest` 通过（`src/main/resources` 无明文密钥）
+- [ ] `./mvnw test -Dtest=StartupSmokeTest` 通过（隔离 H2 启动、无 MCP/Embedding、正常关闭）
+- [ ] `./mvnw test -Dtest=ModelCredentialSourcePriorityTest` 通过（来源标签与空值语义）
+- [ ] 临时清空凭据启动一次：报错应点名 `MKAGENT_MODEL_API_KEY` / `MKAGENT_SEARCH_API_KEY`，
+      而不是库原生的 `DashScope API key must be set`（后者说明校验位置被改到了 resolve 之后）
+- [ ] 打包后 `unzip -p target/*.jar BOOT-INF/classes/application-local.yml` 只有 `${...}` 占位符
+- [ ] 启动日志 / 健康端点（`/api/actuator/health`）不出现完整密钥（健康端点只回显前 6 位）
+- [ ] 确认密钥没有被写进 `.mvn/jvm.config`、启动脚本、`pom.xml` 或 IDE 共享配置
+- [ ] 轮换第 1 节清单中的全部密钥后，只更新 `config/application-local.yml` 或环境变量
+- [ ] 若曾把 `config/application-local.yml` 发给他人 / 上传网盘，按"已泄露"处理并立即轮换
 
 ---
 

@@ -128,25 +128,64 @@ mk-agent
 
 ### 1. 配置本地密钥
 
-新建 `src/main/resources/application-local.yml`（已被 git 忽略，不会上传）：
+仓库里**不含任何明文密钥**。配置分三层：
 
-```yaml
-spring:
-  datasource:
-    url: jdbc:postgresql://localhost:5432/your_db
-    username: your_user
-    password: your_password
+| 层 | 位置 | 入库 | 打包 | 放什么 |
+| --- | --- | --- | --- | --- |
+| 公共默认 | `src/main/resources/application.yml` | 是 | 是 | 端口、预算、重试、限流、模型名等非敏感配置 |
+| 本地差异 | `src/main/resources/application-local.yml` | 是 | 是 | 非敏感本地值 + `${ENV:default}` 占位符，**无真实值** |
+| 真实密钥 | 环境变量，或仓库根 `config/application-local.yml` | 否 | 否 | 见下表 |
 
-  ai:
-    dashscope:
-      api-key: 你的DashScope密钥
+真实密钥的取值分**两层**，混在一起说会得到错误结论（实测见
+`ModelCredentialSourcePriorityTest`）：
 
-search-api:
-  api-key: 你的搜索API密钥
-```
+**① 属性来源（谁定义了这个属性，高 → 低）**
 
-图片搜索子模块的 Pexels 密钥：设置环境变量 `PEXELS_API_KEY`，
-或子模块本地配置 `pexels.api-key`。
+1. 命令行参数（`--spring.ai.dashscope.api-key=...`，仅临时排查用）
+2. 仓库根 `config/application-local.yml`（Spring Boot 的 `file:./config/` 位置，已被忽略）
+3. classpath 模板 `src/main/resources/application-local.yml`
+
+自定义别名（`MKAGENT_*`）**不在这一层**：它只是模板占位符的输入（见 ②）。
+直接绑定目标属性的环境变量（如 `SPRING_AI_DASHSCOPE_API_KEY`）是独立属性源，
+按 Spring 常规优先级参与（高于 config data 文件）。
+
+**② 占位符后备（模板这一层怎么取值）**
+
+模板里写的是 `${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}`：
+变量**未定义**才回退到下一个；变量**定义为空串不会回退**，最终按未配置处理（启动失败）。
+
+> **最容易踩的一条**：外部 `config/application-local.yml` 里如果直接写了
+> `spring.ai.dashscope.api-key: <真实值>`，classpath 模板里那条
+> `${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}` 会被**整条替换**，
+> 该占位符不再参与解析，于是 `MKAGENT_MODEL_API_KEY` 这个**别名**失去作用。
+> 失效的是别名，不是环境变量这一层：**直接绑定目标属性**的环境变量
+> （如 `SPRING_AI_DASHSCOPE_API_KEY`）仍按 Spring 属性源优先级生效，
+> 且高于 config data 文件。要用别名，就别在外部文件里写同名属性。
+
+| 环境变量 | 用途 | 对应属性 |
+| --- | --- | --- |
+| `MKAGENT_MODEL_API_KEY` | 大模型调用 | `spring.ai.dashscope.api-key`（或 `mkagent.model.api-key`） |
+| `MKAGENT_SEARCH_API_KEY` | 网页搜索 | `search-api.api-key` |
+| `MKAGENT_DB_PASSWORD` | 数据库口令 | `spring.datasource.password` |
+| `MKAGENT_PEXELS_API_KEY` | 图片搜索子模块 | `pexels.api-key` |
+
+可选覆盖：`MKAGENT_DB_URL`、`MKAGENT_DB_USERNAME`、`MKAGENT_CHAT_MODEL`。
+
+> 凭据缺失时应用**启动即失败**，并打印该设哪个环境变量；
+> 不会退化成"跑起来但第一次调用才 401"。
+
+### 1.1 四种运行方式
+
+| 场景 | 怎么给配置 |
+| --- | --- |
+| 本地 IDE 运行 | Run Configuration 里加环境变量；或建 `config/application-local.yml`（工作目录须为仓库根） |
+| `./mvnw test` | 什么都不用做：`test` profile + H2 + 占位密钥，**不读真实凭据** |
+| 真实评测（`-Plive`） | 激活 `local` profile，读 classpath 模板 + 环境变量 / `config/application-local.yml` |
+| `java -jar` | 环境变量；或 `--spring.config.additional-location=file:/etc/mk-agent/` |
+
+> 不要把密钥写进启动脚本、`.mvn/jvm.config` 或 `pom.xml`：
+> 构建期变量有可能被 resource filtering 展开并打进产物（本仓库已关闭 filtering，
+> 详见 [`docs/SECURITY.md`](docs/SECURITY.md) 第 7 节）。
 
 ### 2. 启动
 
@@ -238,8 +277,11 @@ event:done       [DONE]
 
 ## 安全说明
 
-- 所有密钥通过本地配置文件 / 环境变量注入，仓库中不含任何明文密钥
-- `application-local.yml`、`mcp-servers.json` 均已加入 `.gitignore`
+- 所有密钥通过环境变量 / `config/application-local.yml` 注入，仓库中不含任何明文密钥
+- `config/application-local.yml`、`mcp-servers.json` 已加入 `.gitignore`；
+  `src/main/resources/application-local.yml` 已入库但只有占位符（见第 7 节安全文档）
+- 打包产物不含明文密钥：构建期关闭了 resource filtering，
+  `ResourceSecretScanUnitTest` 会扫描资源目录并逐字节校验 classpath 副本
 
 ---
 

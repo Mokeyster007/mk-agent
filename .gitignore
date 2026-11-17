@@ -1,5 +1,9 @@
 ###  CUSTOM  ###
+# 本机真实配置（含密钥）默认忽略：包括仓库根的 config/application-local.yml。
 application-local.yml
+# 唯一例外：classpath 上的脱敏模板。它只有 ${ENV:} 占位符、不含任何真实值，
+# 必须入库，否则打包产物里没有可覆盖的配置骨架（详见 docs/SECURITY.md 第 7 节）。
+!src/main/resources/application-local.yml
 # MCP 服务配置含本地真实密钥，不上传；仓库中如需示例可另建 mcp-servers.example.json
 mcp-servers.json
 

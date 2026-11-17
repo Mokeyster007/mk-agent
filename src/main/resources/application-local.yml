@@ -1,0 +1,51 @@
+# =============================================================
+# 本地开发配置（随 classpath 加载，**已入库**）。
+#
+# 本文件只放"非敏感"的本地差异；任何真实密钥都不许写在这里。
+#
+# 取值分两层，别混为一谈（实测见 ModelCredentialSourcePriorityTest）：
+#   ① 属性来源（谁定义了这个属性）：
+#      外部 config/application-local.yml（file:./config/，.gitignore 忽略）
+#      > 本模板。外部文件里**写了**的属性会整条覆盖本模板（连 ${...} 一起
+#      替换），该占位符不再参与解析，因此 MKAGENT_* 这类**别名**失去作用；
+#      想用别名，就别在外部文件里写同名属性。
+#      注意：直接绑定目标属性的环境变量（如 SPRING_AI_DASHSCOPE_API_KEY）
+#      是独立属性源，仍按 Spring 属性源优先级生效，不受这条影响。
+#   ② 占位符后备（本模板这一层怎么取值）：${MKAGENT_XXX:默认值}。
+#      变量**未定义**才用默认值；变量定义为**空串**不会回退，按未配置处理。
+#
+# 详见 docs/SECURITY.md 第 7.2 节、README「配置本地密钥」。
+# =============================================================
+spring:
+  datasource:
+    url: ${MKAGENT_DB_URL:jdbc:postgresql://localhost:5433/ai_agent}
+    username: ${MKAGENT_DB_USERNAME:mk_agent}
+    password: ${MKAGENT_DB_PASSWORD:}
+
+  ai:
+    dashscope:
+      # 模型凭据：只从环境变量 / 外部配置注入，本文件只写占位符。
+      # 嵌套写法是为了兼容 DashScope SDK 的原生变量：
+      #   先取 MKAGENT_MODEL_API_KEY，取不到再退回 AI_DASHSCOPE_API_KEY。
+      # 两者都没有时解析结果为空串，启动阶段由 DashScopeChatModelConfig
+      # 抛出"该设哪个环境变量"的明确错误（而不是等第一次调用才 401）。
+      api-key: ${MKAGENT_MODEL_API_KEY:${AI_DASHSCOPE_API_KEY:}}
+      chat:
+        options:
+          model: ${MKAGENT_CHAT_MODEL:qwen-plus}
+          enable-thinking: false # 见第二节,先关掉思考模式
+
+# 搜索服务（searchapi.io）凭据：只从环境变量或外部配置注入。
+search-api:
+  api-key: ${MKAGENT_SEARCH_API_KEY:}
+
+# OpenAI 兼容客户端（mkagent.model.*）。
+# 这里**只放凭据占位符**：base-url 留空 → 继续走 DashScope 原生客户端。
+# 需要切换时在 config/application-local.yml 里配 base-url，api-key 自动取环境变量。
+mkagent:
+  model:
+    api-key: ${MKAGENT_MODEL_API_KEY:}
+
+# 图片搜索子模块（mk-image-search-mcp-server）使用；主程序不读取。
+pexels:
+  api-key: ${MKAGENT_PEXELS_API_KEY:}

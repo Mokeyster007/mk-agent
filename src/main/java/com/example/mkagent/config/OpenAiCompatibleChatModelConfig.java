@@ -145,7 +145,13 @@ public class OpenAiCompatibleChatModelConfig {
     private ChatModel build(String purpose, OpenAiCompatibleModelProperties.ModelSpec spec) {
         Assert.hasText(
                 properties.getApiKey(),
-                "mkagent.model.api-key 不能为空：启用 OpenAI 兼容客户端时必须提供 API Key"
+                "未配置模型凭据：启用 OpenAI 兼容客户端（mkagent.model.base-url）时，"
+                        + "必须同时提供 mkagent.model.api-key。"
+                        + "建议设置环境变量 MKAGENT_MODEL_API_KEY——"
+                        + "classpath 上的 application-local.yml 已把该属性绑定成 "
+                        + "${MKAGENT_MODEL_API_KEY:}；"
+                        + "若在 config/application-local.yml 里覆盖，请照抄同一写法。"
+                        + "详见 docs/SECURITY.md 第 7 节。"
         );
 
         String modelName = resolveModelName(purpose, spec);

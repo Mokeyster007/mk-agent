@@ -268,6 +268,32 @@
     </dependencies>
 
     <build>
+        <!--
+            ===========================================================
+            资源过滤：显式关闭（打包安全的关键一条）
+            ===========================================================
+            spring-boot-starter-parent 默认对 src/main/resources 下的
+            application*.yml / *.yaml / *.properties 打开 filtering
+            （分隔符是 @...@，不是 ${...}）。
+
+            这条默认规则本身是"方便"，但对本项目是风险：
+            只要有人写出 @MKAGENT_MODEL_API_KEY@ 这类占位符，
+            构建时就会把当前 shell / CI 里的密钥**展开并写回** target/classes，
+            再原样打进 jar——密钥从"运行时注入"退回"随包分发"，
+            而且源码里看不出任何痕迹（源码只有占位符，jar 里是明文）。
+
+            所以这里覆盖父 POM 的 resources 定义并关闭 filtering：
+            配置文件一律按源码原样复制，${ENV:default} 只在运行时由 Spring 解析。
+            本项目资源目录中没有任何 @...@ 构建期占位符，
+            关闭过滤不影响现有功能（已用打包产物核对，见 docs/SECURITY.md 第 7 节）。
+        -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+            </resource>
+        </resources>
+
         <plugins>
 
             <plugin>

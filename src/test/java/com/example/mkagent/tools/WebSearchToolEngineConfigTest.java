@@ -7,6 +7,8 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * WebSearchTool 请求参数构造（离线，不联网）。
@@ -62,5 +64,21 @@ class WebSearchToolEngineConfigTest {
 
         assertEquals("google", tool.getEngine());
         assertFalse(tool.buildRequestParams("x").get("engine").toString().contains(" "));
+    }
+
+    @Test
+    @DisplayName("搜索凭据为空：装配阶段直接失败，报错点名环境变量")
+    void blankApiKeyFailsFastWithActionableMessage() {
+        for (String blank : new String[]{"", "   "}) {
+            IllegalStateException error = assertThrows(
+                    IllegalStateException.class,
+                    () -> new WebSearchTool(blank, "baidu"),
+                    "空凭据必须启动即失败，不能等到第一次搜索才 401"
+            );
+            assertTrue(error.getMessage().contains("MKAGENT_SEARCH_API_KEY"),
+                    "报错必须告诉运维该设哪个环境变量");
+            assertTrue(error.getMessage().contains("search-api.api-key"),
+                    "报错必须同时给出属性名，便于排查是不是配置写错");
+        }
     }
 }
