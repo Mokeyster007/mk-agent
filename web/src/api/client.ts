@@ -42,7 +42,11 @@ export function authHeaders(extra?: Record<string, string>): Record<string, stri
 }
 
 export interface JsonRequestOptions {
-  method?: 'GET' | 'POST'
+  /**
+   * 只允许这几种：不提供 PUT / PATCH，是因为当前没有任何接口需要
+   * "部分更新"语义；少一种方法就少一类误用。
+   */
+  method?: 'GET' | 'POST' | 'DELETE'
   query?: Record<string, string | number | undefined>
   signal?: AbortSignal
   body?: unknown
@@ -98,6 +102,11 @@ export async function requestJson<T>(path: string, options: JsonRequestOptions =
  *
  * 单独暴露是因为 SSE 需要拿到未消费的 response.body，
  * 而且必须用 fetch（EventSource 无法设置 X-User-Id 请求头）。
+ *
+ * Accept 同时声明 json：流接口在**启动之前**就失败时（401/403/404/409，
+ * 比如"这个会话还有未完成任务"）返回的是普通 JSON 错误体。
+ * 只写 text/event-stream 会让 Spring 找不到可接受的表示形式，
+ * 把 409 变成 406/500，界面就只能显示成"未知错误"。
  */
 export async function openStream(
   path: string,
@@ -110,7 +119,7 @@ export async function openStream(
     response = await fetch(apiUrl(path, query), {
       method,
       signal,
-      headers: authHeaders({ Accept: 'text/event-stream' }),
+      headers: authHeaders({ Accept: 'text/event-stream, application/json' }),
     })
   } catch (error) {
     throw toNetworkError(error)

@@ -8,6 +8,7 @@ import com.example.mkagent.approval.ApprovalPauseGateway;
 import com.example.mkagent.approval.ApprovalSummaryBuilder;
 import com.example.mkagent.approval.ApprovalToolPolicy;
 import com.example.mkagent.approval.RunHandoffLocks;
+import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
@@ -60,6 +61,7 @@ public class MusicAgentConfig {
             ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
+            ConversationService conversationService,
             @Value("${mkagent.agent.music.write-enabled:false}") boolean writeEnabled,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
@@ -95,6 +97,7 @@ public class MusicAgentConfig {
                 approvalCompletionService,
                 approvalSummaryBuilder,
                 runHandoffLocks,
+                conversationService,
                 maxSteps,
                 maxToolCalls,
                 timeout,
@@ -119,6 +122,7 @@ public class MusicAgentConfig {
             ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
+            ConversationService conversationService,
             @Value("${mkagent.agent.music.max-steps:8}") int maxSteps,
             @Value("${mkagent.agent.music.max-tool-calls:12}") int maxToolCalls,
             @Value("${mkagent.agent.music.timeout:2m}") Duration timeout,
@@ -148,6 +152,7 @@ public class MusicAgentConfig {
                 approvalCompletionService,
                 approvalSummaryBuilder,
                 runHandoffLocks,
+                conversationService,
                 maxSteps,
                 maxToolCalls,
                 timeout,
@@ -195,6 +200,7 @@ public class MusicAgentConfig {
             ApprovalExecutionCompletionService approvalCompletionService,
             ApprovalSummaryBuilder approvalSummaryBuilder,
             RunHandoffLocks runHandoffLocks,
+            ConversationService conversationService,
             int maxSteps,
             int maxToolCalls,
             Duration timeout,
@@ -226,6 +232,12 @@ public class MusicAgentConfig {
         agent.setApprovalPauseGateway(approvalPauseGateway);
         agent.setApprovalSummaryBuilder(approvalSummaryBuilder);
         agent.setHandoffLocks(runHandoffLocks);
+
+        /*
+         * 会话（同一窗口连续聊天）：只影响"历史文本 + 业务引用"的注入
+         * 与终态落库，不改变审批身份（幂等键仍由 run + step + tool 派生）。
+         */
+        agent.setConversationService(conversationService);
 
         /*
          * 批次 2：恢复执行的启动标记与收尾都走 ApprovalClaimService。

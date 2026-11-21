@@ -143,13 +143,18 @@ ol {
 .mk-btn--primary {
   background: var(--c-accent);
   border-color: var(--c-accent);
-  color: #0b0d12;
+  color: var(--c-text-inverse);
   font-weight: 600;
 }
 
 .mk-btn--primary:hover:not(:disabled) {
-  background: #93a0ff;
-  border-color: #93a0ff;
+  background: var(--c-accent-strong);
+  border-color: var(--c-accent-strong);
+}
+
+/* 按压反馈只有 1px 位移，不做缩放/发光 */
+.mk-btn:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .mk-btn--ghost {

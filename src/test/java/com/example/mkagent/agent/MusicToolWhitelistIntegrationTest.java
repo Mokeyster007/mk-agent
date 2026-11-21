@@ -101,7 +101,7 @@ class MusicToolWhitelistIntegrationTest {
     }
 
     @Test
-    @DisplayName("MUSIC_USER：曲库 + 歌单 + 终止，共 5 个")
+    @DisplayName("MUSIC_USER：曲库 + 歌单 + 播放只读 + 终止，共 7 个")
     void musicUserWhitelistIsExact() {
         assertThat(toolNames(musicUserToolCallbacks))
                 .as("MUSIC_USER 白名单必须精确等于设计")
@@ -110,6 +110,12 @@ class MusicToolWhitelistIntegrationTest {
                         "get_song_detail",
                         "get_user_playlists",
                         "get_playlist_songs",
+                        /*
+                         * 播放只读工具：只回答"能不能播""正在播哪首"，
+                         * 不签发地址、不触发播放，因此不需要审批。
+                         */
+                        "check_playback",
+                        "get_now_playing",
                         "terminate_task"
                 );
     }

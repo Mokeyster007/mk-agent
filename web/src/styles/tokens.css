@@ -1,46 +1,56 @@
 /**
- * 设计变量
+ * 设计令牌 —— 「夜间唱片室」
  * ---------------------------------------------------------------
- * 单一柔和强调色（periwinkle），中性深色底，其余状态色只做小面积点缀。
- * 所有颜色都成对定义：前景色在对应底色上的对比度均高于 4.5:1，
- * 半透明表面只用于"浮起"层级，不用于承载正文。
+ * 方向：安静、清楚、有一点音乐识别度的工作台，不是播放器，也不是落地页。
+ * 借鉴的是音乐应用的排版与曲目列表密度（字号分层、行距、序号列），
+ * 不借鉴播放控件、封面墙、渐变 Hero。
+ *
+ * 配色：三层底色靠明度区分（背景 / 侧栏 / 浮层），强调色只有一种薄荷绿，
+ * 只用于发送按钮、当前会话、关键操作。状态色永远配文字说明，不靠颜色单独传达。
+ *
+ * 字号：正文 15px / 1.65 行高，中文优先系统字体。
+ * 间距：4/8 的倍数，只有 --s-* 一组，不出现 13px、18px 这类随手值。
+ * 圆角：两档 —— 控件 8px，容器与弹层 14px；胶囊只给标签。
  */
+
 :root {
-  /* ---- 底色层级（越靠上层越亮，靠明度而不是靠阴影区分） ---- */
-  --c-bg: #0c0e12;
-  --c-bg-soft: #0f1217;
-  --c-surface: #14181e;
-  --c-surface-2: #191e26;
-  --c-surface-3: #1f2630;
-  --c-surface-hover: #1c222b;
+  /* ---- 底色层级 ---- */
+  --c-bg: #111416;
+  --c-bg-soft: #171b1e;
+  --c-bg-nav: #171b1e;
+  --c-surface: #202529;
+  --c-surface-2: #262c30;
+  --c-surface-3: #2e353a;
+  --c-surface-hover: #242a2e;
 
   /* ---- 描边 ---- */
-  --c-line: #232a34;
-  --c-line-soft: #1b2129;
-  --c-line-strong: #333d4b;
+  --c-line: #2a3134;
+  --c-line-soft: #22282b;
+  --c-line-strong: #3a4348;
 
   /* ---- 文字 ---- */
-  --c-text: #e9ecf2;
-  --c-text-2: #a6afbd;
-  --c-text-3: #737d8c;
-  --c-text-inverse: #0c0e12;
+  --c-text: #f1f3f2;
+  --c-text-2: #aab4b0;
+  --c-text-3: #7c8783;
+  --c-text-inverse: #0e1413;
 
-  /* ---- 强调色 ---- */
-  --c-accent: #7f8ffa;
-  --c-accent-ink: #b4bdff;
-  --c-accent-weak: rgba(127, 143, 250, 0.14);
-  --c-accent-weak-2: rgba(127, 143, 250, 0.08);
-  --c-accent-line: rgba(127, 143, 250, 0.32);
+  /* ---- 强调色（薄荷）：发送、当前会话、关键操作 ---- */
+  --c-accent: #76d6b2;
+  --c-accent-ink: #a6e9d0;
+  --c-accent-strong: #8fe2c3;
+  --c-accent-weak: rgba(118, 214, 178, 0.13);
+  --c-accent-weak-2: rgba(118, 214, 178, 0.07);
+  --c-accent-line: rgba(118, 214, 178, 0.34);
 
-  /* ---- 语义色 ---- */
-  --c-ok: #4ec2a0;
-  --c-ok-weak: rgba(78, 194, 160, 0.13);
-  --c-warn: #e2b45e;
-  --c-warn-weak: rgba(226, 180, 94, 0.13);
-  --c-danger: #e2796f;
-  --c-danger-weak: rgba(226, 121, 111, 0.13);
-  --c-info: #6fb6e8;
-  --c-info-weak: rgba(111, 182, 232, 0.13);
+  /* ---- 语义色：等待确认 / 失败 / 拒绝 / 进行中 ---- */
+  --c-ok: #74cfa9;
+  --c-ok-weak: rgba(116, 207, 169, 0.13);
+  --c-warn: #e0b15f;
+  --c-warn-weak: rgba(224, 177, 95, 0.13);
+  --c-danger: #e2837a;
+  --c-danger-weak: rgba(226, 131, 122, 0.13);
+  --c-info: #7fb6d8;
+  --c-info-weak: rgba(127, 182, 216, 0.13);
 
   /* ---- 字体 ---- */
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
@@ -48,17 +58,17 @@
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
     'Liberation Mono', monospace;
 
-  --fs-xs: 11px;
-  --fs-sm: 12.5px;
-  --fs-base: 14px;
+  --fs-xs: 11.5px;
+  --fs-sm: 13px;
+  --fs-base: 15px;
   --fs-md: 15px;
   --fs-lg: 17px;
-  --fs-xl: 21px;
-  --fs-2xl: 26px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
 
-  --lh-tight: 1.35;
-  --lh-base: 1.62;
-  --lh-relaxed: 1.78;
+  --lh-tight: 1.4;
+  --lh-base: 1.65;
+  --lh-relaxed: 1.8;
 
   /* ---- 间距（4 的倍数） ---- */
   --s-1: 4px;
@@ -72,34 +82,35 @@
   --s-12: 48px;
   --s-16: 64px;
 
-  /* ---- 圆角 ---- */
-  --r-xs: 6px;
+  /* ---- 圆角：只有两档 + 胶囊 ---- */
+  --r-xs: 8px;
   --r-sm: 8px;
-  --r-md: 12px;
-  --r-lg: 16px;
-  --r-xl: 22px;
+  --r-md: 14px;
+  --r-lg: 14px;
+  --r-xl: 14px;
   --r-pill: 999px;
 
-  /* ---- 阴影：只在需要"脱离平面"的元素上使用 ---- */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.32);
-  --shadow-md: 0 8px 24px -12px rgba(0, 0, 0, 0.7);
-  --shadow-lg: 0 24px 60px -24px rgba(0, 0, 0, 0.8);
+  /* ---- 阴影：只有浮层用 ---- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
+  --shadow-lg: 0 24px 64px -28px rgba(0, 0, 0, 0.85);
 
   /* ---- 布局 ---- */
   --nav-w: 264px;
-  --panel-w: 372px;
-  --center-max: 744px;
-  --header-h: 60px;
+  --panel-w: 400px;
+  --center-max: 800px;
+  --header-h: 56px;
+  --composer-max-h: 200px;
 
-  /* ---- 动效 ---- */
+  /* ---- 动效：只给按压/焦点/抽屉，不给布局 ---- */
   --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
-  --dur-fast: 120ms;
-  --dur: 200ms;
-  --dur-slow: 320ms;
+  --dur-fast: 110ms;
+  --dur: 180ms;
+  --dur-slow: 260ms;
 
-  /* ---- 毛玻璃（局部使用，始终叠加不透明底以保证可读性） ---- */
-  --frost: rgba(20, 24, 30, 0.72);
-  --frost-blur: saturate(1.25) blur(18px);
+  /* ---- 毛玻璃：只在浮层标题栏局部使用，始终叠不透明底 ---- */
+  --frost: rgba(23, 27, 30, 0.82);
+  --frost-blur: saturate(1.2) blur(16px);
 
   --z-drawer: 40;
   --z-overlay: 50;

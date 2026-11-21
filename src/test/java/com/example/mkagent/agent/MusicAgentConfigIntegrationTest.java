@@ -65,6 +65,8 @@ class MusicAgentConfigIntegrationTest {
         assertEquals(
                 Set.of("search_songs", "get_song_detail",
                         "get_user_playlists", "get_playlist_songs",
+                        // 播放只读工具：只回答能否播放 / 正在播放哪首
+                        "check_playback", "get_now_playing",
                         "terminate_task"),
                 names
         );

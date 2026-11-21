@@ -73,3 +73,8 @@ mkagent:
       # 演示的唯一目的：让"创建歌单 / 添加歌曲"这条链路真正可用。
       # 写操作仍然必须经页面批准（ApprovalToolPolicy 按注解扫描，不受本开关影响）。
       write-enabled: true
+
+  shop:
+    # 商城演示身份：信任 X-User-Id，角色仍然只从 shop_user 表读。
+    # 只在 demo profile 打开——这是本轮浏览器验收（下单 / 发货 / 签收）的前提。
+    demo-identity-enabled: true

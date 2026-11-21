@@ -96,8 +96,8 @@ class MusicPromptCapabilityTest {
                 MusicAgent.USER_WRITE_SYSTEM_PROMPT_VERSION);
         assertNotEquals(MusicAgent.USER_SYSTEM_PROMPT_VERSION,
                 MusicAgent.ADMIN_SYSTEM_PROMPT_VERSION);
-        assertEquals("music-user-readonly/v3", MusicAgent.USER_SYSTEM_PROMPT_VERSION);
-        assertEquals("music-user-write-approval/v3", MusicAgent.USER_WRITE_SYSTEM_PROMPT_VERSION);
+        assertEquals("music-user-readonly/v5", MusicAgent.USER_SYSTEM_PROMPT_VERSION);
+        assertEquals("music-user-write-approval/v7", MusicAgent.USER_WRITE_SYSTEM_PROMPT_VERSION);
         assertEquals("music-admin-readonly/v3", MusicAgent.ADMIN_SYSTEM_PROMPT_VERSION);
     }
 
@@ -132,6 +132,31 @@ class MusicPromptCapabilityTest {
             assertFalse(prompt.contains(artist),
                     "提示词不得点名具体歌手（会退化成黑名单）：" + artist);
         }
+    }
+
+    @Test
+    @DisplayName("播放契约：两份用户提示词都禁止宣称已播放，管理员提示词不带它")
+    void playbackContractOnlyForUserPrompts() {
+        for (String prompt : new String[]{
+                MusicAgent.USER_SYSTEM_PROMPT,
+                MusicAgent.USER_WRITE_SYSTEM_PROMPT}) {
+            assertTrue(prompt.contains(MusicAgent.PLAYBACK_CONTRACT),
+                    "用户提示词必须包含播放契约");
+            assertTrue(prompt.contains("**不能**直接播放音频"), "必须明确模型不能播放");
+            assertTrue(prompt.contains("**不得**说\"正在播放\""),
+                    "必须禁止宣称已经开始播放");
+            assertTrue(prompt.contains("get_now_playing"),
+                    "必须要求用工具确认\"正在播放\"的是哪首");
+            assertFalse(prompt.contains("http"), "播放契约里不该出现地址样例");
+        }
+
+        assertFalse(MusicAgent.ADMIN_SYSTEM_PROMPT.contains(MusicAgent.PLAYBACK_CONTRACT),
+                "管理员没有播放工具，提示词不应提到播放链路");
+
+        assertTrue(MusicAgent.USER_WRITE_SYSTEM_PROMPT.contains(MusicAgent.PLAYBACK_WRITE_CONTRACT),
+                "写能力版本要说明\"把当前播放曲目加入歌单\"的链路");
+        assertFalse(MusicAgent.USER_SYSTEM_PROMPT.contains(MusicAgent.PLAYBACK_WRITE_CONTRACT),
+                "只读版本不能出现写链路");
     }
 
     @Test

@@ -6,6 +6,8 @@ import com.example.mkagent.approval.ApprovalExecutionCompletionService;
 import com.example.mkagent.approval.RecoveryGate;
 import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.UserContextHolder;
+import com.example.mkagent.conversation.ConversationSeed;
+import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEvent;
@@ -170,6 +172,19 @@ public abstract class BaseAgent {
      * 记录器内部已保证：数据库失败不中断任务主流程。
      */
     private AgentRunRecorder runRecorder;
+
+    /**
+     * 会话读写（可选）。
+     *
+     * <p>为 null 时不做会话落库——纯单元测试与老的独立任务入口都不受影响。
+     * 只在终态持久化成功后调用一次，且 (run_id, role) 唯一，重复调用是更新。
+     *
+     * <p>为什么是 protected 而不是 private：子类（ToolCallAgent）要在工具执行后
+     * 立刻把业务引用落一次库。**不要**在子类里再声明一个同名字段——
+     * 那会遮蔽这个字段，setter 变成子类的 override，
+     * 结果就是"注入进去了，但基类看到的一直是 null"（踩过）。
+     */
+    protected ConversationService conversationService;
 
     /**
      * 全局并发闸门（可选）。
@@ -421,6 +436,22 @@ public abstract class BaseAgent {
      * 4. 任务以任何终态结束后，从注册表移除并只执行一次 cleanup。
      */
     public SseEmitter runStream(String userPrompt) {
+        return runStream(userPrompt, null);
+    }
+
+    /**
+     * 带会话上下文执行一次任务。
+     *
+     * <p>与无参版本的区别只有两处：
+     * 1. 先注入最近几轮的**纯文本**历史（用户/助手），再追加本轮用户输入；
+     * 2. 本轮用户输入前面附一段"会话已知对象"（来自真实工具结果的 id/名称）。
+     *
+     * <p>不注入历史工具调用：回放旧 tool_call 会让模型把上一轮的写指令
+     * 当成本轮指令重新执行一遍。
+     *
+     * @param seed 会话上下文；为 null 时行为与单参版本完全一致
+     */
+    public SseEmitter runStream(String userPrompt, ConversationSeed seed) {
         if (userPrompt == null || userPrompt.isBlank()) {
             throw new IllegalArgumentException("用户任务不能为空");
         }
@@ -463,8 +494,13 @@ public abstract class BaseAgent {
         /*
          * 每次 Agent 请求拥有独立上下文。
          * 不要将 ctx 放到 BaseAgent 成员变量。
+         *
+         * runId 可以由入口预先给出（会话需要在启动前就落一条用户消息），
+         * 没有给就照旧自己生成。
          */
-        AgentRunContext ctx = new AgentRunContext();
+        AgentRunContext ctx = (seed != null && seed.runId() != null)
+                ? new AgentRunContext(seed.runId())
+                : new AgentRunContext();
 
         /*
          * 固化用户身份与 Agent 类型：
@@ -472,6 +508,10 @@ public abstract class BaseAgent {
          */
         ctx.setUserId(UserContextHolder.getOrDefault());
         ctx.setAgentType(getAgentType());
+
+        if (seed != null && seed.hasConversation()) {
+            ctx.setConversationId(seed.conversationId());
+        }
 
         ctx.transitionTo(AgentState.RUNNING);
 
@@ -491,7 +531,15 @@ public abstract class BaseAgent {
             ctx.getMessages().add(new SystemMessage(systemPrompt));
         }
 
-        ctx.getMessages().add(new UserMessage(userPrompt));
+        /*
+         * 会话历史：只放文本轮次，且必须在本轮用户输入之前。
+         * 顺序错了模型会把历史当成"还没发生的事"。
+         */
+        if (seed != null && seed.history() != null && !seed.history().isEmpty()) {
+            ctx.getMessages().addAll(seed.history());
+        }
+
+        ctx.getMessages().add(new UserMessage(withRefs(userPrompt, seed)));
 
         /*
          * 防止 finally、onTimeout、onCompletion、取消接口重复 cleanup。
@@ -909,8 +957,16 @@ public abstract class BaseAgent {
                 if (!completed) {
                     log.warn("终态未命中本次代次，不发送成功事件：runId={}, epoch={}, state={}",
                             ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState());
+                    return false;
                 }
-                return completed;
+
+                /*
+                 * 会话落库只在"终态确实归本次代次"之后做：
+                 * 命中不了说明这次执行不再是结论来源，此时写助手回答
+                 * 等于给会话塞一句库里并不承认的结论。
+                 */
+                finishConversationTurn(ctx);
+                return true;
             }
 
             /*
@@ -925,6 +981,7 @@ public abstract class BaseAgent {
 
             if (rows == 1) {
                 finishResumeApproval(ctx);
+                finishConversationTurn(ctx);
             } else {
                 log.warn("终态写入未命中（旧代次或暂停中）：runId={}, epoch={}, state={}, rows={}",
                         ctx.getRunId(), ctx.getExecutionEpoch(), ctx.getState(), rows);
@@ -963,6 +1020,40 @@ public abstract class BaseAgent {
     private void recordRunStart(AgentRunContext ctx, String userPrompt) {
         if (runRecorder != null) {
             runRecorder.recordStart(ctx, userPrompt);
+        }
+    }
+
+    /**
+     * 把"会话已知对象"拼到本轮用户输入前面。
+     *
+     * <p>为什么拼进用户消息而不是另加一条 SystemMessage：
+     * 部分 OpenAI 兼容实现只接受开头的 system 消息，中途插入 system
+     * 会被拒绝或忽略；拼在用户消息里则任何实现都能看到。
+     *
+     * <p>库里存的仍是用户原文（recordRunStart 与用户消息表都用原文），
+     * 这段前缀只出现在送给模型的内容里。
+     */
+    private String withRefs(String userPrompt, ConversationSeed seed) {
+        if (seed == null || seed.refsBlock() == null || seed.refsBlock().isBlank()) {
+            return userPrompt;
+        }
+        return seed.refsBlock() + "\n\n[用户本轮输入]\n" + userPrompt;
+    }
+
+    /**
+     * 把本轮写进会话（助手回答 + 业务引用）。
+     *
+     * <p>内部吞异常：run 的终态已经落库，会话写失败只是少了聊天记录，
+     * 不能让一次成功任务因为"记不上聊天"而返回失败。
+     */
+    private void finishConversationTurn(AgentRunContext ctx) {
+        if (conversationService == null) {
+            return;
+        }
+        try {
+            conversationService.finishTurn(ctx);
+        } catch (RuntimeException e) {
+            log.warn("会话轮次落库失败（不影响任务结论）：runId={}", ctx.getRunId(), e);
         }
     }
 
@@ -1325,6 +1416,13 @@ public abstract class BaseAgent {
      */
     public void setRunRecorder(AgentRunRecorder runRecorder) {
         this.runRecorder = runRecorder;
+    }
+
+    /**
+     * 注入会话服务（由具体 Agent 的构造器转交）；为 null 表示不记录会话。
+     */
+    public void setConversationService(ConversationService conversationService) {
+        this.conversationService = conversationService;
     }
 
     /**

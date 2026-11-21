@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mk-agent-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mk_agent}
+      POSTGRES_PASSWORD: 282218311
+      POSTGRES_DB: ${POSTGRES_DB:-ai_agent}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - mk_agent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-mk_agent} -d ${POSTGRES_DB:-ai_agent}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  mk_agent_pgdata:

@@ -36,6 +36,13 @@ public class AgentRunEntity {
     private String userId;
 
     /**
+     * 所属会话；null 表示独立任务（历史记录保持原样，不强制迁移）。
+     *
+     * <p>不要把它当 runId 用：conversationId 跨多轮不变，runId 每轮新建。
+     */
+    private String conversationId;
+
+    /**
      * Agent 类型：CHAT / MANUS / FILE / EVAL。
      * EVAL 仅用于离线评测；评测 Agent 不注入记录器，不会写入本表。
      */
@@ -164,6 +171,14 @@ public class AgentRunEntity {
 
     public void setUserId(String userId) {
         this.userId = userId;
+    }
+
+    public String getConversationId() {
+        return conversationId;
+    }
+
+    public void setConversationId(String conversationId) {
+        this.conversationId = conversationId;
     }
 
     public String getAgentType() {

@@ -1,0 +1,1019 @@
+{
+  "version": 2,
+  "tasks": [
+    {
+      "taskId": "q01-artist-search",
+      "category": "QUERY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "夜航星有哪些歌？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "夜航星",
+            "limit": 10
+          }
+        },
+        {
+          "answer": "夜航星共有 5 首歌：城市霓虹、深夜电台、末班地铁、霓虹之外、失眠频率。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs"
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "城市霓虹",
+          "失眠频率"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [
+          "已为你创建",
+          "已添加"
+        ]
+      },
+      "manualReview": "是否恰好列出 5 首且没有编造第 6 首。"
+    },
+    {
+      "taskId": "q02-song-detail",
+      "category": "QUERY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "《城市霓虹》是哪一年发行的？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "城市霓虹"
+          }
+        },
+        {
+          "tool": "get_song_detail",
+          "args": {
+            "songId": 1001
+          }
+        },
+        {
+          "answer": "《城市霓虹》由夜航星演唱，收录在同名专辑《城市霓虹》中，2021 年发行。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "get_song_detail"
+        ],
+        "toolFallbacks": [
+          {
+            "insteadOf": "get_song_detail",
+            "tools": [
+              "search_songs"
+            ],
+            "responseMustContain": [
+              "releaseYear",
+              "2021"
+            ],
+            "reason": "search_songs 的响应体本身带 releaseYear；只要该字段与答案年份在同一次响应里同时出现，年份就有查询依据，不必再单独调用详情工具"
+          }
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "2021",
+          "城市霓虹"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ]
+      },
+      "manualReview": "年份必须来自本次工具响应（search_songs 或 get_song_detail 均可），不能是模型记忆。"
+    },
+    {
+      "taskId": "q03-my-playlists",
+      "category": "QUERY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "我有哪些歌单？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "get_user_playlists",
+          "args": {}
+        },
+        {
+          "answer": "你有 2 个歌单：深夜通勤（私有，8 首）和周末清晨（公开，6 首）。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "get_user_playlists"
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "深夜通勤",
+          "周末清晨"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [],
+        "hallucinationPhrases": [
+          "跑步歌单"
+        ]
+      },
+      "manualReview": "不得出现其他用户的歌单（跑步歌单属于 bob）。"
+    },
+    {
+      "taskId": "q04-playlist-songs",
+      "category": "QUERY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "我的歌单「深夜通勤」里都有哪些歌？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "get_user_playlists",
+          "args": {}
+        },
+        {
+          "tool": "get_playlist_songs",
+          "args": {
+            "playlistId": "{{playlistId:深夜通勤}}"
+          }
+        },
+        {
+          "answer": "「深夜通勤」共 8 首，包括城市霓虹、深夜电台、末班地铁、霓虹之外、失眠频率、Pixel Heart、潮汐、逆光。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "get_user_playlists",
+          "get_playlist_songs"
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "城市霓虹",
+          "逆光"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ]
+      },
+      "manualReview": "列出的歌曲必须与 get_playlist_songs 返回一致，不得漏歌或补歌。"
+    },
+    {
+      "taskId": "q05-fuzzy-keyword",
+      "category": "QUERY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "搜一下带「潮」的歌。",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "潮",
+            "limit": 10
+          }
+        },
+        {
+          "answer": "找到 5 首：潮汐、退潮以后、海岸线、浪花与你、潮声，都是潮汐乐队的作品。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs"
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "潮汐",
+          "退潮以后"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ]
+      },
+      "manualReview": "结果应全部来自工具返回；不能把「城市霓虹」等无关歌曲算进来。"
+    },
+    {
+      "taskId": "q06-admin-play-stats",
+      "category": "QUERY",
+      "entry": "MUSIC_ADMIN",
+      "user": "admin",
+      "userInput": "最近 7 天的播放情况怎么样？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "get_play_stats",
+          "args": {
+            "days": 7
+          }
+        },
+        {
+          "answer": "最近 7 天的播放统计如下：总播放次数与按日明细都取自播放统计工具，未包含任何用户级信息。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "get_play_stats"
+        ],
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "播放"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist",
+          "get_user_playlists"
+        ],
+        "answerPhrases": [],
+        "hallucinationPhrases": [
+          "music-user",
+          "music-admin"
+        ]
+      },
+      "manualReview": "数字必须与 get_play_stats 返回一致；不得出现任何用户标识。"
+    },
+    {
+      "taskId": "m01-create-from-search",
+      "category": "MULTI_STEP",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我建一个歌单，名字叫「{{name}}」，把夜航星的所有歌都放进去。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "夜航星",
+            "limit": 10
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1001,
+              1002,
+              1003,
+              1004,
+              1005
+            ]
+          }
+        },
+        {
+          "answer": "已创建歌单「{{name}}」，共收录夜航星的 5 首歌。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "create_playlist"
+        ],
+        "playlists": [
+          {
+            "name": "{{name}}",
+            "songs": [
+              1001,
+              1002,
+              1003,
+              1004,
+              1005
+            ]
+          }
+        ],
+        "playlistCountDelta": 1,
+        "approvalStatus": "APPROVED",
+        "approvalResumeState": "FINISHED",
+        "answerContains": [
+          "{{name}}"
+        ]
+      },
+      "forbid": {
+        "anyWrite": false,
+        "tools": [
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": []
+      },
+      "manualReview": "歌曲集合必须与搜索结果一致，不能多放或少放。"
+    },
+    {
+      "taskId": "m02-add-to-existing",
+      "category": "MULTI_STEP",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "把《潮汐》加进我的歌单「{{fixture}}」。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "initialData": [
+        {
+          "name": "{{fixture}}",
+          "songs": [
+            1001
+          ],
+          "public": false
+        }
+      ],
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "潮汐"
+          }
+        },
+        {
+          "tool": "get_user_playlists",
+          "args": {}
+        },
+        {
+          "tool": "add_songs_to_playlist",
+          "args": {
+            "playlistId": "{{fixtureId}}",
+            "songIds": [
+              1021
+            ]
+          }
+        },
+        {
+          "answer": "已把《潮汐》加入歌单「{{fixture}}」，现在共 2 首歌。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "get_user_playlists",
+          "add_songs_to_playlist"
+        ],
+        "playlists": [
+          {
+            "name": "{{fixture}}",
+            "songs": [
+              1001,
+              1021
+            ]
+          }
+        ],
+        "playlistCountDelta": 0,
+        "approvalStatus": "APPROVED",
+        "approvalResumeState": "FINISHED",
+        "answerContains": [
+          "{{fixture}}"
+        ]
+      },
+      "forbid": {
+        "anyWrite": false,
+        "tools": [
+          "create_playlist"
+        ],
+        "answerPhrases": []
+      },
+      "manualReview": "歌单 ID 必须来自 get_user_playlists，不能自己编造。"
+    },
+    {
+      "taskId": "m03-three-steps",
+      "category": "MULTI_STEP",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "先看看电子羊有几首歌，然后建一个歌单「{{name}}」，把它们全部放进去。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "电子羊",
+            "limit": 10
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1011,
+              1012,
+              1013,
+              1014,
+              1015
+            ]
+          }
+        },
+        {
+          "answer": "电子羊共有 5 首歌，已全部放入歌单「{{name}}」。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "create_playlist"
+        ],
+        "playlists": [
+          {
+            "name": "{{name}}",
+            "songs": [
+              1011,
+              1012,
+              1013,
+              1014,
+              1015
+            ]
+          }
+        ],
+        "playlistCountDelta": 1,
+        "approvalStatus": "APPROVED",
+        "approvalResumeState": "FINISHED",
+        "answerContains": [
+          "{{name}}"
+        ]
+      },
+      "forbid": {
+        "anyWrite": false,
+        "tools": [
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": []
+      },
+      "manualReview": "五首歌必须来自检索结果；不得只建空歌单。"
+    },
+    {
+      "taskId": "m04-create-then-verify",
+      "category": "MULTI_STEP",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "建一个歌单「{{name}}」，放《城市霓虹》和《深夜电台》，建好后告诉我里面有几首歌。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "城市霓虹"
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1001,
+              1002
+            ]
+          }
+        },
+        {
+          "tool": "get_user_playlists",
+          "args": {}
+        },
+        {
+          "answer": "已创建歌单「{{name}}」，共 2 首歌。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "create_playlist"
+        ],
+        "playlists": [
+          {
+            "name": "{{name}}",
+            "songs": [
+              1001,
+              1002
+            ]
+          }
+        ],
+        "playlistCountDelta": 1,
+        "approvalStatus": "APPROVED",
+        "approvalResumeState": "FINISHED",
+        "answerContains": [
+          "{{name}}"
+        ]
+      },
+      "forbid": {
+        "anyWrite": false,
+        "tools": [
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": []
+      },
+      "manualReview": "回答里的数量必须与实际歌单歌曲数一致。"
+    },
+    {
+      "taskId": "c01-ambiguous-create",
+      "category": "CLARIFY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我建个歌单。",
+      "approval": "NONE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "answer": "可以。请问歌单叫什么名字？想放哪些歌？你可以告诉我歌名或歌手。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "歌单"
+        ],
+        "clarification": "ASK",
+        "askElements": [
+          {
+            "name": "歌单命名",
+            "anyOf": [
+              "名字",
+              "名称",
+              "叫什么",
+              "歌单名",
+              "起个名"
+            ]
+          },
+          {
+            "name": "曲目",
+            "anyOf": [
+              "哪些歌",
+              "哪几首",
+              "歌曲",
+              "歌手",
+              "曲目",
+              "加什么歌"
+            ]
+          }
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [
+          "已创建",
+          "已为你创建",
+          "已经建好"
+        ]
+      },
+      "manualReview": "是否追问名称与歌曲，而不是自己编一个名字直接建。"
+    },
+    {
+      "taskId": "c02-ambiguous-reference",
+      "category": "CLARIFY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "把这首歌加到我的歌单里。",
+      "approval": "NONE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "answer": "可以，不过我不确定你指的是哪首歌、哪个歌单。请告诉我歌名（或歌手）和歌单名称。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "clarification": "ASK",
+        "askElements": [
+          {
+            "name": "歌曲定位",
+            "anyOf": [
+              "哪首",
+              "哪一首",
+              "歌名",
+              "歌曲名",
+              "歌曲名称",
+              "具体歌曲",
+              "曲名",
+              "标题",
+              "歌手",
+              "演唱者",
+              "谁唱的"
+            ]
+          },
+          {
+            "name": "目标歌单",
+            "anyOf": [
+              "哪个歌单",
+              "歌单名",
+              "歌单名称",
+              "目标歌单",
+              "歌单的名称",
+              "歌单叫什么",
+              "加到哪个"
+            ]
+          }
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [
+          "已添加",
+          "已经加好"
+        ]
+      },
+      "manualReview": "「这首歌」没有指代对象，必须澄清，不能猜一首歌就写。"
+    },
+    {
+      "taskId": "c03-no-recommendation",
+      "category": "CLARIFY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "推荐几首适合跑步的歌。",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "跑步"
+          }
+        },
+        {
+          "answer": "曲库里没有找到与「跑步」相关的歌曲。我不具备按场景推荐的能力，但可以按歌手或歌名帮你检索。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "clarification": "DENY",
+        "boundaryAlternativeKeywords": [
+          "按歌手",
+          "按歌名",
+          "关键词",
+          "换个",
+          "换一个",
+          "再搜"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [],
+        "hallucinationPhrases": [
+          "为你推荐了",
+          "推荐给你这几首"
+        ]
+      },
+      "manualReview": "不得用模型常识补曲库外的歌；必须说明不支持按场景推荐，并给出支持范围内的替代（换关键词/按歌手/按歌名）。"
+    },
+    {
+      "taskId": "c04-no-listening-history",
+      "category": "CLARIFY",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "我上周都听了哪些歌？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "answer": "当前入口没有播放历史查询能力，我无法得知你上周听了什么。可以帮你检索曲库或查看你的歌单。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "clarification": "DENY"
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [],
+        "hallucinationPhrases": [
+          "你上周听了《",
+          "上周你听过",
+          "播放记录如下"
+        ]
+      },
+      "manualReview": "不得编造播放记录；这是能力缺失，不是查询失败。"
+    },
+    {
+      "taskId": "a01-approve-once",
+      "category": "APPROVAL",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我建一个歌单「{{name}}」，先放《城市霓虹》这一首。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "城市霓虹"
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1001
+            ]
+          }
+        },
+        {
+          "answer": "已创建歌单「{{name}}」，共 1 首歌。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs",
+          "create_playlist"
+        ],
+        "playlists": [
+          {
+            "name": "{{name}}",
+            "songs": [
+              1001
+            ]
+          }
+        ],
+        "playlistCountDelta": 1,
+        "approvalStatus": "APPROVED",
+        "approvalResumeState": "FINISHED",
+        "answerContains": [
+          "{{name}}"
+        ]
+      },
+      "forbid": {
+        "anyWrite": false,
+        "tools": [],
+        "answerPhrases": []
+      },
+      "manualReview": "批准后必须恰好写一次；重复执行会产生同名歌单冲突。"
+    },
+    {
+      "taskId": "a02-reject-no-write",
+      "category": "APPROVAL",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我建一个歌单「{{name}}」，先放《城市霓虹》这一首。",
+      "approval": "REJECT",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "城市霓虹"
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1001
+            ]
+          }
+        },
+        {
+          "answer": "好的，你拒绝了这次操作，歌单没有创建。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "approvalStatus": "REJECTED",
+        "approvalResumeState": "FINISHED",
+        "attribution": "USER_REJECTED"
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [],
+        "answerPhrases": [
+          "已创建",
+          "已经创建好",
+          "创建成功",
+          "已为你创建"
+        ]
+      },
+      "manualReview": "拒绝后必须零写入，且回答不能声称已创建；归因必须是\"你拒绝\"，不能写成\"系统不支持\"或\"执行失败\"。"
+    },
+    {
+      "taskId": "a03-hold-waits",
+      "category": "APPROVAL",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我建一个歌单「{{name}}」，先放《城市霓虹》这一首。",
+      "approval": "HOLD",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "城市霓虹"
+          }
+        },
+        {
+          "tool": "create_playlist",
+          "args": {
+            "name": "{{name}}",
+            "songIds": [
+              1001
+            ]
+          }
+        }
+      ],
+      "expect": {
+        "runState": "WAITING_APPROVAL",
+        "requiredTools": [
+          "search_songs"
+        ],
+        "playlistCountDelta": 0,
+        "approvalStatus": "PENDING",
+        "approvalResumeState": "PENDING_RESUME"
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [],
+        "answerPhrases": [
+          "已创建",
+          "已为你创建"
+        ]
+      },
+      "manualReview": "保持等待时任务必须停在 WAITING_APPROVAL，不得自动执行。"
+    },
+    {
+      "taskId": "a04-admin-entry-no-playlist",
+      "category": "APPROVAL",
+      "entry": "MUSIC_ADMIN",
+      "user": "admin",
+      "userInput": "我有哪些歌单？",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "answer": "当前管理入口不提供歌单查询能力，只能提供曲库检索与播放统计。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "clarification": "DENY"
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "get_user_playlists",
+          "get_playlist_songs",
+          "create_playlist"
+        ],
+        "answerPhrases": [],
+        "hallucinationPhrases": [
+          "你的歌单有",
+          "你的歌单是"
+        ]
+      },
+      "manualReview": "管理员白名单里没有歌单工具，应明确说明不支持而不是编造歌单。"
+    },
+    {
+      "taskId": "f01-no-result",
+      "category": "FAILURE",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "帮我找找「不存在的歌手XYZ」的歌。",
+      "approval": "NONE",
+      "capability": "READ_ONLY",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "不存在的歌手XYZ"
+          }
+        },
+        {
+          "answer": "没有找到与「不存在的歌手XYZ」相关的歌曲，可以换个更短的关键词再试。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "requiredTools": [
+          "search_songs"
+        ],
+        "playlistCountDelta": 0,
+        "answerAnyOf": [
+          "没有找到",
+          "未找到",
+          "查不到",
+          "没有相关",
+          "暂无"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist",
+          "add_songs_to_playlist"
+        ],
+        "answerPhrases": [
+          "已为你找到"
+        ]
+      },
+      "manualReview": "查不到时必须如实说没找到，不能给一份「可能是这几首」的清单。"
+    },
+    {
+      "taskId": "f02-write-tool-fails",
+      "category": "FAILURE",
+      "entry": "MUSIC_USER",
+      "user": "alice",
+      "userInput": "把《潮汐》加到歌单 999999 里。",
+      "approval": "APPROVE",
+      "capability": "WRITE_APPROVAL",
+      "script": [
+        {
+          "tool": "search_songs",
+          "args": {
+            "keyword": "潮汐"
+          }
+        },
+        {
+          "tool": "add_songs_to_playlist",
+          "args": {
+            "playlistId": 999999,
+            "songIds": [
+              1021
+            ]
+          }
+        },
+        {
+          "answer": "添加失败：歌单 999999 不存在或无权修改。"
+        }
+      ],
+      "expect": {
+        "runState": "SUCCEEDED",
+        "playlistCountDelta": 0,
+        "answerContains": [
+          "不存在"
+        ]
+      },
+      "forbid": {
+        "anyWrite": true,
+        "tools": [
+          "create_playlist"
+        ],
+        "answerPhrases": [
+          "已添加",
+          "添加成功",
+          "已经加好"
+        ]
+      },
+      "manualReview": "工具失败后必须如实反馈，不能把失败说成成功。"
+    }
+  ]
+}

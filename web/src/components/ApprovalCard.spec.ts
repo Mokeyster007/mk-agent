@@ -75,7 +75,7 @@ describe('ApprovalCard', () => {
   it('待确认状态可以提交决定', () => {
     const wrapper = mountCard()
     const buttons = wrapper.findAll('button')
-    const approve = buttons.find((button) => button.text().includes('批准并继续'))
+    const approve = buttons.find((button) => button.text().includes('批准并执行'))
 
     expect(approve?.attributes('disabled')).toBeUndefined()
   })
@@ -89,7 +89,7 @@ describe('ApprovalCard', () => {
 
   it('已处理状态不再允许提交决定', () => {
     const wrapper = mountCard({ approval: view({ status: 'APPROVED', resumeState: 'FINISHED' }) })
-    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并继续'))
+    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并执行'))
 
     expect(approve?.attributes('disabled')).toBeDefined()
     expect(wrapper.text()).toContain('已批准')
@@ -124,7 +124,7 @@ describe('ApprovalCard', () => {
 
   it('点击批准只发一次事件', async () => {
     const wrapper = mountCard()
-    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并继续'))
+    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并执行'))
 
     await approve?.trigger('click')
 

@@ -25,6 +25,8 @@ export function musicEntryPath(entry: MusicEntry): string {
 export interface MusicChatOptions {
   message: string
   entry: MusicEntry
+  /** 同一会话的续聊；不传则是老的独立任务（行为完全不变） */
+  conversationId?: string | null
   signal: AbortSignal
   onEvent: (event: AgentEvent) => void
 }
@@ -32,18 +34,23 @@ export interface MusicChatOptions {
 /**
  * 发起一次音乐任务。
  *
- * 每次调用都会创建一个**独立任务**：后端 AgentRunContext 没有会话关联，
- * 这里也不拼历史消息，所以前端不能假装这是"接着上一轮说"。
+ * 带 conversationId 时是"同一会话的下一轮"：后端会**新建 runId**、
+ * 注入最近几轮的文本历史与"会话已知对象"，绝不复活已终态的 run。
+ * 不带时与以前完全一致（独立任务，无上下文）。
  */
 export async function runMusicChat(options: MusicChatOptions): Promise<void> {
-  const { message, entry, signal, onEvent } = options
+  const { message, entry, conversationId, signal, onEvent } = options
 
-  await streamEvents(musicEntryPath(entry), { method: 'GET', query: { message }, signal }, (frame) => {
-    const event = parseEvent(frame.data)
-    if (event) {
-      onEvent(event)
-    }
-  })
+  await streamEvents(
+    musicEntryPath(entry),
+    { method: 'GET', query: { message, conversationId: conversationId ?? undefined }, signal },
+    (frame) => {
+      const event = parseEvent(frame.data)
+      if (event) {
+        onEvent(event)
+      }
+    },
+  )
 }
 
 /**

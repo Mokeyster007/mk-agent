@@ -2,6 +2,7 @@ package com.example.mkagent.exception;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -94,6 +95,35 @@ public class GlobalExceptionHandler {
                 "异步请求已结束，跳过响应体写入：type={}",
                 e.getClass().getSimpleName()
         );
+    }
+
+    /**
+     * 数据库约束冲突（唯一索引 / CHECK / 外键）。
+     *
+     * <p>为什么单独处理成 409 而不是让它落到 500：
+     * 商城的库存流水唯一索引、库存非负 CHECK 都是**业务语义**的约束
+     * （"同一订单行只能出库一次"、"库存不能为负"），
+     * 撞上它们说明请求与当前状态冲突，重试同样的请求也不会成功。
+     * 返回 500 会让人以为是服务挂了，去重启或重试，反而放大问题。
+     *
+     * <p>日志只记异常类名与最内层原因类名，不记异常消息：
+     * 约束冲突的原始消息里带 SQL 片段和参数值（可能含用户数据）。
+     */
+    @ExceptionHandler(DataIntegrityViolationException.class)
+    public ResponseEntity<Map<String, Object>> handleDataIntegrity(
+            DataIntegrityViolationException e
+    ) {
+        Throwable root = e.getMostSpecificCause();
+        log.warn("数据库约束冲突：type={}, root={}",
+                e.getClass().getSimpleName(),
+                root == null ? "unknown" : root.getClass().getSimpleName());
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("success", false);
+        body.put("code", "DATA_CONFLICT");
+        body.put("message", "操作与当前数据状态冲突，请刷新后重试。");
+
+        return ResponseEntity.status(409).body(body);
     }
 
     /**

@@ -52,7 +52,13 @@ class MusicSeedInitializerTest {
     @Test
     @DisplayName("种子条数符合设计")
     void seedCountsMatchDesign() {
-        assertEquals(60, count("music_song"), "曲库应为 60 首");
+        /*
+         * 只断言**种子曲目**（1001~1060）：
+         * 曲库里还有播放夹具的测试音（1901~1903），
+         * 它们不是种子数据，用总行数断言会让两个初始化器互相牵制。
+         */
+        assertEquals(60, countWhere("music_song", "id BETWEEN 1001 AND 1060"),
+                "种子曲库应为 60 首");
         assertEquals(3, count("music_user"), "用户应为 3 个");
         assertEquals(3, count("music_playlist"), "歌单应为 3 个");
         assertEquals(19, count("music_playlist_song"), "歌单歌曲合计 8+6+5=19");
@@ -62,12 +68,13 @@ class MusicSeedInitializerTest {
     @Test
     @DisplayName("重复执行不翻倍（幂等）")
     void seedIsIdempotent() {
-        int before = count("music_song");
+        int before = countWhere("music_song", "id BETWEEN 1001 AND 1060");
 
         int inserted = seedInitializer.seed();
 
         assertEquals(0, inserted, "已初始化时应跳过，返回 0");
-        assertEquals(before, count("music_song"), "歌曲数不得变化");
+        assertEquals(before, countWhere("music_song", "id BETWEEN 1001 AND 1060"),
+                "歌曲数不得变化");
         assertEquals(3, count("music_user"), "用户数不得变化");
         assertEquals(3, count("music_playlist"), "歌单数不得变化");
         assertEquals(19, count("music_playlist_song"), "歌单歌曲数不得变化");
@@ -189,6 +196,13 @@ class MusicSeedInitializerTest {
     private int count(String table) {
         Integer value = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM " + table, Integer.class);
+        return value == null ? 0 : value;
+    }
+
+    /** 带条件的计数（表名与条件都来自测试常量，不接受外部输入）。 */
+    private int countWhere(String table, String condition) {
+        Integer value = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM " + table + " WHERE " + condition, Integer.class);
         return value == null ? 0 : value;
     }
 }

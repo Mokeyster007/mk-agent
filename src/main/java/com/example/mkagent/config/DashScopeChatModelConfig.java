@@ -10,6 +10,7 @@ import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import io.micrometer.observation.ObservationRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.model.tool.DefaultToolExecutionEligibilityPredicate;
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.model.tool.ToolExecutionEligibilityPredicate;
@@ -82,8 +83,13 @@ public class DashScopeChatModelConfig {
 
     /**
      * DashScope 对话模型（显式构造，重试策略固定为 mkagent.model-retry.*）。
+     *
+     * <p>条件：<b>不是</b>"允许缺凭据启动且凭据为空"。
+     * 默认（开关关闭）条件恒真，行为与之前完全一致——
+     * 缺凭据时仍在构造期抛错，错误信息不变。
      */
     @Bean
+    @Conditional(MissingModelCredentialCondition.Negated.class)
     public DashScopeChatModel dashscopeChatModel(
             ModelRetryProperties retryProperties,
             DashScopeConnectionProperties connectionProperties,
@@ -171,6 +177,26 @@ public class DashScopeChatModelConfig {
         );
 
         return chatModel;
+    }
+
+    /**
+     * 占位模型：允许缺凭据启动时注册。
+     *
+     * <p>Bean 名保持 {@code dashscopeChatModel}，因为容器里其它组件按这个名字取模型
+     * （{@code @Qualifier("dashscopeChatModel")}）。名字一变，
+     * 它们会退化成"按类型找 ChatModel"，在将来出现第二个模型 Bean 时行为不确定。
+     *
+     * <p>注册条件与上面的真实模型**互补**：两者不可能同时存在。
+     * 因此"容器里只有一个对话模型"这条不变量仍然成立。
+     */
+    @Bean("dashscopeChatModel")
+    @Conditional(MissingModelCredentialCondition.class)
+    public ChatModel unavailableChatModel() {
+        log.warn("未配置模型凭据，但已开启 mkagent.model.allow-missing-credentials："
+                + "注册占位模型，Agent 接口将返回 503 {}。"
+                + "商城 / 订单 / 库存等不依赖模型的功能不受影响。",
+                UnavailableChatModel.CODE);
+        return new UnavailableChatModel();
     }
 
     /**

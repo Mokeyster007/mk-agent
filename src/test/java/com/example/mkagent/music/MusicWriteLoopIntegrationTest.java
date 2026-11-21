@@ -1,6 +1,8 @@
 package com.example.mkagent.music;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
+import com.example.mkagent.playback.PlaybackFixtureInitializer;
+import com.example.mkagent.playback.TrackSourceRepository;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -93,6 +95,9 @@ class MusicWriteLoopIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private TrackSourceRepository trackSourceRepository;
+
     @MockitoBean
     private VectorStore chatAppVectorStore;
 
@@ -118,13 +123,25 @@ class MusicWriteLoopIntegrationTest {
         }
 
         /*
-         * "加入已有歌单"用例会往种子歌单里插 1057，
-         * 这里删掉，保证其它用例看到的种子曲目数不变。
+         * "加入已有歌单"的两条用例都会往种子歌单里插歌：
+         *   1057 —— approveAddsSongsToExistingPlaylist；
+         *   1902 —— addNowPlayingGoesThroughApproval（测试音 B）。
+         * 这里按 song_id 精确删掉。漏删 1902 会让后面的用例看到
+         * "深夜通勤有 9 首"，表现为与本次改动无关的绝对数量断言失败
+         * （共享内存库，测试之间并不隔离）。
          */
         jdbcTemplate.update(
-                "DELETE FROM music_playlist_song WHERE song_id = 1057 AND playlist_id IN "
+                "DELETE FROM music_playlist_song WHERE song_id IN (1057, 1902) "
+                        + "AND playlist_id IN "
                         + "(SELECT id FROM music_playlist WHERE user_id = ? AND name = ?)",
                 USER, MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE);
+
+        /*
+         * "正在播放"用例会写 music_now_playing。共享内存库下必须清掉：
+         * 残留一行会让其它用例读到"上一个测试留下的当前曲目"，
+         * 表现为时过时不过的假失败。
+         */
+        jdbcTemplate.update("DELETE FROM music_now_playing WHERE user_id = ?", USER);
     }
 
     // ==================== 主链路 ====================
@@ -209,6 +226,96 @@ class MusicWriteLoopIntegrationTest {
     }
 
     @Test
+    @DisplayName("把正在播放的歌加入歌单：曲目取自服务端播放事实，批准后才写入")
+    void addNowPlayingGoesThroughApproval() throws Exception {
+        long playlistId = seededPlaylistId(MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE);
+        int before = playlistSongCount(playlistId);
+
+        /*
+         * 先造一条"服务端确认过的播放事实"。
+         *
+         * 走真实仓储而不是拼 SQL：这样 get_now_playing 读到的就是
+         * 客户端上报那条链路写进去的同一行，测试与生产不出现两套写法。
+         */
+        trackSourceRepository.startInstance(
+                USER, PlaybackFixtureInitializer.SONG_TEST_B, "inst-write-1",
+                java.time.Instant.now());
+
+        /*
+         * 两步脚本，把模型必须遵守的顺序钉死：
+         *   1) get_now_playing 拿真实曲目；
+         *   2) 用返回的 songId 调 add_songs_to_playlist。
+         *
+         * 模型不能"猜"正在播放的是哪首，也不能跳过查询直接写——
+         * 一旦跳过，第一步的工具结果就不存在，第二步的 songId 也无从谈起。
+         */
+        scriptedChatModel.script(
+                new String[]{"get_now_playing", "{}"},
+                new String[]{"add_songs_to_playlist",
+                        "{\"playlistId\":" + playlistId + ",\"songIds\":["
+                                + PlaybackFixtureInitializer.SONG_TEST_B + "]}"}
+        );
+
+        String runId = startTaskAndWaitApproval("把正在播放的这首加入「"
+                + MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE + "」");
+        String approvalId = pendingApprovalId(runId);
+
+        /*
+         * 审批卡已经生成，用户在这期间又切了一首（新的播放实例）。
+         *
+         * 这是"批准时不能重新取 now-playing"的关键回归：
+         * 卡片的 songId 在暂停那一刻就已经固定（args_json + summary_json），
+         * 批准只重放那次调用，不会因为"现在正在播的是另一首"而改目标。
+         */
+        trackSourceRepository.startInstance(
+                USER, PlaybackFixtureInitializer.SONG_TEST_A, "inst-write-2",
+                java.time.Instant.now());
+
+        /*
+         * 服务端复核过曲目：摘要里必须是**真实标题**。
+         * 只断言"有个审批"是不够的——那证明不了曲目来自服务端播放事实，
+         * 只能证明写工具被调用了。标题出现，说明 songId 在库里查得到、
+         * 且摘要反查走的是真实数据库。
+         */
+        String summary = summaryText(approvalId);
+        assertTrue(summary.contains("向歌单添加歌曲"),
+                "摘要应写明动作，实际：" + summary);
+        assertTrue(summary.contains(MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE),
+                "摘要应写明目标歌单名，实际：" + summary);
+        assertTrue(summary.contains("测试音 B"),
+                "摘要应写明曲目标题（证明曲目来自服务端事实），实际：" + summary);
+
+        // 审批前一律不写：加歌与建歌单共用同一套暂停 / 恢复
+        assertEquals(before, playlistSongCount(playlistId), "批准前不得写入");
+
+        HttpResponse<String> approved = post("/ai/approvals/" + approvalId + "/approve");
+        assertEquals(200, approved.statusCode(), "批准失败，body=" + approved.body());
+        awaitFinishedRun(runId);
+
+        assertEquals("SUCCEEDED", runRow(runId).get("state"),
+                "批准后任务应成功，实际：" + runRow(runId));
+        assertEquals("APPROVED", approvalRow(approvalId).get("status"));
+        assertEquals("FINISHED", approvalRow(approvalId).get("resume_state"));
+
+        assertEquals(before + 1, playlistSongCount(playlistId), "批准后曲目数应 +1");
+
+        JsonNode songs = getJson("/ai/music/playlists/" + playlistId + "/songs");
+        boolean found = false;
+        boolean switchedTrackWasWritten = false;
+        for (JsonNode song : songs) {
+            if (song.get("id").asLong() == PlaybackFixtureInitializer.SONG_TEST_B) {
+                found = true;
+            }
+            if (song.get("id").asLong() == PlaybackFixtureInitializer.SONG_TEST_A) {
+                switchedTrackWasWritten = true;
+            }
+        }
+        assertTrue(found, "查询接口应能读到正在播放的曲目，实际：" + songs);
+        assertFalse(switchedTrackWasWritten,
+                "审批期间切歌不能改变写入目标：写入的必须还是卡片上的那一首");
+    }
+
+    @Test
     @DisplayName("拒绝 → 不执行写工具，数据库里没有歌单")
     void rejectWritesNothing() throws Exception {
         String runId = startTaskAndPause(PLAYLIST_REJECTED, List.of(1001L));
@@ -238,7 +345,7 @@ class MusicWriteLoopIntegrationTest {
 
         assertTrue(caps.get("writeApproval").asBoolean(),
                 "开关打开时页面应显示审批写，实际：" + caps);
-        assertEquals("music-user-write-approval/v3", caps.get("promptVersion").asText(),
+        assertEquals("music-user-write-approval/v7", caps.get("promptVersion").asText(),
                 "提示词版本必须与工具开关同步，实际：" + caps);
     }
 
@@ -296,10 +403,20 @@ class MusicWriteLoopIntegrationTest {
         scriptedChatModel.toolArgs = "{\"playlistId\":" + playlistId
                 + ",\"songIds\":" + songIds + "}";
 
+        return startTaskAndWaitApproval(
+                "把这首加到「" + MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE + "」里");
+    }
+
+    /**
+     * 用当前桩模型脚本发起一次真实对话，等它停在审批上，返回 runId。
+     *
+     * <p>抽出来是为了让多步链路（先查"正在播放"、再用查到的 ID 写歌单）
+     * 复用同一段等待逻辑，而不是把轮询代码再抄一遍——
+     * 抄出来的副本一旦漂移，两条链路的断言就不再等价。
+     */
+    private String startTaskAndWaitApproval(String message) throws Exception {
         String url = "http://localhost:" + port + "/api/ai/music/chat"
-                + "?message=" + URLEncoder.encode(
-                "把这首加到「" + MusicSeedInitializer.PLAYLIST_NAME_PRIVATE_ALICE + "」里",
-                StandardCharsets.UTF_8);
+                + "?message=" + URLEncoder.encode(message, StandardCharsets.UTF_8);
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .header("X-User-Id", USER)
@@ -447,30 +564,64 @@ class MusicWriteLoopIntegrationTest {
 
         volatile String toolArgs = "{}";
 
+        /**
+         * 多步脚本：按顺序发若干次工具调用，发完给最终回答。
+         *
+         * <p>为什么需要它：有的链路本来就是两步——
+         * "先查当前播放曲目，再用查到的 ID 写歌单"。
+         * 只支持单步的桩会把这个约束测丢。
+         */
+        private final java.util.Deque<String[]> steps = new java.util.concurrent.ConcurrentLinkedDeque<>();
+
+        private volatile boolean sequenceMode = false;
+
+        void script(String[]... scriptedSteps) {
+            steps.clear();
+            for (String[] step : scriptedSteps) {
+                steps.add(step);
+            }
+            sequenceMode = true;
+        }
+
         void reset() {
             calls.set(0);
             toolName = "create_playlist";
+            steps.clear();
+            sequenceMode = false;
         }
 
         @Override
         public ChatResponse call(Prompt prompt) {
             int n = calls.incrementAndGet();
 
-            if (n == 1) {
-                return new ChatResponse(
-                        List.of(new Generation(new AssistantMessage(
-                                "",
-                                Map.of(),
-                                List.of(new AssistantMessage.ToolCall(
-                                        "call-1", "function", toolName, toolArgs)))))
-                        ,
-                        ChatResponseMetadata.builder()
-                                .model("stub-model")
-                                .usage(new StubUsage(10, 5))
-                                .build()
-                );
+            if (sequenceMode) {
+                String[] step = steps.poll();
+                return step == null
+                        ? finalAnswer()
+                        : toolCall("call-" + n, step[0], step[1]);
             }
 
+            if (n == 1) {
+                return toolCall("call-1", toolName, toolArgs);
+            }
+
+            return finalAnswer();
+        }
+
+        private ChatResponse toolCall(String id, String name, String args) {
+            return new ChatResponse(
+                    List.of(new Generation(new AssistantMessage(
+                            "",
+                            Map.of(),
+                            List.of(new AssistantMessage.ToolCall(id, "function", name, args))))),
+                    ChatResponseMetadata.builder()
+                            .model("stub-model")
+                            .usage(new StubUsage(10, 5))
+                            .build()
+            );
+        }
+
+        private ChatResponse finalAnswer() {
             return new ChatResponse(
                     List.of(new Generation(new AssistantMessage("已按你的确认处理"))),
                     ChatResponseMetadata.builder()

@@ -14,10 +14,21 @@ spring:
   # 纠缠在一起（一次 400 被重试 8 次的根因就出在这条链路上）。
   #
   # 只排除"对话"：Embedding / Image 的自动配置保持原样。
+  #
+  # 另外排除 DashScope 的**语音**自动配置（合成 / 识别）：
+  # 本项目没有任何语音业务（全仓库零引用 SpeechSynthesisModel /
+  # TranscriptionModel），而这两个自动配置在 api-key 缺失时会由
+  # DashScopeConnectionUtils.resolveConnectionProperties 直接抛
+  # IllegalArgumentException("DashScope API key must be set")，
+  # 让整个应用起不来——即"没配模型凭据就启动失败"的一部分根因。
+  # 商城（A0）要求模型不可用时仍可启动，因此把这两个纯噪声的自动配置摘掉；
+  # 这不是重构模型体系，只是去掉没人用、却会硬失败的装配。
   # ===========================================================
   autoconfigure:
     exclude:
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioSpeechAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioTranscriptionAutoConfiguration
 
   # AgentRun 建表脚本：启动时执行，语句全部幂等（IF NOT EXISTS）。
   sql:
@@ -139,6 +150,94 @@ mkagent:
       # 管理员入口不受影响：MUSIC_ADMIN 白名单里永远没有写工具。
       # -------------------------------------------------------------
       write-enabled: false
+
+  # ===========================================================
+  # 播放（MVP）：音源解析的服务端配置。
+  #
+  # 服务端只做三件事：曲目 → 音源映射、权限校验、签发短期媒体地址。
+  # 不做解码、不做转码、不代理第三方流——出声发生在浏览器里。
+  # 因此这一节没有"音质""输出设备"之类参数，那些不属于服务端职责。
+  # ===========================================================
+  playback:
+    # 媒体地址的 HMAC-SHA256 签名密钥。
+    #
+    # 留空 = 每次启动生成一个进程内随机密钥：
+    #   · 本地 / demo 不配置也能跑；
+    #   · 重启后旧地址全部失效（前端会自动重新解析，表现为一次短暂重载）；
+    #   · 多实例部署必须显式配置**同一个值**，否则 A 实例签发的地址
+    #     在 B 实例上验签失败（403），表现为"播放随机失败"。
+    # 生产请用环境变量注入，不要写进仓库。
+    signing-secret: ${MKAGENT_PLAYBACK_SIGNING_SECRET:}
+    # 媒体地址有效期（秒）。合法范围 30 ~ 3600，越界回退 300。
+    #
+    # 准确的性质：这是**短期持有者凭证（bearer token）**，不是身份绑定。
+    # 签名覆盖 songId + userId + 过期时间，所以拿到地址的人不能改成别的曲目、
+    # 不能延长有效期；但**任何拿到这个地址的人**在有效期内都能读这一首
+    # （不校验请求方是谁）。转发即等于授权，所以不要把它贴进日志、IM 或工单。
+    # 300 秒是"够播完一首、又短到不值得转发"的折中；本轮不改成 60 秒，
+    # 也不在正常播放过程中主动替换 <audio> 的 src（那会造成可听见的断点）。
+    url-ttl-seconds: 300
+    # 可选：媒体根目录。
+    # 留空 → 从 classpath:media/ 读（内置测试音走这条，开箱即用）；
+    # 配置后 → object_key 按该目录解析，并校验解析结果仍在目录内（防 ../ 穿越）。
+    media-dir: ${MKAGENT_PLAYBACK_MEDIA_DIR:}
+    # 活跃播放的失效窗口（秒）：超过这么久没有心跳，就不再认为"正在播放"。
+    # 由服务端时钟判定，客户端时间不参与；180 秒 = 3 个 60 秒心跳周期，
+    # 允许丢两次心跳（切后台被节流）而不误判。
+    # 心跳间隔是**客户端契约**（60 秒），服务端不接受客户端指定间隔，
+    # 因此这里只有一个窗口值，没有"间隔"配置。
+    active-ttl-seconds: 180
+
+  # ===========================================================
+  # 平台连接（音乐账号）。
+  #
+  # 本轮只接模拟来源：没有可信的服务端身份，也没有平台凭据。
+  # 真实平台绑定会被 ProviderBindingGuard 明确拒绝（409），
+  # 不做"假登录"，也不把 X-User-Id 当成真实连接归属。
+  # ===========================================================
+  providers:
+    # 是否允许连接演示（模拟）来源。它们没有凭据、不发网络请求。
+    demo-enabled: ${MKAGENT_PROVIDERS_DEMO_ENABLED:true}
+    # 当前身份是否可信。默认 false：X-User-Id 是占位身份，可伪造。
+    # 接入真实认证（登录态 / OAuth 会话）后才应改为 true。
+    trusted-identity: ${MKAGENT_PROVIDERS_TRUSTED_IDENTITY:false}
+    # 单来源读取预算（毫秒）。超时只让该来源失败，不影响其它来源。
+    timeout-ms: ${MKAGENT_PROVIDERS_TIMEOUT_MS:1500}
+
+  # ===========================================================
+  # 商城（A0：最小商城 + 订单 + 发货出库）
+  #
+  # 这里只有一件事需要配置：**身份从哪来**。
+  # 当前工程没有真实认证，X-User-Id 是占位值、可伪造，
+  # 所以下单 / 发货 / 签收默认**一律拒绝**（403 SHOP_IDENTITY_NOT_CONFIGURED），
+  # 商品浏览仍然可用。
+  #
+  #   demo-identity-enabled=true  本地演示：信任 X-User-Id，角色仍只从 shop_user 读。
+  #   trusted-identity=true       已接入可信登录态后使用（本轮未实现认证层）。
+  #
+  # 两个都关 = 共享部署的安全默认值。
+  # ===========================================================
+  shop:
+    demo-identity-enabled: ${MKAGENT_SHOP_DEMO_IDENTITY:false}
+    trusted-identity: ${MKAGENT_SHOP_TRUSTED_IDENTITY:false}
+    # 单笔订单上限：防溢出与荒唐数量，不是业务规则。
+    max-quantity-per-order: 99
+    # 后台订单列表默认页大小（接口另有 1..100 的夹紧）。
+    admin-page-size: 20
+
+  # ===========================================================
+  # 模型可用性开关。
+  #
+  # allow-missing-credentials=true 且 api-key 确实为空时，
+  # 注册占位实现 UnavailableChatModel（同名 Bean），让应用起得来，
+  # 但一旦真的调用模型就抛 503 MODEL_UNAVAILABLE——不返回假回答。
+  #
+  # 默认 false：缺凭据仍然启动失败并给出明确提示。
+  # 打开它只适合"本地跑不依赖模型的功能（如商城 A0）"，
+  # 不适合任何需要真实回答的环境。
+  # ===========================================================
+  model:
+    allow-missing-credentials: ${MKAGENT_MODEL_ALLOW_MISSING_CREDENTIALS:false}
 
   # ===========================================================
   # 模型分层（OpenAI 兼容接口）。

@@ -12,8 +12,11 @@
  * - "批准"只是保存了决定，不代表业务执行成功；
  * - 用户拒绝不是系统故障；
  * - 决定已保存但恢复失败时，保留决定并给出"手动恢复"。
+ *
+ * 版面纪律：三块内容必须能被一眼扫到 —— 操作是什么 / 目标歌单 / 将写入的歌曲。
+ * 每个状态都带文字，颜色只是辅助。
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
 import TaskStatusBadge from './TaskStatusBadge.vue'
 import type { ApprovalRequiredPayload, ApprovalView } from '@/api/types'
@@ -38,6 +41,9 @@ const emit = defineEmits<{
   (e: 'resume'): void
   (e: 'refresh'): void
 }>()
+
+/** 超过这个数量就先折叠，避免一屏全是歌名 */
+const COLLAPSE_AT = 8
 
 const isPreview = computed(() => props.mode === 'preview')
 
@@ -65,81 +71,93 @@ const expiresText = computed(() => {
 })
 
 const disabled = computed(() => props.busy || isPreview.value || !isPending.value)
+
+/** 长列表折叠，但必须能展开核对 */
+const songsOpen = ref(false)
+const songs = computed(() => summary.value.songs)
+const hiddenCount = computed(() =>
+  songsOpen.value ? 0 : Math.max(0, songs.value.length - COLLAPSE_AT),
+)
+const visibleSongs = computed(() =>
+  songsOpen.value ? songs.value : songs.value.slice(0, COLLAPSE_AT),
+)
 </script>
 
 <template>
   <section class="approval" :class="{ 'approval--preview': isPreview }" data-approval-card>
     <header class="approval__head">
       <div class="approval__title">
-        <span class="approval__icon"><AppIcon name="shield" :size="16" /></span>
-        <div>
-          <h3>需要你确认这次写操作</h3>
-          <p class="approval__sub">
-            批准后才会执行；批准本身不等于执行成功。
-          </p>
+        <span class="approval__icon" aria-hidden="true">
+          <AppIcon name="shield" :size="15" />
+        </span>
+        <div class="approval__title-text">
+          <p class="approval__eyebrow">写操作 · 需要你确认</p>
+          <h3 class="approval__headline">{{ actionLabel }}</h3>
         </div>
       </div>
       <div class="approval__badges">
-        <TaskStatusBadge v-if="status" :label="statusMeta.label" :tone="statusMeta.tone" />
-        <TaskStatusBadge
-          v-else
-          label="状态未确认"
-          tone="warn"
-        />
+        <TaskStatusBadge v-if="status" :label="statusMeta.label" :tone="statusMeta.tone" size="sm" />
+        <TaskStatusBadge v-else label="状态未确认" tone="warn" size="sm" />
         <span v-if="isPreview" class="mk-chip approval__preview-chip">预览</span>
       </div>
     </header>
 
-    <dl class="approval__grid">
-      <div class="approval__item">
-        <dt>将执行的操作</dt>
-        <dd>{{ actionLabel }}</dd>
-      </div>
-      <div class="approval__item">
+    <!-- 1. 操作是什么（标题）+ 2. 目标歌单 -->
+    <dl class="approval__facts">
+      <div class="approval__fact">
         <dt>目标歌单</dt>
         <dd>{{ targetPlaylist }}</dd>
       </div>
-      <div class="approval__item">
-        <dt>涉及歌曲</dt>
-        <dd>
-          <template v-if="summary.songCount !== null">
-            {{ summary.songCount }} 首
-          </template>
-          <template v-else>暂无数据</template>
-        </dd>
-      </div>
-      <div class="approval__item">
-        <dt>本轮工具数</dt>
-        <dd>{{ summary.roundToolCount }}</dd>
-      </div>
-      <div class="approval__item approval__item--wide">
-        <dt>有效期至</dt>
-        <dd class="mk-mono">{{ expiresText }}</dd>
-      </div>
     </dl>
 
-    <div v-if="summary.songs.length" class="approval__songs">
-      <p class="mk-eyebrow">歌曲清单（服务端摘要，按标题截断）</p>
-      <ul>
-        <li v-for="song in summary.songs" :key="song">{{ song }}</li>
-      </ul>
-      <p class="approval__note">
-        摘要只提供歌曲标题，没有可靠的歌曲 ID 映射，因此这里不显示 ID。
-      </p>
+    <!-- 3. 将写入的歌曲 -->
+    <div v-if="songs.length || summary.songCount !== null" class="approval__songs">
+      <div class="approval__songs-head">
+        <span class="approval__songs-label">将写入的歌曲</span>
+        <span class="approval__songs-count">
+          {{ summary.songCount !== null ? summary.songCount : songs.length }} 首
+        </span>
+        <button
+          v-if="songs.length > COLLAPSE_AT"
+          type="button"
+          class="approval__songs-toggle"
+          @click="songsOpen = !songsOpen"
+        >
+          {{ songsOpen ? '收起' : '展开全部' }}
+        </button>
+      </div>
+
+      <ol v-if="visibleSongs.length" class="approval__song-list">
+        <li v-for="(song, index) in visibleSongs" :key="`${song}-${index}`" class="approval__song">
+          <span class="approval__song-index">{{ index + 1 }}</span>
+          <span class="approval__song-title">{{ song }}</span>
+        </li>
+      </ol>
+      <p v-if="hiddenCount > 0" class="approval__more">还有 {{ hiddenCount }} 首未展开</p>
+      <p v-else-if="!songs.length" class="approval__more">服务端摘要没有给出歌曲标题</p>
+
+      <p class="approval__note">摘要只提供歌曲标题，没有可靠的歌曲 ID 映射，因此这里不显示 ID。</p>
     </div>
 
     <p v-if="summary.text" class="approval__text">{{ summary.text }}</p>
 
-    <div v-if="props.approval" class="approval__resume">
+    <div class="approval__resume">
       <span class="approval__resume-label">执行状态</span>
-      <TaskStatusBadge :label="resumeMeta.label" :tone="resumeMeta.tone" size="sm" />
-      <span v-if="props.approval.resumeAttempts > 0" class="approval__attempts">
+      <TaskStatusBadge
+        v-if="props.approval"
+        :label="resumeMeta.label"
+        :tone="resumeMeta.tone"
+        size="sm"
+      />
+      <span v-else class="approval__resume-none">未确认</span>
+      <span v-if="props.approval && props.approval.resumeAttempts > 0" class="approval__attempts">
         已尝试恢复 {{ props.approval.resumeAttempts }} 次
       </span>
+      <span class="approval__expires">有效至 {{ expiresText }}</span>
     </div>
 
     <p v-if="!props.approval && !isPreview" class="approval__warn">
-      <AppIcon name="alert" :size="14" />
+      <AppIcon name="alert" :size="13" />
       还没有确认到审批的当前状态，建议先刷新再提交决定。
     </p>
 
@@ -152,9 +170,9 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
         :disabled="disabled"
         @click="emit('approve')"
       >
-        {{ busy ? '提交中…' : '批准并继续' }}
+        {{ busy ? '提交中…' : '批准并执行' }}
       </button>
-      <button type="button" class="mk-btn" :disabled="disabled" @click="emit('reject')">
+      <button type="button" class="mk-btn approval__reject" :disabled="disabled" @click="emit('reject')">
         拒绝
       </button>
       <button
@@ -164,7 +182,7 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
         :disabled="busy || isPreview"
         @click="emit('resume')"
       >
-        <AppIcon name="refresh" :size="14" />
+        <AppIcon name="refresh" :size="13" />
         手动恢复
       </button>
       <button
@@ -180,19 +198,18 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
       </span>
     </footer>
 
-    <!-- 窄屏上卡片头部的说明会被滚出视口，这里把最关键的一句放在按钮旁边 -->
     <p class="approval__footnote">
       批准只表示同意执行；是否真的执行成功，以任务状态和最终回答为准。
-      写库结果可在左侧「我的歌单」刷新核对。
+      写库结果可在顶栏「我的歌单」里刷新核对。
     </p>
   </section>
 </template>
 
 <style scoped>
 .approval {
-  border: 1px solid rgba(226, 180, 94, 0.32);
-  border-radius: var(--r-lg);
-  background: linear-gradient(180deg, rgba(226, 180, 94, 0.06), transparent 42%), var(--c-surface);
+  border: 1px solid rgba(224, 177, 95, 0.28);
+  border-radius: var(--r-md);
+  background: var(--c-surface);
   padding: var(--s-4);
   display: grid;
   gap: var(--s-3);
@@ -217,24 +234,32 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
   min-width: 0;
 }
 
-.approval__title h3 {
-  font-size: var(--fs-base);
-  font-weight: 600;
-  line-height: var(--lh-tight);
+.approval__title-text {
+  min-width: 0;
 }
 
-.approval__sub {
-  margin-top: 3px;
-  font-size: var(--fs-sm);
-  color: var(--c-text-3);
+.approval__eyebrow {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--c-warn);
+}
+
+.approval__headline {
+  margin-top: 2px;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--c-text);
+  overflow-wrap: anywhere;
 }
 
 .approval__icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   flex: none;
   border-radius: var(--r-sm);
   background: var(--c-warn-weak);
@@ -253,68 +278,109 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
   background: var(--c-accent-weak);
 }
 
-.approval__grid {
+/* ---- 目标歌单：单独一行，字号比正文重一档 ---- */
+.approval__facts {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--s-3);
   margin: 0;
+  padding: var(--s-3) 0;
+  border-top: 1px solid var(--c-line-soft);
+  border-bottom: 1px solid var(--c-line-soft);
 }
 
-.approval__item {
+.approval__fact {
   min-width: 0;
 }
 
-.approval__item--wide {
-  grid-column: 1 / -1;
-}
-
-.approval__item dt {
+.approval__fact dt {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
   margin-bottom: 2px;
 }
 
-.approval__item dd {
+.approval__fact dd {
   margin: 0;
   font-size: var(--fs-base);
   color: var(--c-text);
   overflow-wrap: anywhere;
 }
 
+/* ---- 曲目列表：序号 + 歌名，紧凑但可读 ---- */
 .approval__songs {
-  border-top: 1px solid var(--c-line-soft);
-  padding-top: var(--s-3);
+  display: grid;
+  gap: var(--s-2);
 }
 
-.approval__songs ul {
+.approval__songs-head {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: var(--s-2);
+  align-items: baseline;
+  gap: var(--s-2);
 }
 
-.approval__songs li {
-  padding: 2px 9px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--c-line);
-  background: var(--c-bg-soft);
-  font-size: var(--fs-sm);
+.approval__songs-label {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+}
+
+.approval__songs-count {
+  font-size: var(--fs-xs);
   color: var(--c-text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.approval__songs-toggle {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--c-accent-ink);
+}
+
+.approval__song-list {
+  display: grid;
+  gap: 1px;
+}
+
+.approval__song {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--c-line-soft);
+}
+
+.approval__song:last-child {
+  border-bottom: 0;
+}
+
+.approval__song-index {
+  width: 16px;
+  flex: none;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--c-text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.approval__song-title {
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+  overflow-wrap: anywhere;
+}
+
+.approval__more {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
 }
 
 .approval__note {
-  margin-top: var(--s-2);
-  font-size: var(--fs-xs);
+  font-size: 10.5px;
+  line-height: 1.6;
   color: var(--c-text-3);
 }
 
 .approval__text {
   font-size: var(--fs-sm);
+  line-height: var(--lh-base);
   color: var(--c-text-2);
-  padding: var(--s-2) var(--s-3);
-  border-radius: var(--r-sm);
-  background: var(--c-bg-soft);
-  border: 1px solid var(--c-line-soft);
   overflow-wrap: anywhere;
 }
 
@@ -323,16 +389,16 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
   align-items: center;
   gap: var(--s-2);
   flex-wrap: wrap;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--c-text-3);
 }
 
-.approval__resume-label {
-  font-size: var(--fs-xs);
+.approval__expires {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
 }
 
 .approval__attempts {
-  font-size: var(--fs-xs);
   color: var(--c-text-3);
 }
 
@@ -355,8 +421,19 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
   align-items: center;
   gap: var(--s-2);
   flex-wrap: wrap;
-  border-top: 1px solid var(--c-line-soft);
-  padding-top: var(--s-3);
+  padding-top: var(--s-1);
+}
+
+/* 拒绝必须是显眼的一等按钮，但不能看起来像"危险操作" */
+.approval__reject {
+  border-color: var(--c-line-strong);
+  background: transparent;
+  color: var(--c-text-2);
+}
+
+.approval__reject:hover:not(:disabled) {
+  background: var(--c-surface-2);
+  color: var(--c-text);
 }
 
 .approval__preview-note {
@@ -365,15 +442,20 @@ const disabled = computed(() => props.busy || isPreview.value || !isPending.valu
 }
 
 .approval__footnote {
-  margin-top: var(--s-2);
-  font-size: var(--fs-xs);
-  line-height: 1.6;
+  font-size: 10.5px;
+  line-height: 1.65;
   color: var(--c-text-3);
 }
 
 @media (max-width: 560px) {
-  .approval__grid {
+  .approval__facts {
     grid-template-columns: minmax(0, 1fr);
+    gap: var(--s-2);
+  }
+
+  .approval__expires {
+    margin-left: 0;
+    width: 100%;
   }
 }
 </style>

@@ -50,6 +50,8 @@ public class DefaultToolEventMessageProvider
             Map.entry("get_playlist_songs", "正在读取歌单曲目"),
             Map.entry("get_play_stats", "正在统计播放数据"),
             Map.entry("get_top_songs", "正在统计歌曲排行"),
+            Map.entry("check_playback", "正在确认音源可用性"),
+            Map.entry("get_now_playing", "正在读取当前播放曲目"),
             /*
              * 写工具：文案里**不出现歌单名与歌曲名**。
              * 这些是用户输入，可能含个人信息，也可能被塞进注入文本；
@@ -109,7 +111,58 @@ public class DefaultToolEventMessageProvider
             return musicResultMessage(toolName, result);
         }
 
+        if ("check_playback".equals(toolName)) {
+            return playbackCheckMessage(result);
+        }
+
+        if ("get_now_playing".equals(toolName)) {
+            return nowPlayingMessage(result);
+        }
+
         return RESULT_MESSAGES.getOrDefault(toolName, "工具调用完成");
+    }
+
+    /**
+     * "能不能播"的完成文案。
+     *
+     * <p>失败时**不能**显示成"已确认可播放"：模型可能因此说
+     * "已经为你准备好播放"，而实际没有音源。
+     */
+    private String playbackCheckMessage(String rawResult) {
+        JsonNode root = parseEnvelope(rawResult);
+        if (root == null) {
+            return "音源确认完成";
+        }
+        return root.path("ok").asBoolean(false) ? "音源可用" : "该曲目暂时不可播放";
+    }
+
+    /**
+     * "当前播放曲目"的完成文案：只说明有没有，不推送歌名。
+     */
+    private String nowPlayingMessage(String rawResult) {
+        JsonNode root = parseEnvelope(rawResult);
+        if (root == null) {
+            return "当前播放信息读取完成";
+        }
+        return root.path("ok").asBoolean(false) ? "已获取当前播放曲目" : "当前没有播放中的曲目";
+    }
+
+    /**
+     * 解析信封；解析不了返回 null（调用方给通用文案）。
+     */
+    private static JsonNode parseEnvelope(String rawResult) {
+        if (rawResult == null || rawResult.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode node = OBJECT_MAPPER.readTree(rawResult);
+            if (node != null && node.isTextual()) {
+                node = OBJECT_MAPPER.readTree(node.asText());
+            }
+            return node != null && node.isObject() ? node : null;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /**

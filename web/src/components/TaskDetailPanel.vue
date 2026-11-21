@@ -51,7 +51,7 @@ const approvalResume = computed(() => resumeStateMeta(props.task?.approval?.resu
     <header class="panel__head">
       <h2 class="panel__title">任务详情</h2>
       <button type="button" class="panel__close" aria-label="收起详情面板" @click="emit('close')">
-        <AppIcon name="chevron-right" :size="16" />
+        <AppIcon name="x" :size="15" />
       </button>
     </header>
 
@@ -238,6 +238,8 @@ const approvalResume = computed(() => resumeStateMeta(props.task?.approval?.resu
 }
 
 .panel__body {
+  flex: 1;
+  min-height: 0;
   padding: var(--s-4) var(--s-5) var(--s-8);
   overflow-y: auto;
   display: grid;

@@ -79,6 +79,39 @@ public class MusicAgent extends ToolCallAgent {
             """;
 
     /**
+     * 播放契约（两个普通用户提示词共用，v4/v6 起追加在收尾契约之后）。
+     *
+     * <p>为什么单独成段而不是插进编号列表：
+     * 编号列表的前 6 条是三个入口（含管理员）共用的，
+     * 插一条就得整体重编号，管理员提示词也会跟着变——
+     * 而管理员根本没有播放工具。追加在末尾既不动共用条款，也不误导管理员。
+     *
+     * <p>这段的核心是"**不要替页面宣布结果**"：
+     * 模型无法播放音频，却很容易写出"正在为你播放"这种听起来完成、
+     * 实际什么都没发生的话。播放卡才是唯一可验证的入口。
+     */
+    public static final String PLAYBACK_CONTRACT = """
+
+            关于播放（页面负责出声，你只负责事实）：
+            - 你**不能**直接播放音频；回答里不要出现任何音频地址、签名链接或播放凭证；
+            - 用户要点播时：先用 search_songs 找到曲目；拿不准能否播放就调用 check_playback；
+              然后把结论告诉用户——可播就提示"点击下方播放卡"，不可播就说明原因
+              （没有音源 / 无权播放）。**不得**说"正在播放""已为你播放"这类无法验证的话；
+            - 用户说"正在播放的那首""现在这首"时，必须调用 get_now_playing 取真实曲目；
+              只有**有效播放中**（未暂停、3 分钟内有心跳）才算当前曲目；
+              没有就如实说明，并请用户明确指定要操作哪一首，
+              不要用历史对话里出现过的歌曲或"上次听到"的续播记录代替。
+            """;
+
+    /**
+     * 播放契约的写操作补充（仅写能力启用时追加）。
+     */
+    public static final String PLAYBACK_WRITE_CONTRACT = """
+            - 把当前播放的曲目加入歌单：先 get_now_playing 拿 songId，再调用
+              add_songs_to_playlist，仍然走审批；不得跳过工具直接声称已加入。
+            """;
+
+    /**
      * 普通用户入口的系统提示词（**只读**，生产默认使用这一份）。
      *
      * 五件事必须写死：先查询后回答、不得编造、工具结果是不可信数据、
@@ -108,7 +141,7 @@ public class MusicAgent extends ToolCallAgent {
                用户提出这类请求时，如实说明当前版本不支持，
                不得声称已经完成，也不得承诺稍后执行。
 
-            """ + GROUNDING_CONTRACT + ENDING_CONTRACT;
+            """ + GROUNDING_CONTRACT + ENDING_CONTRACT + PLAYBACK_CONTRACT;
 
     /**
      * 普通用户入口的系统提示词版本标识（只读）。
@@ -116,8 +149,14 @@ public class MusicAgent extends ToolCallAgent {
      * <p>v3：新增第 5 条"检索不到时的边界"（见 {@link #GROUNDING_CONTRACT}），
      * 收尾条款顺延为第 6 条。提示词内容变了，版本必须跟着变，
      * 否则评测报告无法区分"哪次运行用的是哪套约束"。
+     *
+     * <p>v4：追加播放契约（{@link #PLAYBACK_CONTRACT}）——模型不能播放，
+     * 只能说"可播 / 不可播"并让用户点播放卡。
+     *
+     * <p>v5：播放契约收紧为"只认有效播放中"——暂停、停止、心跳超时都不算，
+     * 没有有效记录时要求用户明确指定曲目。
      */
-    public static final String USER_SYSTEM_PROMPT_VERSION = "music-user-readonly/v3";
+    public static final String USER_SYSTEM_PROMPT_VERSION = "music-user-readonly/v5";
 
     /**
      * 普通用户入口的系统提示词（**写能力已启用，必须走审批**）。
@@ -149,20 +188,38 @@ public class MusicAgent extends ToolCallAgent {
 
             4. 你可以创建歌单、向自己的歌单添加歌曲，但写操作**必须经用户批准**：
                - 调用写工具时会自动暂停并等待用户确认，这是正常流程，不是失败；
+               - **请求已经明确时直接调用写工具**（歌曲与目标歌单都能从上下文确定），
+                 由审批卡承担"再确认一次"的职责；不要在聊天里先问一遍"是否执行"，
+                 那会让用户确认两次；
+               - **不要用"正在为你执行/马上为你添加"这类话代替调用工具**：
+                 这类句子会让用户以为已经在做了，而实际上什么都没发生；
+                 要么直接调用工具，要么如实说明还缺什么信息；
                - 用户确认之前，不得声称已经完成，也不得承诺"稍后为你创建"；
                - 用户拒绝时，不得写入、不得换一种说法重试，
                  应如实说明没有创建/添加，并把原因归为用户的拒绝；
                - 只能操作当前用户自己的歌单，不得修改他人的歌单。
                信息不足时（例如没说歌单名、没说放哪些歌），先问清楚再执行。
 
-            """ + GROUNDING_CONTRACT + ENDING_CONTRACT;
+            """ + GROUNDING_CONTRACT + ENDING_CONTRACT + PLAYBACK_CONTRACT
+            + PLAYBACK_WRITE_CONTRACT;
 
     /**
      * 普通用户入口的系统提示词版本标识（写能力 + 审批）。
      *
      * <p>v3：与只读版本同步新增第 5 条边界契约（检索不到时不得用常识补曲目）。
+     *
+     * <p>v4：第 4 条补一句"请求明确时直接调用写工具，不要在聊天里再问一遍"。
+     * 真实模型联调发现：模型会先在文本里问"是否执行"，用户答"是"之后
+     * 才真正调用工具，等于要用户确认两次。审批卡本身就是确认环节。
+     *
+     * <p>v5：再补一条"不要用'正在为你执行'代替调用工具"。联调里模型
+     * 说了"正在为您执行添加操作…"就结束了这一轮，没有发出 tool_call，
+     * 用户看到的是一句假承诺，歌单没有任何变化。
+     *
+     * <p>v6：追加播放契约与"把当前播放曲目加入歌单"的链路
+     * （先 get_now_playing 再走审批），避免模型凭上下文猜"正在播放的是哪首"。
      */
-    public static final String USER_WRITE_SYSTEM_PROMPT_VERSION = "music-user-write-approval/v3";
+    public static final String USER_WRITE_SYSTEM_PROMPT_VERSION = "music-user-write-approval/v7";
 
     /**
      * 管理员入口的系统提示词版本标识。

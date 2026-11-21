@@ -145,3 +145,101 @@ export interface CapabilitiesVO {
   writeApproval: boolean
   promptVersion: string
 }
+
+/* ==================== 会话（同一窗口连续聊天） ==================== */
+
+/**
+ * 会话消息，见 ConversationController.MessageVO。
+ *
+ * 只存"用户输入"与"模型最终回答"的文本：工具调用不进会话，
+ * 回放旧工具调用会让模型把历史指令当成本轮指令再执行一次。
+ */
+export interface ConversationMessageVO {
+  runId: string
+  role: 'USER' | 'ASSISTANT' | string
+  content: string
+  /** 该轮 run 的终态快照；WAITING_APPROVAL 表示还在等审批 */
+  state: string | null
+  createdAt: string | null
+  /** 该轮仍有待审批时的 approvalId，否则 null（刷新后靠它重建审批卡） */
+  approvalId: string | null
+}
+
+/** 会话列表项，见 ConversationController.ConversationVO。 */
+export interface ConversationVO {
+  conversationId: string
+  title: string | null
+  messageCount: number
+  lastState: string | null
+  updatedAt: string | null
+}
+
+/** 会话详情，见 ConversationController.ConversationDetailVO。 */
+export interface ConversationDetailVO {
+  conversationId: string
+  title: string | null
+  messages: ConversationMessageVO[]
+  updatedAt: string | null
+}
+
+/* ==================== 播放（MVP） ==================== */
+
+/** 音源交付方式，见 PlaybackMode。本轮只真实实现 DIRECT_AUDIO。 */
+export type PlaybackMode =
+  | 'DIRECT_AUDIO'
+  | 'PROVIDER_SDK'
+  | 'EXTERNAL_LINK'
+  | 'UNAVAILABLE'
+
+/** 曲目信息（播放器显示用，不含任何内部路径）。 */
+export interface PlaybackSongVO {
+  id: number
+  title: string
+  artist: string
+  album: string | null
+  durationSeconds: number | null
+  releaseYear: number | null
+}
+
+/**
+ * 解析结果，见 PlaybackService.ResolveResult。
+ *
+ * `playable=false` 时一定带 `reasonCode` 与 `reason`：
+ * 页面必须显示"为什么不能播"，而不是一个笼统的播放失败。
+ */
+export interface PlaybackResolveVO {
+  playable: boolean
+  song: PlaybackSongVO
+  mode: PlaybackMode | string
+  provider: string | null
+  format: string | null
+  contentType: string | null
+  /** 短期媒体地址（相对路径，含 /api 前缀）；不可播时为 null */
+  streamUrl: string | null
+  /** 地址过期时间（epoch 秒）；不可播时为 null */
+  expiresAt: number | null
+  capabilities: { seek: boolean; range: boolean; eq: boolean }
+  reasonCode: string | null
+  reason: string | null
+}
+
+/** 会话内候选，见 PlaybackService.Candidate。 */
+export interface PlaybackCandidateVO {
+  songId: number
+  title: string
+  artist: string
+  album: string | null
+  durationSeconds: number | null
+  playable: boolean
+  format: string | null
+  unavailableReason: string | null
+}
+
+/** 当前曲目，见 PlaybackService.NowPlayingView。 */
+export interface NowPlayingVO {
+  songId: number
+  title: string
+  artist: string
+  state: 'PLAYING' | 'PAUSED' | 'STOPPED' | string
+  updatedAtEpochSecond: number
+}

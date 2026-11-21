@@ -84,6 +84,7 @@ public class AgentRunRecorder {
             AgentRunEntity entity = new AgentRunEntity();
             entity.setRunId(ctx.getRunId().toString());
             entity.setUserId(ctx.getUserId());
+            entity.setConversationId(ctx.getConversationId());
             entity.setAgentType(agentTypeName(ctx.getAgentType()));
             entity.setUserPrompt(truncate(userPrompt, MAX_PROMPT_LENGTH));
             entity.setState(ctx.getState().name());

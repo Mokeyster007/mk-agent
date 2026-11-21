@@ -1,16 +1,16 @@
 <script setup lang="ts">
 /**
- * 任务会话区。
+ * 一轮对话：用户气泡 + 助手正文。
  *
- * 展示顺序刻意固定：需求 → 真实状态 → 工具活动 → 审批 → 最终回答 → 错误。
- * 这样用户任何时候都能先看到"我提了什么"，再看"系统做到了哪一步"。
+ * 展示顺序固定：需求 → 真实状态 → 工具活动（折叠）→ 审批 → 最终回答 → 错误。
  *
  * 不做的事：
  * - 不做打字机动画（同步入口没有逐字流，伪造流式属于欺骗）；
  * - 不把最终回答的正则解析结果画成歌曲卡片（后端只返回文本）；
- * - 不在流结束时就标成功，成功只认 agent_run.state。
+ * - 不在流结束时就标成功，成功只认 agent_run.state；
+ * - 不在对话里展示 runId / token —— 那是任务详情抽屉的内容。
  */
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
 import TaskStatusBadge from './TaskStatusBadge.vue'
 import ToolActivityList from './ToolActivityList.vue'
@@ -33,12 +33,6 @@ const emit = defineEmits<{
   (e: 'stop-waiting'): void
   (e: 'recheck'): void
 }>()
-
-const now = ref(Date.now())
-const timer = window.setInterval(() => {
-  now.value = Date.now()
-}, 1000)
-onUnmounted(() => window.clearInterval(timer))
 
 const isRunning = computed(
   () => props.task.transport === 'submitting' || props.task.transport === 'streaming',
@@ -72,13 +66,16 @@ const primaryHint = computed(() => {
   return '还没有拿到后端的任务状态。'
 })
 
-const elapsed = computed(() => {
-  const end = props.task.finishedAt ?? now.value
-  const millis = Math.max(0, end - props.task.createdAt)
-  if (millis < 1000) return `${millis} 毫秒`
-  if (millis < 60_000) return `${(millis / 1000).toFixed(1)} 秒`
-  return `${Math.floor(millis / 60_000)} 分 ${Math.round((millis % 60_000) / 1000)} 秒`
-})
+/**
+ * 成功是默认结果，不再重复一遍"已完成"；其余状态必须显示。
+ * 已经有审批卡时，卡片自己带状态，这里不再重复。
+ */
+const showStatus = computed(
+  () =>
+    !!props.task.serverState &&
+    props.task.serverState !== 'SUCCEEDED' &&
+    !props.task.approvalPayload,
+)
 
 const canCancel = computed(
   () =>
@@ -86,6 +83,18 @@ const canCancel = computed(
     !isTerminalState(props.task.serverState) &&
     props.task.serverState !== null &&
     props.task.transport !== 'aborted',
+)
+
+/**
+ * 「核对状态」只在**值得核对**时出现：
+ * 状态未终结、或前端已报错/未确认。已经 SUCCEEDED 的轮次再放一个核对按钮，
+ * 只会把每一轮都变成一排调试按钮。
+ */
+const showRecheck = computed(
+  () =>
+    !!props.task.runId &&
+    !isRunning.value &&
+    (!isTerminalState(props.task.serverState) || !!props.task.error || !!props.task.detailError),
 )
 
 const showAnswer = computed(
@@ -96,225 +105,275 @@ const isHistoryOnly = computed(
   () => !!props.task.detail && !props.task.events.length && !props.task.prompt,
 )
 
-const entryLabel = computed(() => (props.task.entry === 'MUSIC_ADMIN' ? '音乐管理员' : '音乐用户'))
+/** 工具活动默认折叠：它是次级信息，不该和回答抢版面；执行中自动展开 */
+const toolsOpen = ref(false)
+
+const toolSteps = computed(
+  () => props.task.events.filter((event) => event.type === 'tool_start').length,
+)
+
+/** 执行中实时可见（用户需要知道"它在做什么"），结束后收成一行 */
+const showTools = computed(() => toolsOpen.value || isRunning.value)
+
+const waitingText = computed(() =>
+  props.task.serverState === 'WAITING_APPROVAL'
+    ? ''
+    : isRunning.value
+      ? '正在处理…'
+      : '',
+)
 </script>
 
 <template>
-  <article class="task">
-    <!-- 需求 -->
-    <header class="task__head">
-      <div class="task__meta">
-        <span class="mk-chip">{{ entryLabel }}</span>
-        <span class="task__time mk-mono">{{ formatClock(task.createdAt) }}</span>
-        <span v-if="task.runId" class="task__runid mk-mono" :title="task.runId">
-          run {{ task.runId.slice(0, 8) }}
-        </span>
-      </div>
-      <p v-if="task.prompt" class="task__prompt">{{ task.prompt }}</p>
-      <p v-else class="task__prompt task__prompt--muted">
-        {{ isHistoryOnly ? '（历史任务，本地没有保存原始输入）' : '（无输入内容）' }}
-      </p>
-    </header>
-
-    <!-- 状态条 -->
-    <div class="task__status">
-      <TaskStatusBadge :label="primary.label" :tone="primary.tone" :pulsing="isRunning" />
-      <span class="task__status-hint">{{ primaryHint }}</span>
-      <span class="task__elapsed mk-mono">{{ elapsed }}</span>
+  <article class="turn">
+    <!-- 用户：紧凑气泡，右对齐 -->
+    <div v-if="task.prompt" class="turn__ask">
+      <p class="turn__ask-text">{{ task.prompt }}</p>
     </div>
-
-    <!-- 工具活动：只渲染真实事件 -->
-    <ToolActivityList v-if="task.events.length" :events="task.events" />
-
-    <!-- 审批 -->
-    <ApprovalCard
-      v-if="task.approvalPayload"
-      :payload="task.approvalPayload"
-      :approval="task.approval"
-      :busy="task.deciding"
-      :error="task.approvalError"
-      @approve="emit('approve')"
-      @reject="emit('reject')"
-      @resume="emit('resume')"
-      @refresh="emit('refresh-approval')"
-    />
-
-    <!-- 最终回答 -->
-    <section v-if="showAnswer" class="task__answer">
-      <p class="mk-eyebrow task__answer-label">最终回答</p>
-      <MarkdownView :source="task.answer" />
-    </section>
-
-    <!-- 任务级原因码 -->
-    <p v-if="task.detail?.errorCode" class="task__code">
-      <AppIcon name="info" :size="14" />
-      {{ task.detail.errorCode }}
+    <p v-else class="turn__ask-muted">
+      {{ isHistoryOnly ? '（历史任务，本地没有保存原始输入）' : '（无输入内容）' }}
     </p>
 
-    <!-- 错误 / 未确认 -->
-    <ErrorNotice
-      v-if="task.error"
-      :title="task.error.text"
-      :tone="task.error.kind === 'aborted' ? 'warn' : 'danger'"
-      :action-label="task.runId ? '核对任务状态' : ''"
-      :secondary-label="isRunning ? '停止等待' : ''"
-      @action="emit('recheck')"
-      @secondary="emit('stop-waiting')"
-    />
+    <!-- 助手：开放正文，不加卡片 -->
+    <div class="turn__reply">
+      <div class="turn__meta">
+        <span class="turn__who">MkAgent</span>
+        <span class="turn__time">{{ formatClock(task.createdAt) }}</span>
+        <TaskStatusBadge v-if="showStatus" :label="primary.label" :tone="primary.tone" size="sm" />
+        <button
+          v-if="task.events.length"
+          type="button"
+          class="turn__tools"
+          :aria-expanded="showTools"
+          @click="toolsOpen = !toolsOpen"
+        >
+          <AppIcon
+            name="chevron-right"
+            :size="12"
+            :class="['turn__tools-icon', { 'is-open': showTools }]"
+          />
+          工具 {{ toolSteps }} 步
+        </button>
+      </div>
 
-    <ErrorNotice
-      v-else-if="task.detailError"
-      :title="task.detailError"
-      tone="warn"
-      action-label="重新核对"
-      @action="emit('recheck')"
-    />
+      <p v-if="showStatus && primaryHint" class="turn__hint">{{ primaryHint }}</p>
 
-    <!-- 操作 -->
-    <footer class="task__actions">
-      <button
-        v-if="isRunning"
-        type="button"
-        class="mk-btn mk-btn--sm"
-        @click="emit('stop-waiting')"
-      >
-        <AppIcon name="stop" :size="13" />
-        停止等待
-      </button>
-      <button
-        v-if="canCancel"
-        type="button"
-        class="mk-btn mk-btn--sm"
-        @click="emit('cancel')"
-      >
-        取消任务
-      </button>
-      <button
-        v-if="!isRunning && task.runId"
-        type="button"
-        class="mk-btn mk-btn--sm mk-btn--ghost"
-        :disabled="task.verifying"
-        @click="emit('recheck')"
-      >
-        <AppIcon name="refresh" :size="13" />
-        {{ task.verifying ? '核对中…' : '核对状态' }}
-      </button>
-      <span v-if="isRunning" class="task__action-note">
-        停止等待只关闭前端连接，不会取消后端任务。
-      </span>
-    </footer>
+      <ToolActivityList v-if="showTools && task.events.length" :events="task.events" />
+
+      <ApprovalCard
+        v-if="task.approvalPayload"
+        :payload="task.approvalPayload"
+        :approval="task.approval"
+        :busy="task.deciding"
+        :error="task.approvalError"
+        @approve="emit('approve')"
+        @reject="emit('reject')"
+        @resume="emit('resume')"
+        @refresh="emit('refresh-approval')"
+      />
+
+      <MarkdownView v-if="showAnswer" class="turn__answer" :source="task.answer" />
+
+      <p v-else-if="waitingText" class="turn__waiting">{{ waitingText }}</p>
+
+      <!-- 任务级原因码 -->
+      <p v-if="task.detail?.errorCode" class="turn__code">
+        <AppIcon name="info" :size="13" />
+        {{ task.detail.errorCode }}
+      </p>
+
+      <!-- 错误 / 未确认 -->
+      <ErrorNotice
+        v-if="task.error"
+        :title="task.error.text"
+        :tone="task.error.kind === 'aborted' ? 'warn' : 'danger'"
+        :action-label="task.runId ? '核对任务状态' : ''"
+        :secondary-label="isRunning ? '停止等待' : ''"
+        @action="emit('recheck')"
+        @secondary="emit('stop-waiting')"
+      />
+
+      <ErrorNotice
+        v-else-if="task.detailError"
+        :title="task.detailError"
+        tone="warn"
+        action-label="重新核对"
+        @action="emit('recheck')"
+      />
+
+      <!-- 操作：次级信息，不抢主视觉 -->
+      <footer v-if="isRunning || canCancel || showRecheck" class="turn__actions">
+        <button
+          v-if="isRunning"
+          type="button"
+          class="mk-btn mk-btn--sm"
+          @click="emit('stop-waiting')"
+        >
+          <AppIcon name="stop" :size="12" />
+          停止等待
+        </button>
+        <button
+          v-if="canCancel"
+          type="button"
+          class="mk-btn mk-btn--sm mk-btn--ghost"
+          @click="emit('cancel')"
+        >
+          取消任务
+        </button>
+        <button
+          v-if="showRecheck"
+          type="button"
+          class="mk-btn mk-btn--sm mk-btn--ghost"
+          :disabled="task.verifying"
+          @click="emit('recheck')"
+        >
+          <AppIcon name="refresh" :size="12" />
+          {{ task.verifying ? '核对中…' : '核对状态' }}
+        </button>
+        <span v-if="isRunning" class="turn__action-note">
+          停止等待只关闭前端连接，不会取消后端任务。
+        </span>
+      </footer>
+    </div>
   </article>
 </template>
 
 <style scoped>
-.task {
-  display: grid;
-  gap: var(--s-4);
-  padding: var(--s-5) 0 var(--s-2);
-  animation: fade var(--dur-slow) var(--ease) both;
-}
-
-@keyframes fade {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
-.task__head {
+.turn {
   display: grid;
   gap: var(--s-3);
+  padding: var(--s-6) 0;
+  border-bottom: 1px solid var(--c-line-soft);
 }
 
-.task__meta {
+.turn:last-child {
+  border-bottom: 0;
+}
+
+/* ---- 用户气泡 ---- */
+.turn__ask {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.turn__ask-text {
+  max-width: 78%;
+  padding: 9px var(--s-3);
+  border-radius: var(--r-md);
+  background: var(--c-surface);
+  color: var(--c-text);
+  font-size: var(--fs-base);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.turn__ask-muted {
+  text-align: right;
+  font-size: var(--fs-sm);
+  color: var(--c-text-3);
+}
+
+/* ---- 助手正文 ---- */
+.turn__reply {
+  display: grid;
+  gap: var(--s-3);
+  min-width: 0;
+}
+
+.turn__meta {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  flex-wrap: wrap;
-}
-
-.task__time,
-.task__runid {
+  min-width: 0;
   font-size: var(--fs-xs);
   color: var(--c-text-3);
 }
 
-.task__runid {
-  padding: 1px 6px;
-  border-radius: var(--r-xs);
-  border: 1px solid var(--c-line);
-  background: var(--c-bg-soft);
+.turn__who {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--c-text-2);
 }
 
-.task__prompt {
-  font-size: var(--fs-lg);
-  line-height: var(--lh-tight);
-  font-weight: 500;
+.turn__time {
+  font-variant-numeric: tabular-nums;
+}
+
+.turn__tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  padding: 2px 6px;
+  border-radius: var(--r-xs);
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.turn__tools:hover {
+  background: var(--c-surface-2);
+  color: var(--c-text-2);
+}
+
+.turn__tools-icon {
+  transition: transform var(--dur-fast) var(--ease);
+}
+
+.turn__tools-icon.is-open {
+  transform: rotate(90deg);
+}
+
+.turn__hint {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  line-height: var(--lh-base);
+}
+
+.turn__answer {
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
   color: var(--c-text);
   overflow-wrap: anywhere;
 }
 
-.task__prompt--muted {
-  font-size: var(--fs-base);
-  font-weight: 400;
-  color: var(--c-text-3);
-}
-
-.task__status {
+.turn__waiting {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  flex-wrap: wrap;
-  padding: var(--s-2) 0;
-  border-top: 1px solid var(--c-line-soft);
-  border-bottom: 1px solid var(--c-line-soft);
-}
-
-.task__status-hint {
+  gap: var(--s-2);
   font-size: var(--fs-sm);
   color: var(--c-text-3);
-  flex: 1;
-  min-width: 0;
 }
 
-.task__elapsed {
-  font-size: var(--fs-xs);
-  color: var(--c-text-3);
-}
-
-.task__answer {
-  padding: var(--s-4);
-  border-radius: var(--r-lg);
-  border: 1px solid var(--c-line);
-  background: var(--c-surface);
-}
-
-.task__answer-label {
-  margin-bottom: var(--s-2);
-}
-
-.task__code {
+.turn__code {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--c-text-3);
   font-family: var(--font-mono);
 }
 
-.task__actions {
+.turn__actions {
   display: flex;
   align-items: center;
   gap: var(--s-2);
   flex-wrap: wrap;
+  margin-top: var(--s-1);
 }
 
-.task__action-note {
+.turn__action-note {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
+}
+
+@media (max-width: 560px) {
+  .turn {
+    padding: var(--s-5) 0;
+  }
+
+  .turn__ask-text {
+    max-width: 88%;
+  }
 }
 </style>

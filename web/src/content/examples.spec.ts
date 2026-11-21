@@ -1,18 +1,22 @@
 import { describe, expect, it } from 'vitest'
-import { examplesFor } from './examples'
+import { QUICK_ENTRIES, READ_ONLY_CAPABILITY_TEXT, WRITE_CAPABILITY_TEXT } from './examples'
 import { resolveIdentityPolicy } from '@/api/identity'
 
 /**
  * 内容与身份策略测试。
  *
- * 两个"不能骗人"的点：
- * 1. 只读模式下不能出现任何写操作示例（点了必然失败）；
- * 2. 正式构建不能出现切换身份的入口。
+ * 三个"不能骗人"的点：
+ * 1. 空状态入口里不能出现写操作示例（只读装配下点了必然失败）；
+ * 2. 「查看我的歌单」是本地抽屉，不能被当成一次模型任务提交；
+ * 3. 正式构建不能出现切换身份的入口。
  */
-describe('示例任务', () => {
-  it('只读模式不出现任何写操作示例', () => {
-    const examples = examplesFor('readonly')
-    const text = examples.map((item) => `${item.title}${item.prompt}`).join(' ')
+describe('空状态快捷入口', () => {
+  it('正好三个入口，符合空状态设计', () => {
+    expect(QUICK_ENTRIES).toHaveLength(3)
+  })
+
+  it('入口文案里没有写操作', () => {
+    const text = QUICK_ENTRIES.map((item) => `${item.title}${item.prompt}`).join(' ')
 
     expect(text).not.toContain('创建歌单')
     expect(text).not.toContain('建一个歌单')
@@ -20,25 +24,22 @@ describe('示例任务', () => {
     expect(text).not.toContain('删除')
   })
 
-  it('写能力模式才给出写操作示例', () => {
-    const text = examplesFor('write_approval')
-      .map((item) => `${item.title}${item.prompt}`)
-      .join(' ')
+  it('只有歌单入口走本地抽屉，其余都是回填提示词', () => {
+    const library = QUICK_ENTRIES.filter((item) => item.action === 'library')
+    const prompts = QUICK_ENTRIES.filter((item) => !item.action)
 
-    expect(text).toContain('建一个歌单')
-    expect(text).toContain('需审批')
-  })
-
-  it('每个示例都有标题与可提交的提示词', () => {
-    for (const example of examplesFor('readonly')) {
-      expect(example.title.length).toBeGreaterThan(0)
-      expect(example.prompt.length).toBeGreaterThan(4)
+    expect(library).toHaveLength(1)
+    expect(library[0].title).toBe('查看我的歌单')
+    expect(prompts).toHaveLength(2)
+    for (const entry of prompts) {
+      expect(entry.prompt.length).toBeGreaterThan(4)
     }
   })
 
-  it('只读示例数量在 3–4 条之间，符合空状态设计', () => {
-    expect(examplesFor('readonly').length).toBeGreaterThanOrEqual(3)
-    expect(examplesFor('readonly').length).toBeLessThanOrEqual(4)
+  it('能力说明与装配一致：只读文案不宣称可写', () => {
+    expect(READ_ONLY_CAPABILITY_TEXT).toContain('只读')
+    expect(READ_ONLY_CAPABILITY_TEXT).toContain('写操作还没有开放')
+    expect(WRITE_CAPABILITY_TEXT).toContain('审批')
   })
 })
 

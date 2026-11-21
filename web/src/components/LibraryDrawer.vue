@@ -12,7 +12,7 @@
  * - 不从任务结果里"推断"歌单，全部走查询接口；
  * - 不做分页（种子与演示规模远小于一屏，先不做假的复杂度）。
  */
-import { computed, onBeforeUnmount, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import AppIcon from './AppIcon.vue'
 import {
   library,
@@ -23,6 +23,19 @@ import type { SongVO } from '@/api/types'
 
 const props = defineProps<{ open: boolean }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
+
+/** 打开后把焦点交给关闭按钮：键盘用户不会"丢在页面上" */
+const closeBtn = ref<HTMLButtonElement | null>(null)
+
+watch(
+  () => props.open,
+  (open) => {
+    if (!open) {
+      return
+    }
+    void nextTick(() => closeBtn.value?.focus())
+  },
+)
 
 /**
  * 每次打开都重新查一次。
@@ -112,6 +125,7 @@ function duration(song: SongVO): string {
             {{ library.loading ? '刷新中…' : '刷新' }}
           </button>
           <button
+            ref="closeBtn"
             type="button"
             class="mk-btn mk-btn--ghost mk-btn--sm"
             aria-label="关闭"

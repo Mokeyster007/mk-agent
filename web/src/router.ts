@@ -21,6 +21,22 @@ const router = createRouter({
       component: () => import('@/views/ApprovalPreviewView.vue'),
       meta: { title: '审批卡预览' },
     },
+    /*
+     * 商城（A0）：独立入口，不塞进歌曲 / 播放页面。
+     * 音乐模块完全保留，两个入口通过侧栏与顶栏互相可达。
+     */
+    {
+      path: '/shop',
+      name: 'shop',
+      component: () => import('@/views/ShopView.vue'),
+      meta: { title: '商城' },
+    },
+    {
+      path: '/shop/admin',
+      name: 'shop-admin',
+      component: () => import('@/views/ShopAdminView.vue'),
+      meta: { title: '商城后台' },
+    },
     {
       path: '/:pathMatch(.*)*',
       redirect: '/',

@@ -2,6 +2,7 @@ package com.example.mkagent.model;
 
 import com.example.mkagent.approval.ApprovalCheckpoint;
 import com.example.mkagent.context.UserContextHolder;
+import com.example.mkagent.conversation.ConversationRefs;
 import com.example.mkagent.resilience.ToolTargetExhaustionTracker;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -197,6 +198,23 @@ public class AgentRunContext {
      * 非 HTTP 入口（单测直接 new）时为 anonymous 兑底。
      */
     private String userId = UserContextHolder.ANONYMOUS_USER_ID;
+
+    /**
+     * 所属会话（同一窗口连续聊天）。
+     *
+     * 为空表示"独立任务"：老的 /ai/manus 与 /ai/music/chat 不带会话时保持这个状态，
+     * 历史记录不需要迁移。**注意它不是 runId**：
+     * conversationId 跨多轮不变，runId 每轮都新建。
+     */
+    private String conversationId;
+
+    /**
+     * 本轮从真实工具结果里抽出的业务引用（最近搜索到的歌、歌单）。
+     *
+     * 由 BusinessRefCollector 在工具执行后累积，终态时写回会话；
+     * 下一轮构造上下文时再读出来，供"第一首/刚才那个歌单"这类指代使用。
+     */
+    private ConversationRefs conversationRefs = ConversationRefs.EMPTY;
 
     /**
      * 执行本任务的 Agent 类型（持久化到 agent_run.agent_type），
@@ -576,6 +594,30 @@ public class AgentRunContext {
 
     public void setUserId(String userId) {
         this.userId = userId;
+    }
+
+    /**
+     * 所属会话；null 表示独立任务。
+     */
+    public String getConversationId() {
+        return conversationId;
+    }
+
+    public void setConversationId(String conversationId) {
+        this.conversationId = conversationId;
+    }
+
+    /**
+     * 本轮累积的业务引用；永远不会是 null（无引用时是 EMPTY）。
+     */
+    public ConversationRefs getConversationRefs() {
+        return conversationRefs;
+    }
+
+    public void setConversationRefs(ConversationRefs conversationRefs) {
+        this.conversationRefs = conversationRefs == null
+                ? ConversationRefs.EMPTY
+                : conversationRefs;
     }
 
     public AgentType getAgentType() {

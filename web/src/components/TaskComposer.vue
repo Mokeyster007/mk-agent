@@ -7,7 +7,9 @@
  * 1. 组件内 submitting 锁（点击后立即置位，不等父组件）；
  * 2. 按钮 disabled；
  * 3. store 里的 isBusy 守卫。
- * 输入法组字中的回车不算提交（isComposing），否则中文输入会被截断。
+ *
+ * 输入法：组字中的回车是选词，不是发送（isComposing + composition 事件双保险）。
+ * 高度：随内容向上扩展，到上限后在 textarea 内部滚动，不影响底部位置。
  */
 import { nextTick, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
@@ -26,6 +28,9 @@ const emit = defineEmits<{
   (e: 'entry', value: MusicEntry): void
 }>()
 
+/** 与 CSS 的 --composer-max-h 保持一致 */
+const MAX_HEIGHT = 200
+
 const text = ref('')
 const composing = ref(false)
 const submitting = ref(false)
@@ -37,7 +42,7 @@ function resize(): void {
     return
   }
   el.style.height = 'auto'
-  el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+  el.style.height = `${Math.min(el.scrollHeight, MAX_HEIGHT)}px`
 }
 
 function send(): void {
@@ -134,7 +139,7 @@ defineExpose({ fill })
           :aria-label="busy ? '任务执行中' : '发送任务'"
           @click="send"
         >
-          <AppIcon :name="busy ? 'clock' : 'send'" :size="16" />
+          <AppIcon :name="busy ? 'clock' : 'send'" :size="15" />
         </button>
       </div>
     </div>
@@ -149,7 +154,7 @@ defineExpose({ fill })
 .composer__entry {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
+  gap: var(--s-2);
   margin-bottom: var(--s-2);
   flex-wrap: wrap;
 }
@@ -157,7 +162,6 @@ defineExpose({ fill })
 .composer__entry-label {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
-  letter-spacing: 0.04em;
 }
 
 .composer__entry-hint {
@@ -174,10 +178,10 @@ defineExpose({ fill })
 }
 
 .segmented__item {
-  height: 24px;
-  padding: 0 10px;
+  height: 22px;
+  padding: 0 9px;
   border-radius: 6px;
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--c-text-3);
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
@@ -187,21 +191,21 @@ defineExpose({ fill })
 }
 
 .segmented__item--on {
-  background: var(--c-surface-3);
+  background: var(--c-surface-2);
   color: var(--c-text);
 }
 
 .composer__box {
   border: 1px solid var(--c-line);
-  border-radius: var(--r-lg);
+  border-radius: var(--r-md);
   background: var(--c-surface);
-  padding: var(--s-3) var(--s-3) var(--s-2);
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  padding: var(--s-2) var(--s-3) var(--s-2);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 
 .composer__box:focus-within {
   border-color: var(--c-accent-line);
-  box-shadow: 0 0 0 3px var(--c-accent-weak-2);
+  background: var(--c-surface-2);
 }
 
 .composer--busy .composer__box {
@@ -209,17 +213,19 @@ defineExpose({ fill })
 }
 
 .composer__input {
+  display: block;
   width: 100%;
-  min-height: 44px;
-  max-height: 200px;
+  min-height: 26px;
+  max-height: var(--composer-max-h);
   resize: none;
   border: 0;
   outline: none;
   background: transparent;
   color: var(--c-text);
-  font-size: var(--fs-md);
+  font-size: var(--fs-base);
   line-height: var(--lh-base);
-  padding: 2px 2px 0;
+  padding: 4px 0 0;
+  overflow-y: auto;
 }
 
 .composer__input::placeholder {
@@ -235,11 +241,11 @@ defineExpose({ fill })
   align-items: center;
   justify-content: space-between;
   gap: var(--s-3);
-  margin-top: var(--s-2);
+  margin-top: var(--s-1);
 }
 
 .composer__hint {
-  font-size: var(--fs-xs);
+  font-size: 10.5px;
   color: var(--c-text-3);
   white-space: nowrap;
   overflow: hidden;
@@ -260,17 +266,17 @@ kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 30px;
+  height: 30px;
   flex: none;
   border-radius: var(--r-sm);
   background: var(--c-accent);
-  color: #0b0d12;
+  color: var(--c-text-inverse);
   transition: background var(--dur-fast) var(--ease), opacity var(--dur-fast) var(--ease);
 }
 
 .composer__send:hover:not(:disabled) {
-  background: #93a0ff;
+  background: var(--c-accent-strong);
 }
 
 .composer__send:disabled {
@@ -288,8 +294,7 @@ kbd {
   }
 
   .composer__input {
-    min-height: 38px;
-    font-size: var(--fs-base);
+    font-size: 16px; /* 防止 iOS 聚焦时自动放大页面 */
   }
 
   .composer__bar {

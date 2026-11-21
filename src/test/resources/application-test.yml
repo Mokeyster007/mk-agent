@@ -18,6 +18,19 @@ spring:
     exclude:
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeChatAutoConfiguration
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAgentAutoConfiguration
+      # 语音合成 / 识别：本项目零使用，且 api-key 为空时会抛异常导致启动失败。
+      # 生产 application.yml 已排除，这里必须重复（列表是整体替换的）。
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioSpeechAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeAudioTranscriptionAutoConfiguration
+      # Image / Rerank：同样零使用（只有直接 new 的 RetryTemplate 事故复现测试），
+      # 且和语音一样，api-key 为空时会在启动阶段抛
+      # "DashScope API key must be set"。
+      # 测试环境不装配它们，才能验证"完全没有模型凭据时容器仍能起来、
+      # 商城闭环仍能跑"（ShopStartsWithoutModelCredentialTest）。
+      # 生产保留这两个自动配置：它们和既有的 RetryTemplate 污染诊断相关，
+      # 本轮不动。
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeImageAutoConfiguration
+      - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeRerankAutoConfiguration
       # 真实 Embedding 模型会与 RAG 测试里的同名桩 Bean 冲突并被覆盖，
       # 进而用占位密钥发起真实请求（401）。测试统一使用桩或 mock。
       - com.alibaba.cloud.ai.autoconfigure.dashscope.DashScopeEmbeddingAutoConfiguration
@@ -63,6 +76,13 @@ mkagent:
     pgvector:
       # H2 没有 vector 扩展；测试统一使用内存向量库或 mock。
       enabled: false
+
+  shop:
+    # 测试默认启用演示身份，否则下单 / 发货 / 签收全部 403，主流程无从验证。
+    # 需要验证"未启用时拒绝"的用例，用
+    # @HermeticSpringBootTest(properties = "mkagent.shop.demo-identity-enabled=false")
+    # 单独覆盖，不要改这里的默认值。
+    demo-identity-enabled: true
 
 search-api:
   # 占位密钥：搜索工具在测试中不会被真正调用。

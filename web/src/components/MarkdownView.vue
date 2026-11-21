@@ -81,10 +81,15 @@ const html = computed(() => {
 
 <style scoped>
 .markdown {
-  font-size: var(--fs-md);
-  line-height: var(--lh-relaxed);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
   color: var(--c-text);
   overflow-wrap: anywhere;
+}
+
+.markdown :deep(strong) {
+  font-weight: 600;
+  color: var(--c-text);
 }
 
 .markdown :deep(p) {

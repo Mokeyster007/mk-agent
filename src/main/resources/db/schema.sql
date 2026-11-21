@@ -326,6 +326,180 @@ ALTER TABLE music_tool_idempotency ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
 ALTER TABLE music_tool_idempotency
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
 
+-- =============================================================
+-- 会话（同一窗口连续聊天）
+--
+-- 三个 ID 的职责严格分开，不能互相顶替：
+--   conversation_id —— 会话：一个窗口里连续的多轮；
+--   run_id          —— 一次用户提交（一轮）；每次提交都新建，**绝不复活**终态 run；
+--   execution_epoch —— 某个 run 的执行代次：审批恢复时 +1，只用于防旧线程迟到写入。
+--
+-- agent_run.conversation_id 可空：历史独立任务保持 NULL，
+-- 不强迫把旧记录迁移成会话。
+-- =============================================================
+CREATE TABLE IF NOT EXISTS agent_conversation
+(
+    id              BIGINT       NOT NULL,
+    conversation_id VARCHAR(64)  NOT NULL,
+    user_id         VARCHAR(64)  NOT NULL,
+    title           VARCHAR(200),
+    refs_json       TEXT,
+    last_run_id     VARCHAR(64),
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_agent_conversation PRIMARY KEY (id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_conversation_id
+    ON agent_conversation (conversation_id);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_user
+    ON agent_conversation (user_id, updated_at);
+
+-- 会话消息：只存用户输入与模型最终回答的**文本**。
+--
+-- 不存工具调用与工具原始结果：
+-- 1. 回放旧工具调用会让模型把历史指令当新指令重新执行；
+-- 2. 工具结果里的 ID/名称另有 refs_json 承载（见下），
+--    不需要把整段 JSON 塞回上下文。
+--
+-- (run_id, role) 唯一：同一个 run 的助手回答只留一条，
+-- 审批恢复重写时是更新而不是追加。
+CREATE TABLE IF NOT EXISTS agent_conversation_message
+(
+    id              BIGINT       NOT NULL,
+    conversation_id VARCHAR(64)  NOT NULL,
+    run_id          VARCHAR(64)  NOT NULL,
+    role            VARCHAR(16)  NOT NULL,
+    content         TEXT,
+    state           VARCHAR(32),
+    created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_agent_conversation_message PRIMARY KEY (id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_conversation_message_run_role
+    ON agent_conversation_message (run_id, role);
+
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_message_conv
+    ON agent_conversation_message (conversation_id, id);
+
+-- 存量 agent_run 增量升级：会话归属（幂等，可重复执行）
+ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS conversation_id VARCHAR(64);
+
+CREATE INDEX IF NOT EXISTS idx_agent_run_conversation
+    ON agent_run (conversation_id, state);
+
+COMMENT ON TABLE agent_conversation IS '会话：一个窗口里的连续多轮（与 run 一对多）';
+COMMENT ON COLUMN agent_conversation.refs_json IS '会话级业务引用（最近搜索结果 / 歌单），只由真实工具结果写入';
+COMMENT ON COLUMN agent_conversation.last_run_id IS '最近一次提交对应的 run（便于定位，不代表"当前活动 run"）';
+COMMENT ON TABLE agent_conversation_message IS '会话消息：只存用户输入与模型最终回答文本，不存工具调用';
+COMMENT ON COLUMN agent_conversation_message.state IS '该轮 run 的终态快照（FAILED/CANCELLED 等也要如实展示）';
+COMMENT ON COLUMN agent_run.conversation_id IS '所属会话；历史独立任务为 NULL';
+
+-- =============================================================
+-- 播放（MVP）：曲目 → 音源映射
+--
+-- 为什么单独一张表而不是给 music_song 加 url 列：
+--   1. 曲目是"内容元数据"，音源是"交付方式"——两者生命周期不同
+--      （同一首歌将来可能同时有自有音频、官方 SDK、外链三种来源）；
+--   2. 没有映射的曲目必须继续可查询、明确不可播，而不是"有 url 但为空"
+--      这种无法区分"没配"和"配错了"的状态；
+--   3. 播放模式要能表达 DIRECT_AUDIO / PROVIDER_SDK / EXTERNAL_LINK /
+--      UNAVAILABLE 四种，未来加 SDK 不需要改曲库表。
+--
+-- 主键 (song_id, provider)：一首歌在同一 provider 下只有一条映射，
+-- 但可以有多条（例如自有音频 + 未来接入的官方 SDK），解析时按优先级挑选。
+--
+-- object_key 是**服务端内部标识**（classpath 相对路径或媒体目录下的相对路径），
+-- 永远不出现在接口响应里；对外只给带签名的短期地址。
+-- owner_user_id 非空表示"仅该用户可播"（用于验证越权拒绝）；
+-- 为空表示所有已开通音乐服务的用户都可播。
+-- =============================================================
+CREATE TABLE IF NOT EXISTS music_track_source
+(
+    song_id       BIGINT       NOT NULL,
+    provider      VARCHAR(32)  NOT NULL,
+    mode          VARCHAR(24)  NOT NULL,
+    format        VARCHAR(24)  NOT NULL,
+    object_key    VARCHAR(255) NOT NULL,
+    content_type  VARCHAR(64)  NOT NULL,
+    owner_user_id VARCHAR(64),
+    processable   BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_test_audio BOOLEAN      NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_track_source PRIMARY KEY (song_id, provider)
+);
+
+-- 「正在播放」：客户端在真实 playing 事件后上报，服务端复核可播性再落库。
+--
+-- 为什么不在请求里直接信任前端传的 songId：
+-- "把正在播放的歌加入歌单"这条链路必须以**服务端能确认的播放事实**为前提，
+-- 否则前端可以声称任意歌曲正在播放，等于绕过曲目访问校验。
+--
+-- 一个用户只有一行（同一时刻只有一个"活跃播放实例"）。
+-- instance_id 是客户端为每次播放尝试生成的随机串，用来解决三件事：
+--   1. 心跳只能刷新**同一个实例**，不能拿旧标签页的心跳改当前曲目；
+--   2. 旧标签页迟到的 PAUSE/STOP 不能停掉新实例；
+--   3. 已 STOPPED 的实例不能被一次迟到心跳"复活"。
+-- updated_at 只由服务端写（CURRENT_TIMESTAMP），不接受客户端时间。
+CREATE TABLE IF NOT EXISTS music_now_playing
+(
+    user_id     VARCHAR(64) NOT NULL,
+    song_id     BIGINT      NOT NULL,
+    state       VARCHAR(16) NOT NULL,
+    instance_id VARCHAR(64),
+    started_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_now_playing PRIMARY KEY (user_id)
+);
+
+-- 已有库的增量迁移（本轮给「正在播放」加了播放实例）。
+-- 用 ADD COLUMN IF NOT EXISTS 而不是改上面的 CREATE：
+-- 上面只对空库生效，演示库 / 已部署库需要原地补列。
+-- H2(PostgreSQL 模式) 与 PostgreSQL 9.6+ 都支持这个语法。
+ALTER TABLE music_now_playing
+    ADD COLUMN IF NOT EXISTS instance_id VARCHAR(64);
+ALTER TABLE music_now_playing
+    ADD COLUMN IF NOT EXISTS started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+COMMENT ON TABLE music_track_source IS '曲目音源映射（缺失即不可播；object_key 不对前端暴露）';
+COMMENT ON COLUMN music_track_source.mode IS 'DIRECT_AUDIO / PROVIDER_SDK / EXTERNAL_LINK / UNAVAILABLE';
+COMMENT ON COLUMN music_track_source.object_key IS '服务端内部定位（媒体目录相对路径），不对外返回';
+COMMENT ON COLUMN music_track_source.processable IS '是否允许客户端做音频处理（EQ）；仅受控来源为 TRUE';
+COMMENT ON COLUMN music_track_source.is_test_audio IS '是否为技术夹具测试音（非歌曲）';
+COMMENT ON COLUMN music_track_source.owner_user_id IS '非空表示仅该用户可播；空表示所有已开通用户可播';
+COMMENT ON TABLE music_now_playing IS '每个用户当前活跃播放实例（由客户端 playing 事件上报，服务端复核）';
+COMMENT ON COLUMN music_now_playing.instance_id IS '客户端生成的播放实例标识；心跳/暂停/停止必须带同一实例，否则 409';
+COMMENT ON COLUMN music_now_playing.started_at IS '本实例开始播放的时间（服务端时钟）';
+COMMENT ON COLUMN music_now_playing.updated_at IS '最后一次心跳时间（服务端时钟）；超过 TTL 视为无活跃播放';
+
+-- 平台连接：第三方音乐账号的只读绑定关系。
+--
+-- 三条边界：
+--   1. 归属是 (user_id, provider)：一个用户对一个平台最多一条连接；
+--   2. 只存"连接元数据"，**不存明文 access/refresh token**——
+--      credential_ref 指向外部密钥存储（本轮未启用，故为 NULL）；
+--   3. provider 是适配器标识（demo-alpha / demo-beta / 将来真实平台），
+--      不是展示名；展示名由适配器提供，避免前端硬编码。
+CREATE TABLE IF NOT EXISTS music_provider_connection
+(
+    user_id          VARCHAR(64)  NOT NULL,
+    provider         VARCHAR(32)  NOT NULL,
+    provider_user_id VARCHAR(128),
+    display_name     VARCHAR(128),
+    status           VARCHAR(16)  NOT NULL,
+    scopes           VARCHAR(512),
+    credential_ref   VARCHAR(128),
+    connected_at     TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_music_provider_connection PRIMARY KEY (user_id, provider)
+);
+
+COMMENT ON TABLE music_provider_connection IS '第三方音乐平台只读连接（不含明文令牌）';
+COMMENT ON COLUMN music_provider_connection.status IS 'CONNECTED / EXPIRED / REVOKED';
+COMMENT ON COLUMN music_provider_connection.scopes IS '已授予的只读范围（空格分隔），用于前端展示"权限不足"';
+COMMENT ON COLUMN music_provider_connection.credential_ref IS '外部密钥存储引用；本轮不写明文令牌，未启用时为 NULL';
+
 COMMENT ON TABLE music_song IS '曲库（虚构种子数据，不含真实版权内容）';
 COMMENT ON COLUMN music_song.duration_seconds IS '时长（秒）';
 COMMENT ON COLUMN music_song.release_year IS '发行年份';
@@ -337,3 +511,189 @@ COMMENT ON TABLE music_play_log IS '播放日志（不含设备指纹 / IP 等�
 COMMENT ON TABLE music_user IS '用户角色表：管理员身份的唯一可信来源';
 COMMENT ON COLUMN music_user.role IS '角色：USER / ADMIN';
 COMMENT ON TABLE music_tool_idempotency IS '写工具幂等记录（M3 启用；幂等键由服务端派生）';
+
+-- =============================================================
+-- 商城（A0：最小商城 + 订单 + 发货出库）
+--
+-- 命名空间 shop_ 与音乐表完全分开：不复用 music_song / music_user。
+-- 全部语句幂等（IF NOT EXISTS），PostgreSQL 与 H2（PostgreSQL 兼容模式）通用。
+--
+-- 这一批只建 A0 需要的六张表。
+-- **不提前**建售后申请表、退货单、仓库验收表或 ERP 通用模型：
+-- A1 / B 的表结构要在"资格校验规则"和"验收规则"定下来之后再加，
+-- 提前建表只会把还没想清楚的状态机固化进数据库。
+-- =============================================================
+
+-- 商品。A0 里**一行就是一个可售 SKU**（单仓、单规格）。
+--
+-- 为什么不拆 product + sku 两张表：
+-- 本轮没有颜色/尺码这类变体，拆开只会多一次 join 和一张永远只有一行的表。
+-- 将来真出现多规格时，再加 shop_sku 表并让订单行指向 sku，
+-- 而不是现在先把变体模型猜一遍。
+--
+-- price_cents 用"分"存整数：金额绝不进浮点数。
+CREATE TABLE IF NOT EXISTS shop_product
+(
+    id          BIGINT       NOT NULL,
+    sku         VARCHAR(64)  NOT NULL,
+    name        VARCHAR(200) NOT NULL,
+    subtitle    VARCHAR(200),
+    price_cents BIGINT       NOT NULL,
+    status      VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_shop_product PRIMARY KEY (id),
+    CONSTRAINT uk_shop_product_sku UNIQUE (sku),
+    CONSTRAINT ck_shop_product_price CHECK (price_cents >= 0),
+    CONSTRAINT ck_shop_product_status CHECK (status IN ('ACTIVE', 'INACTIVE'))
+);
+
+-- 销售订单。一条订单在 A0 里只有一条明细（见下方唯一索引）。
+--
+-- 状态只有三条边：PENDING_SHIPMENT → SHIPPED → SIGNED，没有回退、没有取消。
+-- CHECK 约束把这条状态机钉在数据库里：应用层写错一个字符串会直接失败，
+-- 而不是悄悄产生一个"谁也不认识"的状态。
+--
+-- payment_mode 固定 DEMO：本轮没有真实资金交易，
+-- 这一列存在的意义是**让"这是演示付款"成为可查询的事实**，
+-- 而不是只写在页面文案里。
+CREATE TABLE IF NOT EXISTS shop_order
+(
+    id           BIGINT      GENERATED BY DEFAULT AS IDENTITY,
+    order_no     VARCHAR(32) NOT NULL,
+    buyer_id     VARCHAR(64) NOT NULL,
+    status       VARCHAR(24) NOT NULL,
+    total_cents  BIGINT      NOT NULL,
+    payment_mode VARCHAR(16) NOT NULL,
+    created_at   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    shipped_at   TIMESTAMP,
+    shipped_by   VARCHAR(64),
+    signed_at    TIMESTAMP,
+    signed_by    VARCHAR(64),
+    CONSTRAINT pk_shop_order PRIMARY KEY (id),
+    CONSTRAINT uk_shop_order_no UNIQUE (order_no),
+    CONSTRAINT ck_shop_order_status
+        CHECK (status IN ('PENDING_SHIPMENT', 'SHIPPED', 'SIGNED')),
+    CONSTRAINT ck_shop_order_total CHECK (total_cents >= 0),
+    CONSTRAINT ck_shop_order_payment CHECK (payment_mode IN ('DEMO'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_shop_order_buyer
+    ON shop_order (buyer_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_shop_order_status
+    ON shop_order (status, created_at);
+
+-- 订单明细：SKU 关联 + **成交快照**（商品名、单价、数量、行小计）。
+--
+-- 为什么快照必须落在订单行上：
+-- 商品改名、调价之后，历史订单仍然要显示"当时买的是什么、多少钱"。
+-- 只存 product_id 再 join 商品表，会让历史订单随商品一起变形。
+--
+-- uk_shop_order_item_order：A0 明确"一张订单一条 SKU 明细"，
+-- 用唯一索引表达，而不是靠服务层自觉。
+CREATE TABLE IF NOT EXISTS shop_order_item
+(
+    id               BIGINT       GENERATED BY DEFAULT AS IDENTITY,
+    order_id         BIGINT       NOT NULL,
+    product_id       BIGINT       NOT NULL,
+    sku              VARCHAR(64)  NOT NULL,
+    product_name     VARCHAR(200) NOT NULL,
+    unit_price_cents BIGINT       NOT NULL,
+    quantity         INT          NOT NULL,
+    line_cents       BIGINT       NOT NULL,
+    created_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_shop_order_item PRIMARY KEY (id),
+    CONSTRAINT uk_shop_order_item_order UNIQUE (order_id),
+    CONSTRAINT fk_shop_order_item_order FOREIGN KEY (order_id) REFERENCES shop_order (id),
+    CONSTRAINT ck_shop_order_item_qty CHECK (quantity > 0),
+    CONSTRAINT ck_shop_order_item_price CHECK (unit_price_cents >= 0 AND line_cents >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shop_order_item_product
+    ON shop_order_item (product_id);
+
+-- 库存余额（单仓，按 SKU 一行）。
+--
+-- ck_shop_inventory_available 是**最后一道**防线：
+-- 即使应用层的条件更新写错，数据库也不允许出现负库存。
+-- 它不替代"发货前校验 + 原子条件更新"——那两件事决定的是**用户体验**
+-- （给"库存不足"而不是给"约束冲突"），约束只负责"绝不为负"。
+CREATE TABLE IF NOT EXISTS shop_inventory_balance
+(
+    sku        VARCHAR(64) NOT NULL,
+    product_id BIGINT      NOT NULL,
+    available  INT         NOT NULL,
+    updated_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_shop_inventory_balance PRIMARY KEY (sku),
+    CONSTRAINT ck_shop_inventory_available CHECK (available >= 0)
+);
+
+-- 库存流水（只增不改）。
+--
+-- order_id / order_item_id 是可追溯的来源：从订单能查到出库记录，
+-- 从流水也能回到订单行。
+--
+-- uk_shop_inventory_movement_source 是"重复发货不重复写流水"的数据库兜底：
+-- 同一个订单行 + 同一种业务类型只允许一条。
+-- 正常路径靠订单行锁 + 状态条件更新挡住重复发货，
+-- 这条唯一索引保证"即使有人绕过状态机，也不会出现两笔出库"。
+--
+-- movement_type 目前只允许 OUTBOUND_SHIPMENT。
+-- B 段加退货入库时**必须显式改这条 CHECK**（DROP + ADD），
+-- 这样"新增业务类型"是一件看得见的事，而不是随手写个新字符串就能插进去。
+CREATE TABLE IF NOT EXISTS shop_inventory_movement
+(
+    id             BIGINT      GENERATED BY DEFAULT AS IDENTITY,
+    sku            VARCHAR(64) NOT NULL,
+    quantity_delta INT         NOT NULL,
+    movement_type  VARCHAR(24) NOT NULL,
+    order_id       BIGINT,
+    order_item_id  BIGINT,
+    operator_id    VARCHAR(64),
+    note           VARCHAR(200),
+    created_at     TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_shop_inventory_movement PRIMARY KEY (id),
+    CONSTRAINT ck_shop_inventory_movement_type
+        CHECK (movement_type IN ('OUTBOUND_SHIPMENT')),
+    CONSTRAINT ck_shop_inventory_movement_delta CHECK (quantity_delta <> 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uk_shop_inventory_movement_source
+    ON shop_inventory_movement (order_item_id, movement_type);
+
+CREATE INDEX IF NOT EXISTS idx_shop_inventory_movement_sku
+    ON shop_inventory_movement (sku, created_at);
+CREATE INDEX IF NOT EXISTS idx_shop_inventory_movement_order
+    ON shop_inventory_movement (order_id);
+
+-- 商城用户角色。与 music_user **完全独立**：
+-- 同一个 userId 在两张表里可以有不同角色，互不推导。
+--
+-- 角色是商城权限的唯一可信来源（服务端查询），
+-- 不接受请求头、请求参数或提示词里声明的角色。
+CREATE TABLE IF NOT EXISTS shop_user
+(
+    user_id    VARCHAR(64) NOT NULL,
+    role       VARCHAR(16) NOT NULL,
+    created_at TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pk_shop_user PRIMARY KEY (user_id),
+    CONSTRAINT ck_shop_user_role CHECK (role IN ('BUYER', 'ADMIN'))
+);
+
+COMMENT ON TABLE shop_product IS '商城商品（A0：一行一个可售 SKU，单仓单规格）';
+COMMENT ON COLUMN shop_product.price_cents IS '售价（分）；金额一律用整数，不用浮点';
+COMMENT ON COLUMN shop_product.status IS 'ACTIVE / INACTIVE（下架商品不可下单）';
+COMMENT ON TABLE shop_order IS '销售订单（A0：演示付款，无真实资金交易）';
+COMMENT ON COLUMN shop_order.order_no IS '对外订单号（页面与接口用它定位订单，不暴露自增 id）';
+COMMENT ON COLUMN shop_order.status IS 'PENDING_SHIPMENT → SHIPPED → SIGNED，由 CHECK 约束限定';
+COMMENT ON COLUMN shop_order.payment_mode IS '本轮固定 DEMO：演示付款，未发生真实支付';
+COMMENT ON COLUMN shop_order.shipped_by IS '执行发货的后台演示人员';
+COMMENT ON COLUMN shop_order.signed_by IS '执行签收标记的后台演示人员';
+COMMENT ON TABLE shop_order_item IS '订单明细（含成交快照；A0 每单一条）';
+COMMENT ON COLUMN shop_order_item.unit_price_cents IS '成交单价快照（分），不随商品调价变化';
+COMMENT ON TABLE shop_inventory_balance IS '库存余额（单仓，按 SKU 一行；available 永不为负）';
+COMMENT ON TABLE shop_inventory_movement IS '库存流水（只增不改；同订单行同类型唯一）';
+COMMENT ON COLUMN shop_inventory_movement.quantity_delta IS '变动数量：出库为负';
+COMMENT ON COLUMN shop_inventory_movement.order_item_id IS '来源订单行；同一订单行同类型只能一条';
+COMMENT ON TABLE shop_user IS '商城角色表：商城权限的唯一可信来源（与 music_user 独立）';
+COMMENT ON COLUMN shop_user.role IS '角色：BUYER / ADMIN';

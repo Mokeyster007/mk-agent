@@ -13,6 +13,8 @@ import com.example.mkagent.approval.PauseRejectedException;
 import com.example.mkagent.approval.PauseResult;
 import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.AgentRunContextHolder;
+import com.example.mkagent.conversation.BusinessRefCollector;
+import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.exception.ModelCallException;
 import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
@@ -1520,6 +1522,8 @@ public class ToolCallAgent extends ReActAgent {
             );
         });
 
+        recordBusinessRefs(ctx, toolResponseMessage);
+
         /*
          * 判断模型是否调用了终止工具。
          *
@@ -1708,6 +1712,8 @@ public class ToolCallAgent extends ReActAgent {
 
         ctx.addToolCallCount(toolResponseMessage.getResponses().size());
 
+        recordBusinessRefs(ctx, toolResponseMessage);
+
         log.info("暂停轮已执行完成：runId={}, tools={}, step={}",
                 ctx.getRunId(), toolResponseMessage.getResponses().size(),
                 ctx.getCurrentStep());
@@ -1737,6 +1743,35 @@ public class ToolCallAgent extends ReActAgent {
 
         log.info("拒绝回执已回填：runId={}, step={}, calls={}",
                 ctx.getRunId(), ctx.getCurrentStep(), responses.size());
+    }
+
+    /**
+     * 把本轮工具结果里的业务引用记到上下文，并立刻落一次库。
+     *
+     * <p>为什么执行完就落、而不是等终态一起写：
+     * 审批暂停会切断上下文（恢复时 ctx 从检查点重建），
+     * 暂停前搜索到的歌曲引用只留在内存里就丢了。而"先搜歌、再暂停建歌单"
+     * 恰好就是最需要"前两首"这个指代的那条链路。
+     *
+     * <p>没有会话（独立任务入口）或引用没变化时不做任何事，
+     * 避免每次工具调用都多一次 UPDATE。
+     */
+    private void recordBusinessRefs(
+            AgentRunContext ctx,
+            ToolResponseMessage toolResponseMessage
+    ) {
+        if (conversationService == null || ctx.getConversationId() == null) {
+            return;
+        }
+
+        boolean changed = false;
+        for (ToolResponseMessage.ToolResponse item : toolResponseMessage.getResponses()) {
+            changed |= BusinessRefCollector.collect(ctx, item.name(), item.responseData());
+        }
+
+        if (changed) {
+            conversationService.saveRefs(ctx);
+        }
     }
 
     /**

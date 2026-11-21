@@ -6,6 +6,8 @@ import com.example.mkagent.agent.MkManus;
 import com.example.mkagent.agent.MusicAgent;
 import com.example.mkagent.app.chatApp;
 import com.example.mkagent.context.UserContextHolder;
+import com.example.mkagent.conversation.ConversationSeed;
+import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.music.MusicAccessGuard;
@@ -30,6 +32,7 @@ import reactor.core.publisher.Flux;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 
 @RestController
@@ -80,6 +83,12 @@ public class AiController {
      */
     @Resource
     private MusicAccessGuard musicAccessGuard;
+
+    /**
+     * 会话读写（同一窗口连续聊天）。
+     */
+    @Resource
+    private ConversationService conversationService;
 
     /**
      * 运行中任务注册表：按 runId 查询任务，支撑主动取消接口。
@@ -246,16 +255,41 @@ public class AiController {
      * 与 /ai/manus/chat 使用同一套限流；
      * 该接口本身没有输入长度校验（全项目统一由模型侧截断），
      * 音乐入口保持一致，不额外加一条只作用于新接口的规则。
+     *
+     * <p>conversationId 可选：带上就是"同一会话里的下一轮"，
+     * 不带就是老的独立任务（行为与以前完全一致，历史记录不需要迁移）。
+     * 会话只影响"注入哪些历史文本 / 业务引用"和"终态写哪条会话"，
+     * **每轮仍然新建 runId**，绝不复活已终态的 run。
      */
     @GetMapping("/music/chat")
     public SseEmitter doChatWithMusic(
             String message,
+            @RequestParam(required = false) String conversationId,
             HttpServletRequest request
     ) {
-        musicAccessGuard.requireUser();
+        String userId = musicAccessGuard.requireUser();
         checkAgentRateLimit(request);
 
-        return musicUserAgent.runStream(message);
+        if (conversationId == null || conversationId.isBlank()) {
+            return musicUserAgent.runStream(message);
+        }
+
+        /*
+         * 先落会话（校验归属、拦并发、组装上下文、写用户消息），再启动 Agent。
+         * runId 由这里生成并交给 Agent，这样"用户消息"与"run"从一开始就是同一个 id，
+         * 不需要事后回填。
+         */
+        UUID runId = UUID.randomUUID();
+        ConversationSeed seed = conversationService.beginTurn(
+                userId, conversationId, message, runId);
+
+        try {
+            return musicUserAgent.runStream(message, seed);
+        } catch (RuntimeException e) {
+            // 启动失败就把刚落的用户消息撤掉，避免会话里留一条永远没有回答的提问
+            conversationService.dropUserMessage(runId.toString());
+            throw e;
+        }
     }
 
     /**

@@ -29,6 +29,8 @@ import type {
   AgentRunVO,
   ApprovalRequiredPayload,
   ApprovalView,
+  ConversationDetailVO,
+  ConversationMessageVO,
   MusicEntry,
 } from '@/api/types'
 import type { ErrorKind } from '@/api/errors'
@@ -52,6 +54,12 @@ export interface SessionTask {
   token: number
   prompt: string
   entry: MusicEntry
+  /**
+   * 所属会话；null 表示独立任务（老的入口 / 历史任务重开）。
+   *
+   * 注意它不是 runId：会话跨多轮不变，runId 每轮新建。
+   */
+  conversationId: string | null
   createdAt: number
   transport: Transport
   runId: string | null
@@ -87,7 +95,11 @@ function decideKey(task: SessionTask, approvalId: string): string {
   return `${task.id}::${approvalId}`
 }
 
-function newTask(prompt: string, entry: MusicEntry): SessionTask {
+function newTask(
+  prompt: string,
+  entry: MusicEntry,
+  conversationId: string | null = null,
+): SessionTask {
   idSeq += 1
   /*
    * 必须用 reactive 包裹。
@@ -102,6 +114,7 @@ function newTask(prompt: string, entry: MusicEntry): SessionTask {
     token: ++tokenSeq,
     prompt,
     entry,
+    conversationId,
     createdAt: Date.now(),
     transport: 'idle',
     runId: null,
@@ -330,17 +343,23 @@ export const taskStore = {
   /**
    * 提交任务。返回 false 表示被重复提交守卫拦下。
    *
-   * 注意：这里不接受"历史消息"，每次提交都是独立任务，
-   * 不把上一轮对话拼进 prompt 假装有记忆。
+   * conversationId 为空时是老的独立任务（行为完全不变）；
+   * 有值时这一轮会挂到该会话上：后端新建 runId，
+   * 并把最近几轮文本与"会话已知对象"注入给模型。
+   * 前端**不**自己拼历史——只拼前端而不给模型历史，等于假记忆。
    */
-  async submit(prompt: string, entry: MusicEntry): Promise<boolean> {
+  async submit(
+    prompt: string,
+    entry: MusicEntry,
+    conversationId: string | null = null,
+  ): Promise<boolean> {
     const text = prompt.trim()
     if (!text || submitting.value || isBusy.value) {
       return false
     }
 
     submitting.value = true
-    const task = newTask(text, entry)
+    const task = newTask(text, entry, conversationId)
     tasks.value = [task, ...tasks.value]
     activeId.value = task.id
     task.transport = 'submitting'
@@ -352,6 +371,7 @@ export const taskStore = {
       await runMusicChat({
         message: text,
         entry,
+        conversationId,
         signal: controller.signal,
         onEvent: (event) => {
           /*
@@ -598,6 +618,98 @@ export const taskStore = {
   /** 任务级原因码解释（PROCESS_RESTART 等） */
   runErrorHint(task: SessionTask): string {
     return describeRunErrorCode(task.detail?.errorCode ?? null)
+  },
+
+  /**
+   * 把一个会话的历史消息还原成可渲染的轮次。
+   *
+   * <p>为什么复用 SessionTask：一轮 = 一个 run = 一张审批卡 + 一条回答，
+   * 与现有的任务视图完全同构。另造一套"消息"模型会让审批卡、
+   * 断流核对、状态徽标都要重写一遍。
+   *
+   * <p>两条纪律：
+   * 1. 只按 runId 认领已有任务，绝不重复插入（live 任务可能已经在列表里）；
+   * 2. 待审批的轮次要**重建审批卡**——只显示"等待审批"却不给按钮，
+   *    用户只能新建会话重来。approvalId 来自服务端 join，不是前端猜的。
+   */
+  async hydrateConversation(detail: ConversationDetailVO): Promise<void> {
+    const byRun = new Map<
+      string,
+      { user?: ConversationMessageVO; assistant?: ConversationMessageVO }
+    >()
+
+    for (const message of detail.messages) {
+      const pair = byRun.get(message.runId) ?? {}
+      if (message.role === 'USER') {
+        pair.user = message
+      } else if (message.role === 'ASSISTANT') {
+        pair.assistant = message
+      }
+      byRun.set(message.runId, pair)
+    }
+
+    const pending: Array<{ task: SessionTask; approvalId: string }> = []
+
+    for (const [runId, pair] of byRun) {
+      const existing = tasks.value.find((task) => task.runId === runId)
+      const task =
+        existing ?? newTask(pair.user?.content ?? '', 'MUSIC_USER', detail.conversationId)
+
+      if (!existing) {
+        task.runId = runId
+        task.transport = 'closed'
+        const at = pair.user?.createdAt ? Date.parse(pair.user.createdAt) : NaN
+        if (!Number.isNaN(at)) {
+          task.createdAt = at
+        }
+        tasks.value = [task, ...tasks.value]
+      }
+
+      task.conversationId = detail.conversationId
+      if (pair.user?.content) {
+        task.prompt = pair.user.content
+      }
+      if (pair.assistant) {
+        task.answer = pair.assistant.content ?? ''
+        task.serverState = pair.assistant.state ?? task.serverState
+      }
+
+      /*
+       * 待审批：服务端 join 出来的 approvalId 是唯一可信来源。
+       * 拿到就立刻查一次审批视图，用真实 summary 重建卡片。
+       */
+      if (pair.user?.approvalId && !task.approvalPayload) {
+        task.serverState = 'WAITING_APPROVAL'
+        pending.push({ task, approvalId: pair.user.approvalId })
+      }
+    }
+
+    await Promise.all(
+      pending.map(async ({ task, approvalId }) => {
+        try {
+          const view = await getApproval(approvalId)
+          task.approval = view
+          if (!view.summary) {
+            return
+          }
+          task.approvalPayload = {
+            approvalId: view.approvalId,
+            expiresAt: view.expiresAt ?? '',
+            summary: {
+              tool: view.summary.tool ?? '',
+              toolLabel: view.summary.toolLabel ?? '',
+              playlistName: view.summary.playlistName ?? null,
+              songCount: view.summary.songCount ?? null,
+              songs: view.summary.songs ?? [],
+              roundToolCount: view.summary.roundToolCount ?? 0,
+              text: view.summary.text ?? '',
+            },
+          }
+        } catch {
+          // 审批可能刚好被处理掉：查不到就不显示卡片，不编一张出来
+        }
+      }),
+    )
   },
 }
 

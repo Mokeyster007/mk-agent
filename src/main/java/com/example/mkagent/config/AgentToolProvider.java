@@ -6,6 +6,7 @@ import com.example.mkagent.tools.AdminAnalyticsTool;
 import com.example.mkagent.tools.FileOperationTool;
 import com.example.mkagent.tools.MusicPlaylistQueryTool;
 import com.example.mkagent.tools.MusicQueryTool;
+import com.example.mkagent.tools.PlaybackTool;
 import com.example.mkagent.tools.PDFGenerationTool;
 import com.example.mkagent.tools.ResourceDownloadTool;
 import com.example.mkagent.tools.TerminateTool;
@@ -29,7 +30,7 @@ import java.util.Map;
  * FILE       ：read_file、write_file、download_resource、generate_pdf
  * EVAL       ：评测专用，复用 MANUS 的只读工具集
  * MUSIC_USER ：search_songs、get_song_detail、get_user_playlists、
- *              get_playlist_songs、terminate_task
+ *              get_playlist_songs、check_playback、get_now_playing、terminate_task
  * MUSIC_ADMIN：search_songs、get_song_detail、get_play_stats、
  *              get_top_songs、terminate_task（**没有**歌单类工具）
  *
@@ -70,6 +71,7 @@ public class AgentToolProvider {
             PDFGenerationTool pdfGenerationTool,
             MusicQueryTool musicQueryTool,
             MusicPlaylistQueryTool musicPlaylistQueryTool,
+            PlaybackTool playbackTool,
             AdminAnalyticsTool adminAnalyticsTool,
             ToolRetryWrapper toolRetryWrapper
     ) {
@@ -106,6 +108,12 @@ public class AgentToolProvider {
                 AgentType.MUSIC_USER, List.of(
                         musicQueryTool,
                         musicPlaylistQueryTool,
+                        /*
+                         * 播放只读工具（能否播放 / 当前播放曲目）。
+                         * 它们不签发地址、不触发播放，只回答事实，
+                         * 因此与曲库工具同级，不需要审批。
+                         */
+                        playbackTool,
                         terminateTool
                 ),
                 /*

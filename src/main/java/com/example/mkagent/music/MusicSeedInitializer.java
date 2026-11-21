@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Profile;
+import org.springframework.core.annotation.Order;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
 import org.springframework.jdbc.support.KeyHolder;
@@ -23,8 +24,11 @@ import java.util.Map;
  * 音乐业务种子数据初始化器。
  *
  * 设计要点：
- * 1. **幂等**：以 music_song 的行数作为"是否已初始化"的判据，
- *    已有数据直接跳过。应用每次启动都会跑，不能重复插入；
+ * 1. **幂等**：以"种子首曲 id=1001 是否存在"作为"是否已初始化"的判据，
+ *    已有数据直接跳过。应用每次启动都会跑，不能重复插入。
+ *    不用"music_song 总行数 > 0"：曲库里可能还有别的初始化器写入的曲目
+ *    （例如播放夹具的测试音），那样会让本初始化器误判为"已完成"，
+ *    从而永远不写用户与歌单；
  * 2. **单事务**：所有表要么全部写入，要么全部回滚。
  *    否则中途失败会留下"有歌没歌单"的半成品，而幂等判据看的是歌曲数，
  *    下次启动会误判为"已初始化"从而永远缺数据；
@@ -39,6 +43,7 @@ import java.util.Map;
  */
 @Component
 @Profile("!prod")
+@Order(0)
 public class MusicSeedInitializer implements ApplicationRunner {
 
     private static final Logger log =
@@ -228,10 +233,10 @@ public class MusicSeedInitializer implements ApplicationRunner {
     @Transactional
     public int seed() {
         Integer existing = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM music_song", Integer.class);
+                "SELECT COUNT(*) FROM music_song WHERE id = ?", Integer.class, SONG_ID_BASE);
 
         if (existing != null && existing > 0) {
-            log.info("音乐种子数据已存在（music_song={} 行），跳过初始化", existing);
+            log.info("音乐种子数据已存在（music_song 含 id={}），跳过初始化", SONG_ID_BASE);
             return 0;
         }
 

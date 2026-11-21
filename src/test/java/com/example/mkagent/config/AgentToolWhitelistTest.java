@@ -6,6 +6,7 @@ import com.example.mkagent.tools.AdminAnalyticsTool;
 import com.example.mkagent.tools.FileOperationTool;
 import com.example.mkagent.tools.MusicPlaylistQueryTool;
 import com.example.mkagent.tools.MusicQueryTool;
+import com.example.mkagent.tools.PlaybackTool;
 import com.example.mkagent.tools.PDFGenerationTool;
 import com.example.mkagent.tools.ResourceDownloadTool;
 import com.example.mkagent.tools.TerminateTool;
@@ -40,6 +41,8 @@ class AgentToolWhitelistTest {
             // 音乐工具只用到方法签名，构造时依赖传 null 即可。
             new MusicQueryTool(null),
             new MusicPlaylistQueryTool(null),
+            // 播放工具同样只用到方法签名
+            new PlaybackTool(null),
             new AdminAnalyticsTool(null, null),
             // 重试包装器使用与生产一致的默认配置；
             // 包装不改变工具名，白名单断言不受影响。
@@ -120,6 +123,7 @@ class AgentToolWhitelistTest {
         assertEquals(
                 Set.of("search_songs", "get_song_detail",
                         "get_user_playlists", "get_playlist_songs",
+                        "check_playback", "get_now_playing",
                         "terminate_task"),
                 names
         );

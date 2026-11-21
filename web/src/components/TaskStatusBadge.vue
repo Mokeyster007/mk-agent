@@ -83,25 +83,25 @@ withDefaults(
 
 .badge--wait {
   color: var(--c-warn);
-  border-color: rgba(226, 180, 94, 0.3);
+  border-color: rgba(224, 177, 95, 0.3);
   background: var(--c-warn-weak);
 }
 
 .badge--ok {
   color: var(--c-ok);
-  border-color: rgba(78, 194, 160, 0.28);
+  border-color: rgba(116, 207, 169, 0.28);
   background: var(--c-ok-weak);
 }
 
 .badge--warn {
   color: var(--c-warn);
-  border-color: rgba(226, 180, 94, 0.26);
+  border-color: rgba(224, 177, 95, 0.26);
   background: var(--c-warn-weak);
 }
 
 .badge--danger {
   color: var(--c-danger);
-  border-color: rgba(226, 121, 111, 0.3);
+  border-color: rgba(226, 131, 122, 0.3);
   background: var(--c-danger-weak);
 }
 

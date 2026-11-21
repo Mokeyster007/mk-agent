@@ -1,35 +1,32 @@
 <script setup lang="ts">
 /**
- * 应用骨架：三栏布局 + 移动端抽屉。
+ * 应用骨架：侧栏 + 主工作区 + 常驻播放器。
  *
- * 断点策略：
- * - ≥1180px：左导航 + 中间工作区 + 右侧详情（可收起）
- * - 900–1179px：右侧详情改为覆盖式抽屉，中间区域保持完整
- * - <900px：左导航也改为抽屉，中间单列
+ * 布局契约（输入框不跳动的根因就在这里）：
+ * 1. 外壳只有**两列**，永远不会因为"有没有任务详情"而改变列宽——
+ *    详情是覆盖式抽屉，不占列、不挤压主区；
+ * 2. 主区只有三行：顶栏（固定高度）+ 内容（minmax(0,1fr)）+ 播放器（auto）；
+ * 3. 内容区本身**不滚动**，纵向滚动全部交给工作区里的消息区；
+ * 4. 播放器没有曲目时渲染为空，第三行高度为 0，不占位置。
  *
- * 布局只负责"放哪里"，不负责取数，也不判断任何业务状态。
+ * 断点只有一个：<900px 侧栏变抽屉。桌面端宽度变化不影响主区结构。
  */
 import AppIcon from './AppIcon.vue'
+import PlaybackBar from './PlaybackBar.vue'
 
 defineProps<{
   panelOpen: boolean
   navOpen: boolean
-  /** 右侧是否有内容可展示；没有内容时不显示开关，也不占列宽 */
-  hasPanel: boolean
 }>()
 
 defineEmits<{
-  (e: 'toggle-panel'): void
   (e: 'toggle-nav'): void
   (e: 'close-overlays'): void
 }>()
 </script>
 
 <template>
-  <div
-    class="shell"
-    :class="{ 'shell--panel': panelOpen && hasPanel, 'shell--nav': navOpen }"
-  >
+  <div class="shell" :class="{ 'shell--nav': navOpen }">
     <div class="shell__nav" :class="{ 'shell__nav--open': navOpen }">
       <slot name="nav" />
     </div>
@@ -48,25 +45,19 @@ defineEmits<{
         <div class="shell__topbar-slot">
           <slot name="topbar" />
         </div>
-
-        <button
-          v-if="hasPanel"
-          type="button"
-          class="shell__icon-btn"
-          :aria-label="panelOpen ? '收起任务详情' : '展开任务详情'"
-          :aria-expanded="panelOpen"
-          @click="$emit('toggle-panel')"
-        >
-          <AppIcon name="sliders" :size="17" />
-        </button>
       </header>
 
       <div class="shell__content">
         <slot />
       </div>
+
+      <!-- 常驻播放器：独立一行，不在消息滚动区里，也不浮在内容上方 -->
+      <div class="shell__player">
+        <PlaybackBar />
+      </div>
     </main>
 
-    <div v-if="hasPanel" class="shell__panel" :class="{ 'shell__panel--open': panelOpen }">
+    <div v-if="panelOpen" class="shell__panel" role="dialog" aria-modal="true" aria-label="任务详情">
       <slot name="panel" />
     </div>
 
@@ -89,31 +80,28 @@ defineEmits<{
   background: var(--c-bg);
 }
 
-.shell--panel {
-  grid-template-columns: var(--nav-w) minmax(0, 1fr) var(--panel-w);
+.shell__nav {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  background: var(--c-bg-nav);
 }
 
-.shell__nav {
+.shell__main {
+  display: grid;
+  grid-template-rows: var(--header-h) minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   height: 100%;
 }
 
-.shell__main {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  min-height: 0;
-}
-
 .shell__topbar {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  height: var(--header-h);
+  gap: var(--s-2);
+  min-width: 0;
   padding: 0 var(--s-4);
   border-bottom: 1px solid var(--c-line);
-  flex: none;
   background: var(--c-bg);
 }
 
@@ -146,64 +134,54 @@ defineEmits<{
   display: none;
 }
 
+/* 内容区不滚动：滚动由工作区内部的消息区承担 */
 .shell__content {
-  flex: 1;
   min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
-
-.shell__panel {
   min-width: 0;
-  min-height: 0;
-  height: 100%;
   overflow: hidden;
 }
 
-.shell__scrim {
-  display: none;
+/* 播放器行：没有曲目时子组件渲染为空，这一行高度为 0 */
+.shell__player {
+  min-width: 0;
 }
 
-/* ---- 中屏：详情变抽屉 ---- */
-@media (max-width: 1179px) {
-  .shell,
-  .shell--panel {
-    grid-template-columns: var(--nav-w) minmax(0, 1fr);
-  }
+/* ---- 详情：覆盖式抽屉，不占列、不挤压主区 ---- */
+.shell__panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(var(--panel-w), 92vw);
+  z-index: var(--z-drawer);
+  background: var(--c-bg-soft);
+  border-left: 1px solid var(--c-line);
+  box-shadow: var(--shadow-lg);
+  animation: panel-in var(--dur) var(--ease) both;
+  overflow: hidden;
+}
 
-  .shell__panel {
-    position: fixed;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: min(400px, 90vw);
-    z-index: var(--z-drawer);
-    background: var(--c-bg-soft);
-    box-shadow: var(--shadow-lg);
-    transform: translateX(100%);
-    transition: transform var(--dur) var(--ease);
-    pointer-events: none;
+@keyframes panel-in {
+  from {
+    transform: translateX(12px);
+    opacity: 0;
   }
-
-  .shell__panel--open {
+  to {
     transform: none;
-    pointer-events: auto;
-  }
-
-  .shell__scrim {
-    display: block;
-    position: fixed;
-    inset: 0;
-    z-index: calc(var(--z-drawer) - 1);
-    background: rgba(6, 8, 11, 0.6);
-    backdrop-filter: blur(2px);
+    opacity: 1;
   }
 }
 
-/* ---- 窄屏：导航也变抽屉 ---- */
+.shell__scrim {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-drawer) - 1);
+  background: rgba(6, 8, 10, 0.58);
+}
+
+/* ---- 窄屏：侧栏变抽屉 ---- */
 @media (max-width: 899px) {
-  .shell,
-  .shell--panel {
+  .shell {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -214,7 +192,6 @@ defineEmits<{
     bottom: 0;
     width: min(292px, 86vw);
     z-index: var(--z-drawer);
-    background: var(--c-bg);
     transform: translateX(-100%);
     transition: transform var(--dur) var(--ease);
     box-shadow: var(--shadow-lg);
@@ -232,6 +209,12 @@ defineEmits<{
 
   .shell__topbar {
     padding: 0 var(--s-3);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shell__nav {
+    transition: none;
   }
 }
 </style>
