@@ -54,5 +54,20 @@ public enum AgentType {
      * 且管理员身份必须由服务端查 music_user 表确认，
      * 绝不接受请求参数或提示词里的自我声明。
      */
-    MUSIC_ADMIN
+    MUSIC_ADMIN,
+
+    /**
+     * 电商售后（A1）：查本人订单、校验可退资格、查已有申请、
+     * 预览并在人工确认后提交退货申请。
+     *
+     * <p>白名单里只有售后工具（见 AgentToolProvider）：
+     * 曲库、歌单、文件、网页搜索一概没有——售后 Agent 不需要，
+     * 给了只会扩大误用面。
+     *
+     * <p>唯一的写工具是 {@code submit_return}，它带
+     * {@code @RequiresApproval}，确认前不建单、不占额度。
+     * 买家身份由入口处的 {@code ShopAccessGuard.requireBuyerIdentity()}
+     * 解析并冻结进 AgentRunContext，工具侧没有 buyerId 参数。
+     */
+    AFTER_SALES
 }

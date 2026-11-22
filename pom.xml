@@ -360,6 +360,48 @@
 
         <profile>
             <!--
+                真实 PostgreSQL 回归（A0-PG）：
+                  mvnw -Ppg test -Dtest=ShopPostgres*
+
+                excludedGroups 调成只排除 live，让 @Tag("pg") 的用例能跑。
+
+                <h3>为什么要覆盖 PATH</h3>
+                本机（Windows + 中文用户名）的 PATH 里存在**无法被 JVM 当前
+                sun.jnu.encoding 编码**的目录（实测出现 C:\Users\????\...）。
+                任何按 PATH 逐条探测子进程的代码（Testcontainers 的
+                CommandLine.executableExists 就是典型）都会因此抛
+                InvalidPathException，把整个上下文初始化带崩。
+
+                收窄成"系统目录 + Docker CLI 目录"这一组纯 ASCII 路径即可绕开。
+                测试内部启动容器时优先用 Docker CLI 的绝对路径，
+                PATH 只是兜底，所以这里不需要 Python / Node 之类的目录。
+                该覆盖只作用于本 profile 显式启用的那次测试运行，
+                不改系统环境，也不影响默认构建。
+
+                Unix 下不需要：Testcontainers/CLI 都走 /var/run/docker.sock，
+                用 -Dmkagent.test.excluded-groups=live -Dgroups=pg 即可。
+            -->
+            <id>pg</id>
+            <properties>
+                <mkagent.test.excluded-groups>live</mkagent.test.excluded-groups>
+            </properties>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <environmentVariables>
+                                <PATH>${env.SystemRoot}\system32;${env.SystemRoot};${env.ProgramFiles}\Docker\Docker\resources\bin</PATH>
+                            </environmentVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <profile>
+            <!--
                 本地演示 / 私有演示：不依赖 PostgreSQL 的完整闭环。
 
                   mvnw -Pdemo spring-boot:run -Dspring-boot.run.profiles=demo

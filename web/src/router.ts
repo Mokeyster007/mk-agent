@@ -37,6 +37,16 @@ const router = createRouter({
       component: () => import('@/views/ShopAdminView.vue'),
       meta: { title: '商城后台' },
     },
+    /*
+     * 售后（A1）：独立入口，不塞进订单详情里。
+     * 普通表单 + 售后 Agent 在同一个页面，两条链路写的是同一套 Java 服务。
+     */
+    {
+      path: '/shop/aftersale',
+      name: 'shop-aftersale',
+      component: () => import('@/views/AfterSaleView.vue'),
+      meta: { title: '售后' },
+    },
     {
       path: '/:pathMatch(.*)*',
       redirect: '/',

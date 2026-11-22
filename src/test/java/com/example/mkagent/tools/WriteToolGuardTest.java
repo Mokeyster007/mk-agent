@@ -61,6 +61,18 @@ class WriteToolGuardTest {
      */
     private static final String TOOLS_PACKAGE = "com.example.mkagent.tools";
 
+    /**
+     * 允许写工具进入白名单的登记表（唯一合法来源）。
+     *
+     * <p>当前只有售后：{@code submit_return} 必须对模型可见，
+     * 否则"预览 → 确认 → 建单"这条链路根本走不通。
+     * 音乐写工具**不在**这里——它们仍然对模型不可见。
+     */
+    private static final java.util.Map<AgentType, Set<String>> APPROVAL_WHITELISTED =
+            java.util.Map.of(
+                    AgentType.AFTER_SALES, Set.of("submit_return")
+            );
+
     @Autowired
     private AgentToolProvider toolProvider;
 
@@ -78,10 +90,11 @@ class WriteToolGuardTest {
         assertFalse(writeTools.isEmpty(), "扫描结果为空说明守卫失效");
         assertTrue(writeTools.contains("create_playlist"), writeTools.toString());
         assertTrue(writeTools.contains("add_songs_to_playlist"), writeTools.toString());
+        assertTrue(writeTools.contains("submit_return"), writeTools.toString());
     }
 
     /**
-     * 审批策略也必须看见这两个写工具。
+     * 审批策略必须看见所有写工具。
      *
      * 与上面的反射扫描是**两条独立链路**：
      * 反射扫描只证明"注解写对了"，策略扫描才决定运行时会不会暂停。
@@ -91,7 +104,7 @@ class WriteToolGuardTest {
      * 但少了一个已知写工具必须立刻失败。
      */
     @Test
-    @DisplayName("审批策略扫到了两个写工具（不能是空集合）")
+    @DisplayName("审批策略扫到了全部写工具（不能是空集合）")
     void approvalPolicySeesWriteTools() {
         assertTrue(approvalToolPolicy.isReady(), "容器刷新后必须已完成扫描");
 
@@ -102,11 +115,30 @@ class WriteToolGuardTest {
                 "策略必须识别 create_playlist，实际：" + approvalTools);
         assertTrue(approvalTools.contains("add_songs_to_playlist"),
                 "策略必须识别 add_songs_to_playlist，实际：" + approvalTools);
+        assertTrue(approvalTools.contains("submit_return"),
+                "策略必须识别 submit_return，实际：" + approvalTools);
     }
 
+    /**
+     * 写工具进入白名单的**唯一**合法方式：显式登记 + 运行时真的会暂停。
+     *
+     * <p>这条规则在 A1 之前是"写工具不得进入任何白名单"——
+     * 那时审批链路刚装配、还没有真实业务用它。
+     * 现在售后 Agent 的 {@code submit_return} 必须对模型可见
+     * （否则"确认后建单"根本无法发生），因此规则收紧为：
+     * <ol>
+     *   <li>只有登记在 {@link #APPROVAL_WHITELISTED} 里的类型/工具可以出现在白名单；</li>
+     *   <li>出现了就必须被 {@code ApprovalToolPolicy} 认成"需要人工确认"——
+     *       否则等于把审批承诺悄悄作废；</li>
+     *   <li>其余类型（含音乐）仍然一个写工具都不能有。</li>
+     * </ol>
+     *
+     * <p>这样"新增一个对模型可见的写工具"必须同时改这份登记表，
+     * 是一次看得见的决定，而不是某个配置顺手打开的结果。
+     */
     @Test
-    @DisplayName("写工具不在任何 AgentType 的白名单里")
-    void writeToolsAreInNoWhitelist() {
+    @DisplayName("写工具只能出现在显式登记的白名单里，且必须真的会暂停")
+    void writeToolsOnlyInDeclaredWhitelistAndAlwaysGated() {
         Set<String> writeTools = scanWriteToolNames();
 
         for (AgentType type : AgentType.values()) {
@@ -115,10 +147,49 @@ class WriteToolGuardTest {
                 continue;
             }
 
+            Set<String> permitted = APPROVAL_WHITELISTED.getOrDefault(type, Set.of());
+
             for (String writeTool : writeTools) {
+                if (!allowed.contains(writeTool)) {
+                    continue;
+                }
+
+                assertTrue(
+                        permitted.contains(writeTool),
+                        "写工具 " + writeTool + " 未登记就进入了 " + type + " 的白名单："
+                                + allowed
+                );
+                assertTrue(
+                        approvalToolPolicy.requiresApproval(writeTool),
+                        "白名单里的写工具 " + writeTool + " 必须被审批策略认成需要确认，"
+                                + "否则会被当普通工具直接执行"
+                );
+            }
+        }
+    }
+
+    /**
+     * 音乐写工具仍然对模型不可见（A1 没有改变这条）。
+     *
+     * <p>与上面那条分开写，是因为它们的理由不同：
+     * 音乐写工具"能力不存在"，售后写工具"存在但必须先确认"。
+     * 混在一个断言里，将来放宽一处会顺手放宽另一处。
+     */
+    @Test
+    @DisplayName("音乐写工具不在任何 AgentType 的白名单里")
+    void musicWriteToolsAreInNoWhitelist() {
+        Set<String> musicWriteTools = Set.of("create_playlist", "add_songs_to_playlist");
+
+        for (AgentType type : AgentType.values()) {
+            Set<String> allowed = toolNames(type);
+            if (allowed.isEmpty()) {
+                continue;
+            }
+
+            for (String writeTool : musicWriteTools) {
                 assertFalse(
                         allowed.contains(writeTool),
-                        "写工具 " + writeTool + " 不得进入 " + type + " 的白名单：" + allowed
+                        "音乐写工具 " + writeTool + " 不得进入 " + type + " 的白名单：" + allowed
                 );
             }
         }

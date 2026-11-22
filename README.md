@@ -73,10 +73,41 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - **价格与归属由服务端决定**：下单请求体只有 `productId` + `quantity`，
   没有价格、没有 buyerId 字段可绑
 - **不依赖大模型**：模型不可用或没配凭据时，商城闭环照常运行
-- 详见 [`docs/shop-a0.md`](docs/shop-a0.md)
+- **两种数据库都验过**：H2（全量 841 项）+ 真实 PostgreSQL 16.15（专项 13 项，
+  `./mvnw -Ppg test "-Dtest=ShopPostgres*"`）
+- 详见 [`docs/shop-a0.md`](docs/shop-a0.md) 与 [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)
 
 > 演示付款：`payment_mode = 'DEMO'`，没有真实资金交易、没有退款、没有物流。
-> A1（售后 Agent）与 B（客服审批 / 仓库验收）只有边界设计，**未实施**。
+> 售后（A1）已实施，见 1.3；B（客服审批 / 仓库验收 / 退货入库 / 退款）仍未实施。
+
+### 1.3 售后（A1：退货申请 + 售后 Agent）
+
+买家可以对**已签收**的订单申请退货（支持部分数量），普通表单与售后 Agent
+写的是同一套 Java 服务。本轮只做到 **「已提交、可查」**。
+
+- **入口**：`/shop/aftersale`（对话 + 可退订单 + 表单 + 我的售后）；
+  对话走 `GET /api/ai/aftersale/chat`
+- **状态只有一种**：`SUBMITTED`（已提交）。数据库 `CHECK` 钉住，
+  写不出「已批准 / 已退款」
+- **额度三算**：已购 / 已占用 / 剩余可退，全部服务端算；A1 里只有"已提交"的申请占额度，
+  客服驳回与释放额度留到 B 阶段
+- **不超卖**：订单行 `SELECT … FOR UPDATE` + 原子条件更新
+  `WHERE reserved_qty + ? <= quantity_total` + `CHECK (reserved_qty <= quantity_total)` 兜底；
+  额度占用与建单在**同一个事务**里，占用后建单失败整体回滚
+- **两套幂等**：表单用 `clientRequestId`（重试沿用、改参数换新），
+  Agent 用框架的 `runId + step + toolCallId`；同键同参数返回原单，同键不同参数 409
+- **确认卡固定五项**：订单号 / 商品 / 数量 / 预计退款 / 原因。
+  确认前不建单、不占额度；拒绝或取消**零写入**；预览**不是**资格凭证，
+  执行时会重新校验归属与额度
+- **不碰库存**：A1 不改可售库存、不写退货入库流水
+- **不依赖大模型**：模型不可用时普通表单照常提交与查询
+- **两种数据库都验过**：H2（A1 专项 42 项）+ 真实 PostgreSQL 16（专项 5 项，
+  `./mvnw -Ppg test "-Dtest=AfterSalePostgres*"`）
+- 详见 [`docs/shop-a1.md`](docs/shop-a1.md)
+
+> ⚠️ 本轮**不是**真实认证上线：`X-User-Id` 仍是 demo 边界内的占位方案。
+> 共享部署请保持 `mkagent.shop.demo-identity-enabled=false`（默认），
+> 此时售后所有入口一律 403（有测试钉住）。
 
 ### 2. 弹性与成本控制（resilience）
 
@@ -613,6 +644,36 @@ cd web && node tools/e2e-shop.mjs
 > 共享部署请保持 `mkagent.shop.demo-identity-enabled=false`（默认）：
 > 此时下单/发货/签收一律 403，商品浏览仍可用。
 
+### 2.6 售后 A1 闭环（表单 + 售后 Agent）
+
+```bash
+# 后端 / 前端同 2.5；另外需要真实模型凭据（对话要真的调模型）
+export MKAGENT_MODEL_API_KEY=sk-...
+
+# 真实浏览器验收：买两把 → 发货 → 签收 → 对话退一把 → 确认卡 → 我的售后
+cd web && node tools/e2e-aftersale.mjs
+
+# 第二段：拒绝零写入 + 普通表单提交（模型不可用也能走这条路）
+cd web && node tools/e2e-aftersale-form.mjs
+```
+
+浏览器里走一遍（约 3 分钟）：
+
+1. `/shop` 用 `music-user-1` 买 2 把键盘 → 切 `music-admin-1` 发货并标记签收；
+2. 切回买家 → 侧栏「售后与退货」→「可退订单」显示 `已占用 0 / 剩余可退 2`；
+3. 对话里说「帮我退一把订单 SO… 的键盘，退 1 件，原因是键盘按键失灵」；
+4. 出现**确认卡**（订单号 / 商品 / 数量 / 原因）——此时「我的售后」仍为空；
+5. 点「批准并执行」→ 卡片变「已批准」→「我的售后」出现真实退货单号 `RT…`，
+   状态「已提交」，来源「售后 Agent」；
+6. 刷新页面 → 记录仍在；「可退订单」变成 `已占用 1 / 剩余可退 1`；
+7. 回后台核对：库存与出库流水**都没变**（A1 不碰库存）。
+
+也可以完全不用模型：同一个页面下半部分是**普通退货表单**，
+选单 → 数量 → 原因 → 提交，效果与 Agent 路径一致（同一个 Java 服务）。
+
+> 额度规则：只有「已提交」的申请占额度；客服驳回、释放额度、仓库验收、
+> 退货入库与退款都在 B 阶段，本轮没有。
+
 ### 3. 接口文档
 
 启动后访问：`http://localhost:8123/api/doc.html`（Knife4j）
@@ -658,6 +719,12 @@ cd web && node tools/e2e-shop.mjs
 | `POST /api/shop/admin/orders/{orderNo}/ship` | 发货：单事务内扣库存 + 写出库流水 + 改状态；重复发货 200 `applied=false`；库存不足 409 |
 | `POST /api/shop/admin/orders/{orderNo}/sign` | 标记签收（仅已发货；不改库存） |
 | `GET /api/shop/admin/inventory` | 库存余额 + 最近 50 条流水（需 ADMIN） |
+| `GET /api/shop/aftersale/orders` | 已签收订单 + 每单额度三算（已购 / 已占用 / 剩余可退）+ 退货截止时间 |
+| `POST /api/shop/aftersale/preview` | 试算退款与资格（**不写库、不占额度**，也不是资格凭证） |
+| `POST /api/shop/aftersale/returns` | 提交退货申请，201 + 真实退货单号；同 `clientRequestId` 重放返回原单，同键不同参数 409 |
+| `GET /api/shop/aftersale/returns` | 我的售后列表（新的在前，不含事件流） |
+| `GET /api/shop/aftersale/returns/{returnNo}` | 售后详情（含处理记录）；别人的单 → **404** |
+| `GET /api/ai/aftersale/chat?message=...` | 售后 Agent（`AFTER_SALES`，SSE），需商城买家身份；可选 `conversationId` 表示同一会话的下一轮 |
 
 Agent 任务 SSE 事件流示例：
 
@@ -701,6 +768,18 @@ event:done       [DONE]
 # 商城 A0：主流程 / 并发争抢 / 权限 / 禁用身份 / 模型不可用（30 个用例）
 ./mvnw test "-Dtest=Shop*Test"
 
+# 商城 A0 的真实 PostgreSQL 回归（一次性 PG16 容器，13 个用例；默认构建排除）
+./mvnw -Ppg test "-Dtest=ShopPostgres*"
+
+# 售后 A1：表单闭环 / 边界 / 幂等 / 并发 / 回滚（H2）
+./mvnw test "-Dtest=AfterSaleFlowIntegrationTest,AfterSaleConcurrencyTest,AfterSaleRollbackTest"
+
+# 售后 A1：工具归属 + 真实审批（暂停/批准/拒绝/卡过期重校验）+ 模型不可用
+./mvnw test "-Dtest=AfterSaleAgentToolTest,AfterSaleApprovalFlowTest,AfterSaleModelIndependenceTest"
+
+# 售后 A1 的真实 PostgreSQL 回归（额度争抢 / 同键并发 / 占用后回滚，5 个用例）
+./mvnw -Ppg test "-Dtest=AfterSalePostgres*"
+
 # live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
 ./mvnw -Plive test "-Dtest=MkManusTest"
 ```
@@ -723,6 +802,8 @@ event:done       [DONE]
 - [`docs/music-permissions.md`](docs/music-permissions.md)：音乐权限矩阵——工具 × AgentType × 数据范围 × 三道防线
 - [`docs/music-idempotency-research.md`](docs/music-idempotency-research.md)：写工具幂等键调研（Spring AI 1.0.0 不传 toolCallId，改用服务端派生键）
 - [`docs/shop-a0.md`](docs/shop-a0.md)：商城 A0——模块关系、六张表、状态机、接口与权限矩阵、并发与幂等设计、实跑测试结果、限制，以及 A1 售后 Agent 的最小接入设计（只设计）
+- [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)：A0 的真实 PostgreSQL 16 回归——一次性容器接线、A/B/C/D/E 五场景实测证据（含受控锁等待与事务回滚注入）、Testcontainers 与 Docker 29 不兼容的根因与替代方案
+- [`docs/shop-a1.md`](docs/shop-a1.md)：售后 A1——模块与四张表、额度算法、五个接口与权限、确认→建单的调用链与事务边界、两套幂等身份、实跑结果（H2 / 真实 PG / 浏览器 / 模型）、限制与 B 阶段边界
 
 ---
 

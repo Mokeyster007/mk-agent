@@ -2,6 +2,7 @@ package com.example.mkagent.controller;
 
 import com.example.mkagent.agent.AgentTaskCanceller;
 import com.example.mkagent.agent.AgentTaskRegistry;
+import com.example.mkagent.agent.AfterSaleAgent;
 import com.example.mkagent.agent.MkManus;
 import com.example.mkagent.agent.MusicAgent;
 import com.example.mkagent.app.chatApp;
@@ -11,6 +12,7 @@ import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.music.MusicAccessGuard;
+import com.example.mkagent.shop.ShopAccessGuard;
 import com.example.mkagent.resilience.AgentRequestRateLimiter;
 import com.example.mkagent.resilience.RateLimitResult;
 import jakarta.annotation.Resource;
@@ -83,6 +85,24 @@ public class AiController {
      */
     @Resource
     private MusicAccessGuard musicAccessGuard;
+
+    /**
+     * 电商售后 Agent（AgentType.AFTER_SALES）。
+     *
+     * 与音乐 Agent 共用同一套循环、SSE、会话与审批；
+     * 差别只有工具白名单（售后只读 + 唯一写工具 submit_return）与提示词。
+     */
+    @Resource(name = "afterSaleAgent")
+    private AfterSaleAgent afterSaleAgent;
+
+    /**
+     * 商城访问控制：售后入口复用它解析买家身份。
+     *
+     * <p>关闭 demo 身份且没有可信身份时，{@code requireBuyerIdentity()} 直接 403，
+     * 因此"新增的私有读写入口"不会因为只加了 {@code X-User-Id} 就被放行。
+     */
+    @Resource
+    private ShopAccessGuard shopAccessGuard;
 
     /**
      * 会话读写（同一窗口连续聊天）。
@@ -307,6 +327,47 @@ public class AiController {
         checkAgentRateLimit(request);
 
         return musicAdminAgent.runStream(message);
+    }
+
+    /**
+     * 电商售后入口。
+     *
+     * <p>与音乐入口同构：先做访问控制，再决定是否落会话、启动 Agent。
+     *
+     * <p>身份来自 {@link ShopAccessGuard#requireBuyerIdentity()}：
+     * 缺 {@code X-User-Id} 401、未启用演示身份 403
+     * {@code SHOP_IDENTITY_NOT_CONFIGURED}、不在 {@code shop_user} 里 403
+     * {@code SHOP_USER_NOT_PROVISIONED}。
+     * 身份在 {@code runStream} 的同步段被冻结进 {@code AgentRunContext}，
+     * 工具侧没有 buyerId 参数，模型无法改变它。
+     *
+     * <p>conversationId 可选：带上就是"同一会话里的下一轮"（追问哪一单、几件、为什么），
+     * 不带就是独立任务。每轮仍然新建 runId。
+     */
+    @GetMapping("/aftersale/chat")
+    public SseEmitter doChatWithAfterSale(
+            String message,
+            @RequestParam(required = false) String conversationId,
+            HttpServletRequest request
+    ) {
+        String userId = shopAccessGuard.requireBuyerIdentity();
+        checkAgentRateLimit(request);
+
+        if (conversationId == null || conversationId.isBlank()) {
+            return afterSaleAgent.runStream(message);
+        }
+
+        UUID runId = UUID.randomUUID();
+        ConversationSeed seed = conversationService.beginTurn(
+                userId, conversationId, message, runId);
+
+        try {
+            return afterSaleAgent.runStream(message, seed);
+        } catch (RuntimeException e) {
+            // 启动失败就撤掉刚落的用户消息，避免会话里留一条永远没有回答的提问
+            conversationService.dropUserMessage(runId.toString());
+            throw e;
+        }
     }
 
     /**

@@ -3,6 +3,7 @@ package com.example.mkagent.config;
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.ToolRetryWrapper;
 import com.example.mkagent.tools.AdminAnalyticsTool;
+import com.example.mkagent.tools.AfterSaleQueryTool;
 import com.example.mkagent.tools.FileOperationTool;
 import com.example.mkagent.tools.MusicPlaylistQueryTool;
 import com.example.mkagent.tools.MusicQueryTool;
@@ -14,6 +15,7 @@ import com.example.mkagent.tools.WebScrapingTool;
 import com.example.mkagent.tools.WebSearchTool;
 import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -33,6 +35,14 @@ import java.util.Map;
  *              get_playlist_songs、check_playback、get_now_playing、terminate_task
  * MUSIC_ADMIN：search_songs、get_song_detail、get_play_stats、
  *              get_top_songs、terminate_task（**没有**歌单类工具）
+ * AFTER_SALES：list_my_signed_orders、get_my_order_detail、check_return_eligibility、
+ *              list_my_return_requests、preview_return、submit_return、terminate_task
+ *
+ * 售后类型的写工具 {@code submit_return} 来自一个**已被幂等包装**的
+ * {@code ToolCallback[]} Bean（见 AfterSaleToolConfig），
+ * 因此这里不能像其它类型那样"只传工具 Bean"——它已经是回调了。
+ * 这也是唯一一个"白名单里同时有只读工具与写工具"的类型，
+ * 由 WriteToolGuardTest 显式记录（其余类型仍禁止出现审批工具）。
  *
  * 音乐类型的白名单粒度是 **Bean**，所以曲库工具与歌单工具被拆成
  * MusicQueryTool / MusicPlaylistQueryTool 两个类：
@@ -62,6 +72,14 @@ public class AgentToolProvider {
      */
     private final ToolRetryWrapper toolRetryWrapper;
 
+    /**
+     * 售后写工具（已由 {@code IdempotentToolCallback} 包装）。
+     *
+     * <p>单独持有而不是塞进 {@code toolBeansByType}：那个 Map 存的是**工具 Bean**，
+     * 这里已经是回调对象。混在一起会让"这个类型到底拿到了什么"更难回答。
+     */
+    private final ToolCallback[] afterSaleWriteCallbacks;
+
     public AgentToolProvider(
             WebSearchTool webSearchTool,
             WebScrapingTool webScrapingTool,
@@ -73,9 +91,14 @@ public class AgentToolProvider {
             MusicPlaylistQueryTool musicPlaylistQueryTool,
             PlaybackTool playbackTool,
             AdminAnalyticsTool adminAnalyticsTool,
+            AfterSaleQueryTool afterSaleQueryTool,
+            @Qualifier("afterSaleWriteToolCallbacks") ToolCallback[] afterSaleWriteCallbacks,
             ToolRetryWrapper toolRetryWrapper
     ) {
         this.toolRetryWrapper = toolRetryWrapper;
+        this.afterSaleWriteCallbacks = afterSaleWriteCallbacks == null
+                ? new ToolCallback[0]
+                : afterSaleWriteCallbacks;
         this.toolBeansByType = Map.of(
                 AgentType.CHAT, List.of(
                         webSearchTool
@@ -125,6 +148,15 @@ public class AgentToolProvider {
                         musicQueryTool,
                         adminAnalyticsTool,
                         terminateTool
+                ),
+                /*
+                 * 电商售后：订单与额度只读 + terminate_task。
+                 * 写工具 submit_return 不在这个列表里（它已经是回调），
+                 * 由 getTools 单独追加，且必须带审批。
+                 */
+                AgentType.AFTER_SALES, List.of(
+                        afterSaleQueryTool,
+                        terminateTool
                 )
         );
     }
@@ -148,6 +180,27 @@ public class AgentToolProvider {
             );
         }
 
-        return toolRetryWrapper.wrap(ToolCallbacks.from(tools.toArray()));
+        ToolCallback[] readCallbacks = ToolCallbacks.from(tools.toArray());
+
+        /*
+         * 售后是唯一需要"只读工具 + 已包装写工具"混装的类型。
+         * 写工具已经是 IdempotentToolCallback，重试包装器不会碰它
+         * （它不在 retryable-tools 里，wrapIfNeeded 原样返回）。
+         */
+        ToolCallback[] all = agentType == AgentType.AFTER_SALES
+                ? concat(readCallbacks, afterSaleWriteCallbacks)
+                : readCallbacks;
+
+        return toolRetryWrapper.wrap(all);
+    }
+
+    private static ToolCallback[] concat(ToolCallback[] read, ToolCallback[] write) {
+        if (write.length == 0) {
+            return read;
+        }
+        ToolCallback[] merged = new ToolCallback[read.length + write.length];
+        System.arraycopy(read, 0, merged, 0, read.length);
+        System.arraycopy(write, 0, merged, read.length, write.length);
+        return merged;
     }
 }

@@ -61,6 +61,51 @@ public class ShopProperties {
     /** 后台订单列表默认页大小（上限见 {@code ShopAdminController}）。 */
     private int adminPageSize = 20;
 
+    /**
+     * 售后（A1）退货窗口：签收后多少天内可以申请退货。
+     *
+     * <p>这是**演示规则**，不是真实平台政策。它存在的意义是让"超期不能退"
+     * 成为一条可测试、可解释的规则，而不是一句"看情况"。
+     */
+    private int returnWindowDays = 7;
+
+    /**
+     * 退货原因的最大长度（按 Unicode 码点计）。
+     *
+     * <p>与 {@code shop_aftersale_return.reason VARCHAR(200)} 对齐：
+     * 应用层先按码点校验，数据库再按字符数兜底。
+     */
+    private int maxReturnReasonLength = 200;
+
+    /**
+     * 买家售后列表最多返回多少条（A1 不分页）。
+     */
+    private int aftersaleListLimit = 50;
+
+    public int getReturnWindowDays() {
+        return returnWindowDays;
+    }
+
+    public void setReturnWindowDays(int returnWindowDays) {
+        this.returnWindowDays = returnWindowDays;
+    }
+
+    public int getMaxReturnReasonLength() {
+        return maxReturnReasonLength;
+    }
+
+    public void setMaxReturnReasonLength(int maxReturnReasonLength) {
+        this.maxReturnReasonLength = maxReturnReasonLength;
+    }
+
+    public int getAftersaleListLimit() {
+        return aftersaleListLimit;
+    }
+
+    public void setAftersaleListLimit(int aftersaleListLimit) {
+        this.aftersaleListLimit = aftersaleListLimit;
+    }
+
     public boolean isDemoIdentityEnabled() {
         return demoIdentityEnabled;
     }

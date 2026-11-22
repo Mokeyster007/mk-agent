@@ -3,6 +3,7 @@ package com.example.mkagent.config;
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.ToolRetryWrapper;
 import com.example.mkagent.tools.AdminAnalyticsTool;
+import com.example.mkagent.tools.AfterSaleQueryTool;
 import com.example.mkagent.tools.FileOperationTool;
 import com.example.mkagent.tools.MusicPlaylistQueryTool;
 import com.example.mkagent.tools.MusicQueryTool;
@@ -44,6 +45,14 @@ class AgentToolWhitelistTest {
             // 播放工具同样只用到方法签名
             new PlaybackTool(null),
             new AdminAnalyticsTool(null, null),
+            // 售后只读工具同样只用到方法签名；服务为 null 不影响工具名。
+            new AfterSaleQueryTool(null),
+            /*
+             * 售后写工具在真实装配里是"已幂等包装的回调数组"。
+             * 本测试只验证白名单，不验证包装，因此传空数组；
+             * "submit_return 必须带审批"由 WriteToolGuardTest 覆盖。
+             */
+            new ToolCallback[0],
             // 重试包装器使用与生产一致的默认配置；
             // 包装不改变工具名，白名单断言不受影响。
             new ToolRetryWrapper(
@@ -151,6 +160,24 @@ class AgentToolWhitelistTest {
         assertFalse(names.contains("get_playlist_songs"));
         assertFalse(names.contains("create_playlist"));
         assertFalse(names.contains("add_songs_to_playlist"));
+    }
+
+    @Test
+    void afterSaleAgentHasOnlyAfterSaleTools() {
+        Set<String> names = toolNames(provider.getTools(AgentType.AFTER_SALES));
+
+        assertEquals(
+                Set.of("list_my_signed_orders", "get_my_order_detail",
+                        "check_return_eligibility", "list_my_return_requests",
+                        "preview_return", "terminate_task"),
+                names
+        );
+
+        // 售后 Agent 拿不到音乐、文件、联网工具。
+        assertFalse(names.contains("search_songs"));
+        assertFalse(names.contains("create_playlist"));
+        assertFalse(names.contains("read_file"));
+        assertFalse(names.contains("web_search"));
     }
 
     private static Set<String> toolNames(ToolCallback[] callbacks) {

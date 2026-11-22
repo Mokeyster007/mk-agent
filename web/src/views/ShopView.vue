@@ -256,7 +256,8 @@ onMounted(async () => {
 
         <p class="foot-note">
           本页只做 A0：商品 → 下单 → 待发货 → 已发货 → 已签收。
-          没有购物车、优惠券、地址簿与真实支付；售后与退货在下一阶段。
+          没有购物车、优惠券、地址簿与真实支付；退货申请在
+          <RouterLink class="foot-note__link" to="/shop/aftersale">售后与退货</RouterLink>。
         </p>
       </div>
     </div>
@@ -609,6 +610,15 @@ onMounted(async () => {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
   line-height: var(--lh-base);
+}
+
+.foot-note__link {
+  color: var(--c-accent-ink);
+  text-decoration: none;
+}
+
+.foot-note__link:hover {
+  text-decoration: underline;
 }
 
 @media (max-width: 720px) {

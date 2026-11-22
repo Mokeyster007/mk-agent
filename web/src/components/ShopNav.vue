@@ -63,6 +63,10 @@ function onChange(event: Event): void {
         <AppIcon name="clock" :size="14" />
         我的订单
       </a>
+      <RouterLink class="shop-nav__link" to="/shop/aftersale">
+        <AppIcon name="refresh" :size="14" />
+        售后与退货
+      </RouterLink>
       <RouterLink class="shop-nav__link" to="/shop/admin">
         <AppIcon name="shield" :size="14" />
         商城后台

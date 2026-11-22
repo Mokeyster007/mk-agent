@@ -56,4 +56,16 @@ public class ToolRegistryConfig {
     public ToolCallback[] musicAdminToolCallbacks(AgentToolProvider toolProvider) {
         return toolProvider.getTools(AgentType.MUSIC_ADMIN);
     }
+
+    /**
+     * 电商售后：订单与额度只读 + 唯一写工具 {@code submit_return}。
+     *
+     * <p>写工具由 {@code AgentToolProvider} 在 AFTER_SALES 类型下追加，
+     * 且已经在 {@code AfterSaleToolConfig} 里被幂等包装过——
+     * 这里拿到的就是"可执行的那一份"，不再二次包装。
+     */
+    @Bean("afterSaleToolCallbacks")
+    public ToolCallback[] afterSaleToolCallbacks(AgentToolProvider toolProvider) {
+        return toolProvider.getTools(AgentType.AFTER_SALES);
+    }
 }

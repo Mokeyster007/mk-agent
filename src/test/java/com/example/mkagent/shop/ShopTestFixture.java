@@ -20,6 +20,16 @@ final class ShopTestFixture {
     }
 
     static void reset(JdbcTemplate jdbc) {
+        /*
+         * 先清售后（A1），再清订单（A0）：
+         * shop_aftersale_return / quota / event 都有外键指向订单与订单行，
+         * 顺序反了会直接违反外键约束。
+         */
+        jdbc.update("DELETE FROM shop_aftersale_event");
+        jdbc.update("DELETE FROM shop_aftersale_return");
+        jdbc.update("DELETE FROM shop_aftersale_quota");
+        jdbc.update("DELETE FROM shop_aftersale_idempotency");
+
         jdbc.update("DELETE FROM shop_inventory_movement");
         jdbc.update("DELETE FROM shop_order_item");
         jdbc.update("DELETE FROM shop_order");
@@ -97,5 +107,93 @@ final class ShopTestFixture {
         List<String> values = jdbc.queryForList(
                 "SELECT buyer_id FROM shop_order WHERE order_no = ?", String.class, orderNo);
         return values.isEmpty() ? null : values.get(0);
+    }
+
+    // ---------------------------------------------------------------
+    // A1 售后夹具
+    // ---------------------------------------------------------------
+
+    /**
+     * 直接造一张"已签收"的订单（自动化边界用例用）。
+     *
+     * <p>为什么允许夹具：A1 的边界场景（额度争抢、窗口过期、回滚）
+     * 需要精确控制签收时间与数量，走完整浏览器链路既慢又无法造出"7 天前签收"。
+     * 但**主验收路径仍然必须从 A0 页面下单 → 发货 → 签收产生**，
+     * 夹具不能替代那条路径。
+     *
+     * @param signedAt 签收时间（传 {@code null} 表示用当前时间）
+     * @return 订单号
+     */
+    static String createSignedOrder(
+            JdbcTemplate jdbc,
+            String orderNo,
+            String buyerId,
+            String sku,
+            long productId,
+            String productName,
+            long unitPriceCents,
+            int quantity,
+            java.time.LocalDateTime signedAt
+    ) {
+        long totalCents = unitPriceCents * quantity;
+        jdbc.update("""
+                INSERT INTO shop_order
+                    (order_no, buyer_id, status, total_cents, payment_mode, created_at, updated_at,
+                     shipped_at, shipped_by, signed_at, signed_by)
+                VALUES (?, ?, 'SIGNED', ?, 'DEMO', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP, 'music-admin-1', ?, 'music-admin-1')
+                """, orderNo, buyerId, totalCents,
+                java.sql.Timestamp.valueOf(
+                        signedAt == null ? java.time.LocalDateTime.now() : signedAt));
+
+        Long orderId = jdbc.queryForObject(
+                "SELECT id FROM shop_order WHERE order_no = ?", Long.class, orderNo);
+
+        jdbc.update("""
+                INSERT INTO shop_order_item
+                    (order_id, product_id, sku, product_name, unit_price_cents,
+                     quantity, line_cents, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, orderId, productId, sku, productName, unitPriceCents, quantity, totalCents);
+
+        return orderNo;
+    }
+
+    /** 全库退货单条数。 */
+    static int totalReturns(JdbcTemplate jdbc) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_return", Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的事件条数。 */
+    static int eventCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_event e
+                JOIN shop_aftersale_return r ON r.id = e.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 某订单行当前已占用的可退额度（没有额度行时返回 0）。 */
+    static int occupiedQty(JdbcTemplate jdbc, String orderNo) {
+        Integer value = jdbc.queryForObject("""
+                SELECT COALESCE(q.reserved_qty, 0)
+                FROM shop_order o
+                JOIN shop_order_item i ON i.order_id = o.id
+                LEFT JOIN shop_aftersale_quota q ON q.order_item_id = i.id
+                WHERE o.order_no = ?
+                """, Integer.class, orderNo);
+        return value == null ? 0 : value;
+    }
+
+    /** 退货单的退货数量（按退货单号）。 */
+    static int returnQty(JdbcTemplate jdbc, String returnNo) {
+        List<Integer> values = jdbc.queryForList(
+                "SELECT quantity FROM shop_aftersale_return WHERE return_no = ?",
+                Integer.class, returnNo);
+        return values.isEmpty() ? -1 : values.get(0);
     }
 }

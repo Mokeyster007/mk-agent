@@ -65,6 +65,23 @@ const summary = computed(() => props.payload.summary)
 const targetPlaylist = computed(() => summary.value.playlistName || '未指定歌单名')
 const actionLabel = computed(() => summary.value.toolLabel || toolLabel(summary.value.tool))
 
+/**
+ * 业务扩展给出的结构化字段（当前只有售后：订单号 / 商品 / 数量 / 原因）。
+ *
+ * 有 details 就按"标签 值"逐条渲染，**不再**显示歌单那一块：
+ * 售后卡上没有歌单，显示"未指定歌单名"会让用户以为批准的是别的东西。
+ * 两者都来自服务端摘要，前端不拼接、不补字段。
+ */
+const details = computed(() => summary.value.details ?? [])
+const hasDetails = computed(() => details.value.length > 0)
+
+/** 音乐卡的脚注指向歌单；有 details 的业务指向自己的列表，避免指错地方。 */
+const footnote = computed(() =>
+  hasDetails.value
+    ? '批准只表示同意执行；是否真的建单，以「我的售后」列表里的单号为准。'
+    : '批准只表示同意执行；是否真的执行成功，以任务状态和最终回答为准。写库结果可在顶栏「我的歌单」里刷新核对。',
+)
+
 const expiresText = computed(() => {
   const value = props.approval?.expiresAt || props.payload.expiresAt
   return value ? formatDateTime(value) : '暂无数据'
@@ -102,15 +119,21 @@ const visibleSongs = computed(() =>
       </div>
     </header>
 
-    <!-- 1. 操作是什么（标题）+ 2. 目标歌单 -->
-    <dl class="approval__facts">
+    <!-- 1. 操作是什么（标题）+ 2. 这次要固定的关键事实 -->
+    <dl v-if="hasDetails" class="approval__facts">
+      <div v-for="item in details" :key="item.label" class="approval__fact">
+        <dt>{{ item.label }}</dt>
+        <dd>{{ item.value }}</dd>
+      </div>
+    </dl>
+    <dl v-else class="approval__facts">
       <div class="approval__fact">
         <dt>目标歌单</dt>
         <dd>{{ targetPlaylist }}</dd>
       </div>
     </dl>
 
-    <!-- 3. 将写入的歌曲 -->
+    <!-- 3. 将写入的歌曲（音乐链路；售后没有这一段） -->
     <div v-if="songs.length || summary.songCount !== null" class="approval__songs">
       <div class="approval__songs-head">
         <span class="approval__songs-label">将写入的歌曲</span>
@@ -199,8 +222,7 @@ const visibleSongs = computed(() =>
     </footer>
 
     <p class="approval__footnote">
-      批准只表示同意执行；是否真的执行成功，以任务状态和最终回答为准。
-      写库结果可在顶栏「我的歌单」里刷新核对。
+      {{ footnote }}
     </p>
   </section>
 </template>

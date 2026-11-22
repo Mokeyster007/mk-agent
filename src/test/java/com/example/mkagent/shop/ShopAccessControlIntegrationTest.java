@@ -114,4 +114,37 @@ class ShopAccessControlIntegrationTest {
         assertEquals(403, reply.status(), reply.raw());
         assertEquals("NOT_ADMIN", reply.text("code"));
     }
+
+    @Test
+    @DisplayName("售后 Agent 入口：缺身份 401、未开通商城 403，且都不启动 Agent")
+    void afterSaleChatRequiresBuyerIdentity() {
+        ShopApiClient.Reply anonymous = api.get("/ai/aftersale/chat?message=hi", null);
+        assertEquals(401, anonymous.status(), anonymous.raw());
+        assertTrue(anonymous.text("message").contains("X-User-Id"), anonymous.raw());
+
+        ShopApiClient.Reply unknown = api.get("/ai/aftersale/chat?message=hi", "nobody-provisioned");
+        assertEquals(403, unknown.status(), unknown.raw());
+        assertEquals("SHOP_USER_NOT_PROVISIONED", unknown.text("code"));
+
+        Integer runs = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agent_run WHERE agent_type = 'AFTER_SALES'",
+                Integer.class);
+        assertEquals(0, runs, "身份不通过时不得启动售后 Agent（也就不会有任何写操作）");
+    }
+
+    @Test
+    @DisplayName("售后读写入口同样要求身份：缺头 401、未开通 403")
+    void afterSaleEndpointsRequireBuyerIdentity() {
+        assertEquals(401, api.get("/shop/aftersale/orders", null).status());
+        assertEquals(401, api.get("/shop/aftersale/returns", null).status());
+        assertEquals(401, api.post("/shop/aftersale/returns", null,
+                Map.of("orderNo", "SO-ANY", "quantity", 1, "reason", "测试",
+                        "clientRequestId", "req-anon-0001")).status());
+
+        ShopApiClient.Reply unknown = api.get("/shop/aftersale/orders", "nobody-provisioned");
+        assertEquals(403, unknown.status(), unknown.raw());
+        assertEquals("SHOP_USER_NOT_PROVISIONED", unknown.text("code"));
+
+        assertEquals(0, ShopTestFixture.totalReturns(jdbcTemplate));
+    }
 }

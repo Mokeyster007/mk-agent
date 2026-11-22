@@ -78,6 +78,17 @@ export interface AgentEvent {
   timestamp: number
 }
 
+/**
+ * 确认卡上的一条"标签 值"。
+ *
+ * 售后用它固定订单号、商品、数量、原因；音乐链路没有 details（空数组），
+ * 仍然走 playlistName / songs 那一套渲染。
+ */
+export interface ApprovalSummaryDetail {
+  label: string
+  value: string
+}
+
 /** 审批摘要，见 com.example.mkagent.approval.ApprovalSummary */
 export interface ApprovalSummary {
   tool: string
@@ -87,6 +98,8 @@ export interface ApprovalSummary {
   songs: string[]
   roundToolCount: number
   text: string
+  /** 业务扩展给出的结构化字段；没有时为空数组 */
+  details: ApprovalSummaryDetail[]
 }
 
 /** approval_required 事件 data 解析后的结构 */

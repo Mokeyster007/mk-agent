@@ -22,6 +22,7 @@ const payload: ApprovalRequiredPayload = {
     songs: ['城市霓虹', '午夜电台'],
     roundToolCount: 1,
     text: '即将创建歌单「清晨慢跑」，并放入 2 首歌曲。',
+    details: [],
   },
 }
 
@@ -137,5 +138,50 @@ describe('ApprovalCard', () => {
 
     expect(wrapper.text()).toContain('状态未确认')
     expect(wrapper.text()).toContain('建议先刷新')
+  })
+
+  it('售后确认卡按 details 逐条展示，不显示歌单与歌曲', () => {
+    const aftersale = {
+      approvalId: 'ap-aftersale',
+      expiresAt: '2026-11-22T10:30:00',
+      summary: {
+        tool: 'submit_return',
+        toolLabel: '提交退货申请',
+        playlistName: null,
+        songCount: null,
+        songs: [],
+        roundToolCount: 1,
+        text: '提交退货申请：订单号 SO1；退货数量 1 件。',
+        details: [
+          { label: '订单号', value: 'SO20261122100000-0001' },
+          { label: '商品', value: '机械键盘 K87' },
+          { label: '退货数量', value: '1 件' },
+          { label: '退货原因', value: '键盘按键失灵' },
+        ],
+      },
+    }
+
+    const wrapper = mountCard({
+      payload: aftersale,
+      approval: view({
+        approvalId: 'ap-aftersale',
+        agentType: 'AFTER_SALES',
+        primaryTool: 'submit_return',
+        summaryText: aftersale.summary.text,
+        summary: aftersale.summary,
+      }),
+    })
+    const text = wrapper.text()
+
+    expect(text).toContain('提交退货申请')
+    expect(text).toContain('SO20261122100000-0001')
+    expect(text).toContain('机械键盘 K87')
+    expect(text).toContain('1 件')
+    expect(text).toContain('键盘按键失灵')
+    // 售后卡上没有歌单，不能显示"未指定歌单名"这种误导性占位
+    expect(text).not.toContain('未指定歌单名')
+    expect(text).not.toContain('将写入的歌曲')
+    // 脚注要指向售后列表，而不是音乐歌单
+    expect(text).toContain('「我的售后」')
   })
 })

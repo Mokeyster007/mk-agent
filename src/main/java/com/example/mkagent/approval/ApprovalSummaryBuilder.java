@@ -3,6 +3,7 @@ package com.example.mkagent.approval;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -44,12 +45,32 @@ public class ApprovalSummaryBuilder {
 
     private final ApprovalProperties properties;
 
+    /**
+     * 业务侧提供的摘要扩展（当前只有售后）。
+     *
+     * <p>没有实现时行为与之前完全一致——音乐确认卡不受影响。
+     */
+    private final List<ApprovalSummaryContributor> contributors;
+
+    @Autowired
+    public ApprovalSummaryBuilder(
+            SongTitleLookup songTitleLookup,
+            ApprovalProperties properties,
+            List<ApprovalSummaryContributor> contributors
+    ) {
+        this.songTitleLookup = songTitleLookup;
+        this.properties = properties;
+        this.contributors = contributors == null ? List.of() : List.copyOf(contributors);
+    }
+
+    /**
+     * 单测 / 手工构造用：没有业务扩展。
+     */
     public ApprovalSummaryBuilder(
             SongTitleLookup songTitleLookup,
             ApprovalProperties properties
     ) {
-        this.songTitleLookup = songTitleLookup;
-        this.properties = properties;
+        this(songTitleLookup, properties, List.of());
     }
 
     /**
@@ -81,6 +102,27 @@ public class ApprovalSummaryBuilder {
 
         AssistantMessage.ToolCall primary = pickPrimary(toolCalls);
         String toolName = primary.name();
+
+        /*
+         * 业务扩展优先：售后等业务自己知道"确认卡上该固定哪些字段"。
+         * 扩展失败（抛异常 / 返回 null）时退回默认渲染，
+         * 绝不因为摘要不好看而阻断暂停。
+         */
+        ApprovalSummaryContributor.Contribution contributed = contribute(primary, userId);
+        if (contributed != null) {
+            String text = renderGeneric(
+                    contributed.label(), contributed.details(), toolCalls.size());
+            return new ApprovalSummary(
+                    toolName,
+                    contributed.label(),
+                    null,
+                    null,
+                    List.of(),
+                    toolCalls.size(),
+                    text,
+                    contributed.details());
+        }
+
         String label = TOOL_LABELS.getOrDefault(toolName, "执行工具 " + toolName);
 
         String playlistName = null;
@@ -139,6 +181,71 @@ public class ApprovalSummaryBuilder {
     }
 
     /**
+     * 找第一个认领该工具的扩展并取摘要。
+     *
+     * <p>任何异常都吞掉并返回 null：摘要只是辅助信息，
+     * 不能因为它让整个审批流程失败。真正的一致性由检查点里的参数原文与哈希保证。
+     */
+    private ApprovalSummaryContributor.Contribution contribute(
+            AssistantMessage.ToolCall primary,
+            String userId
+    ) {
+        for (ApprovalSummaryContributor contributor : contributors) {
+            try {
+                if (!contributor.supports(primary.name())) {
+                    continue;
+                }
+                ApprovalSummaryContributor.Contribution contribution =
+                        contributor.contribute(primary.arguments(), userId);
+                if (contribution != null) {
+                    return contribution;
+                }
+            } catch (Exception e) {
+                // 记一条 warn 就够：审批仍要正常暂停。
+                // 不打印参数原文（可能含用户输入）。
+                org.slf4j.LoggerFactory.getLogger(ApprovalSummaryBuilder.class)
+                        .warn("审批摘要扩展失败，退回默认渲染：tool={}, reason={}",
+                                primary.name(), e.getClass().getSimpleName());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 通用摘要文本：动作 + 若干"标签 值" + 有效期。
+     *
+     * <p>为什么不把参数原文拼进来：参数里可能有用户输入的任意文本，
+     * 直接回显既难读，也容易把内部标识带到前端。
+     */
+    private String renderGeneric(
+            String label,
+            List<ApprovalSummary.Detail> details,
+            int roundToolCount
+    ) {
+        StringBuilder text = new StringBuilder(label);
+
+        if (details != null && !details.isEmpty()) {
+            text.append("：");
+            for (int i = 0; i < details.size(); i++) {
+                if (i > 0) {
+                    text.append("；");
+                }
+                text.append(details.get(i).label())
+                        .append(" ")
+                        .append(details.get(i).value());
+            }
+        }
+        if (roundToolCount > 1) {
+            text.append("（本轮共 ").append(roundToolCount).append(" 个操作，一并等待确认）");
+        }
+        text.append("。有效期 ")
+                .append(properties.getTtl().toMinutes())
+                .append(" 分钟。");
+
+        return sanitize(text.toString(), ApprovalSummary.MAX_TEXT_LENGTH);
+    }
+
+    /**
      * 选"主工具"：优先写工具，否则第一个。
      *
      * 一轮里可能既有读又有写，摘要必须指向真正需要确认的那个，
@@ -148,11 +255,29 @@ public class ApprovalSummaryBuilder {
             List<AssistantMessage.ToolCall> toolCalls
     ) {
         for (AssistantMessage.ToolCall call : toolCalls) {
-            if (TOOL_LABELS.containsKey(call.name())) {
+            if (isWriteTool(call.name())) {
                 return call;
             }
         }
         return toolCalls.get(0);
+    }
+
+    /**
+     * 是否是需要确认的写工具：音乐写工具（固定名单）+ 任何被业务扩展认领的工具。
+     *
+     * <p>后者让"新增一个写工具"不需要改审批包的名单——
+     * 扩展实现已经声明了它负责哪个工具。
+     */
+    private boolean isWriteTool(String toolName) {
+        if (TOOL_LABELS.containsKey(toolName)) {
+            return true;
+        }
+        for (ApprovalSummaryContributor contributor : contributors) {
+            if (contributor.supports(toolName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private String render(
@@ -231,8 +356,12 @@ public class ApprovalSummaryBuilder {
 
     /**
      * 去控制字符、折叠空白、按码点截断。
+     *
+     * <p>public 是因为业务侧的 {@link ApprovalSummaryContributor} 也要用同一套规则：
+     * 摘要会进 SSE 事件，换行会把一条事件拆成两行。
+     * 两处各写一份"清洗"迟早不一致。
      */
-    static String sanitize(String value, int maxCodePoints) {
+    public static String sanitize(String value, int maxCodePoints) {
         if (value == null) {
             return "";
         }

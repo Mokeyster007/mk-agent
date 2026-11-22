@@ -38,7 +38,16 @@ import { ApiError, describeError, describeRunErrorCode } from '@/api/errors'
 import { runMusicChat } from '@/api/music'
 import { cancelRun, getRun, isTerminalState, pageRuns } from '@/api/runs'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
+import { parseApprovalPayload } from '@/api/approvalPayload'
 import type { Transport } from '@/utils/status'
+
+/**
+ * 重新导出：历史上 `parseApprovalPayload` 定义在本文件里，
+ * 测试与其它调用方按这个路径引用。实现已经搬到 `@/api/approvalPayload`，
+ * 因为售后链路也要用同一份解析（确认卡多一个 details 字段时不能只改一处）。
+ */
+export { parseApprovalPayload }
+
 
 export interface TaskError {
   kind: ErrorKind | 'task'
@@ -216,42 +225,6 @@ async function verify(
     task.detailError = describeError(error)
   } finally {
     task.verifying = false
-  }
-}
-
-/** 解析 approval_required 的 data（后端给的是 JSON 字符串）。 */
-export function parseApprovalPayload(message: string): ApprovalRequiredPayload | null {
-  try {
-    const parsed = JSON.parse(message) as Partial<ApprovalRequiredPayload>
-    if (!parsed || typeof parsed.approvalId !== 'string' || !parsed.approvalId) {
-      return null
-    }
-    return {
-      approvalId: parsed.approvalId,
-      expiresAt: typeof parsed.expiresAt === 'string' ? parsed.expiresAt : '',
-      summary:
-        parsed.summary && typeof parsed.summary === 'object'
-          ? {
-              tool: parsed.summary.tool ?? '',
-              toolLabel: parsed.summary.toolLabel ?? '',
-              playlistName: parsed.summary.playlistName ?? null,
-              songCount: parsed.summary.songCount ?? null,
-              songs: Array.isArray(parsed.summary.songs) ? parsed.summary.songs : [],
-              roundToolCount: parsed.summary.roundToolCount ?? 0,
-              text: parsed.summary.text ?? '',
-            }
-          : {
-              tool: '',
-              toolLabel: '',
-              playlistName: null,
-              songCount: null,
-              songs: [],
-              roundToolCount: 0,
-              text: '',
-            },
-    }
-  } catch {
-    return null
   }
 }
 
@@ -703,6 +676,7 @@ export const taskStore = {
               songs: view.summary.songs ?? [],
               roundToolCount: view.summary.roundToolCount ?? 0,
               text: view.summary.text ?? '',
+              details: view.summary.details ?? [],
             },
           }
         } catch {

@@ -105,4 +105,29 @@ class ShopIdentityDisabledIntegrationTest {
     void inventoryRejected() {
         assertEquals(403, api.get("/shop/admin/inventory", ADMIN).status());
     }
+
+    @Test
+    @DisplayName("售后入口一律拒绝：表单、列表、详情、Agent 对话都不放行")
+    void afterSaleEntriesRejected() {
+        // 普通表单与查询
+        assertEquals(403, api.get("/shop/aftersale/orders", ADMIN).status());
+        assertEquals(403, api.get("/shop/aftersale/returns", ADMIN).status());
+        assertEquals(403, api.get("/shop/aftersale/returns/RT-ANY", ADMIN).status());
+        assertEquals(403, api.post("/shop/aftersale/preview", ADMIN,
+                Map.of("orderNo", "SO-ANY", "quantity", 1, "reason", "测试")).status());
+        assertEquals(403, api.post("/shop/aftersale/returns", ADMIN,
+                Map.of("orderNo", "SO-ANY", "quantity", 1, "reason", "测试",
+                        "clientRequestId", "req-disabled-0001")).status());
+
+        // Agent 对话入口：新增的私有读写入口不得因为"只是聊天"就放行
+        ShopApiClient.Reply chat = api.get("/ai/aftersale/chat?message=hi", ADMIN);
+        assertEquals(403, chat.status(), chat.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", chat.text("code"));
+
+        assertEquals(0, ShopTestFixture.totalReturns(jdbcTemplate), "拒绝的请求不得建单");
+        Integer runs = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agent_run WHERE agent_type = 'AFTER_SALES'",
+                Integer.class);
+        assertEquals(0, runs, "身份被拒绝时不得启动售后 Agent");
+    }
 }

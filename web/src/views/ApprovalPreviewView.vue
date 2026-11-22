@@ -29,6 +29,7 @@ const payload: ApprovalRequiredPayload = {
     songs: ['城市霓虹', '午夜电台', '沿海公路'],
     roundToolCount: 1,
     text: '即将创建歌单「清晨慢跑」，并放入 3 首歌曲。',
+    details: [],
   },
 }
 

@@ -144,6 +144,7 @@ describe('conversation store', () => {
         songs: ['城市霓虹', '深夜电台'],
         roundToolCount: 1,
         text: '创建歌单《夜航星精选》',
+        details: [],
       },
       expiresAt: '2026-11-18T04:10:00',
     })
