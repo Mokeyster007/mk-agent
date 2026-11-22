@@ -21,11 +21,12 @@ final class ShopTestFixture {
 
     static void reset(JdbcTemplate jdbc) {
         /*
-         * 先清售后（A1），再清订单（A0）：
-         * shop_aftersale_return / quota / event 都有外键指向订单与订单行，
+         * 先清售后（A1 / B1），再清订单（A0）：
+         * shop_aftersale_return / quota / event / decision 都有外键指向订单与订单行，
          * 顺序反了会直接违反外键约束。
          */
         jdbc.update("DELETE FROM shop_aftersale_event");
+        jdbc.update("DELETE FROM shop_aftersale_decision");
         jdbc.update("DELETE FROM shop_aftersale_return");
         jdbc.update("DELETE FROM shop_aftersale_quota");
         jdbc.update("DELETE FROM shop_aftersale_idempotency");
@@ -195,5 +196,81 @@ final class ShopTestFixture {
                 "SELECT quantity FROM shop_aftersale_return WHERE return_no = ?",
                 Integer.class, returnNo);
         return values.isEmpty() ? -1 : values.get(0);
+    }
+
+    // ---------------------------------------------------------------
+    // B1 决策夹具
+    // ---------------------------------------------------------------
+
+    /** 退货单当前状态（按退货单号）。 */
+    static String returnStatus(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList(
+                "SELECT status FROM shop_aftersale_return WHERE return_no = ?",
+                String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的决策记录条数（一单一决，正常只可能是 0 或 1）。 */
+    static int decisionCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的决策结果（没有决策时返回 {@code null}）。 */
+    static String decisionOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT d.decision
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的驳回原因（没有决策或批准时返回 {@code null}）。 */
+    static String rejectReasonOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT d.reason
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的事件类型序列（按写入顺序）。 */
+    static List<String> eventTypes(JdbcTemplate jdbc, String returnNo) {
+        return jdbc.queryForList("""
+                SELECT e.event_type
+                FROM shop_aftersale_event e
+                JOIN shop_aftersale_return r ON r.id = e.return_id
+                WHERE r.return_no = ?
+                ORDER BY e.id
+                """, String.class, returnNo);
+    }
+
+    /**
+     * 全库一致性断言：占用额度必须等于"未被驳回的申请数量之和"。
+     *
+     * <p>这条不变式是 B1 的核心：批准保留额度、驳回释放额度，
+     * 任何一次决策写错都会让它不成立。
+     *
+     * @return 不成立时返回说明，成立返回 {@code null}
+     */
+    static String quotaConsistencyError(JdbcTemplate jdbc, String orderNo) {
+        int occupied = occupiedQty(jdbc, orderNo);
+        Integer expected = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(r.quantity), 0)
+                FROM shop_aftersale_return r
+                JOIN shop_order o ON o.id = r.order_id
+                WHERE o.order_no = ? AND r.status <> 'REJECTED'
+                """, Integer.class, orderNo);
+        int want = expected == null ? 0 : expected;
+        return occupied == want ? null : "occupied=" + occupied + " 但有效申请合计=" + want;
     }
 }

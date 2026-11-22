@@ -40,7 +40,7 @@ export interface AfterSaleSignedOrderVO {
   returnable: boolean
 }
 
-/** 售后事件（详情里的处理记录）。A1 只有"买家提交退货申请"一种。 */
+/** 售后事件（详情里的处理记录）。提交、批准、驳回各一条。 */
 export interface AfterSaleEventVO {
   type: string
   label: string
@@ -49,10 +49,27 @@ export interface AfterSaleEventVO {
   createdAt: string | null
 }
 
-/** 退货申请。列表接口 `events` 为 null（未加载），详情接口为数组。 */
+/**
+ * 客服决策（一单一决）。
+ *
+ * 买家在自己的详情里也看得到：状态变成「已批准 / 已驳回」之后，
+ * 他需要知道"谁在什么时候、为什么"。
+ */
+export interface AfterSaleDecisionVO {
+  /** APPROVED / REJECTED */
+  decision: string
+  label: string
+  /** 驳回原因；批准时为 null */
+  reason: string | null
+  decidedBy: string
+  decidedAt: string | null
+}
+
+/** 退货申请。列表接口 `events` / `decision` 为 null（未加载），详情接口才有值。 */
 export interface AfterSaleReturnVO {
   returnNo: string
   orderNo: string
+  buyerId: string
   status: string
   statusLabel: string
   source: string
@@ -66,7 +83,16 @@ export interface AfterSaleReturnVO {
   refundText: string
   reason: string
   createdAt: string | null
+  decision: AfterSaleDecisionVO | null
   events: AfterSaleEventVO[] | null
+}
+
+/** 客服后台的分页响应（与订单后台同构）。 */
+export interface AfterSalePageVO<T> {
+  items: T[]
+  page: number
+  size: number
+  total: number
 }
 
 /** 预览结果；`eligible=false` 时 `code` 说明原因（后端稳定码）。 */
@@ -144,6 +170,74 @@ export function getMyReturn(returnNo: string, signal?: AbortSignal): Promise<Aft
   return requestJson<AfterSaleReturnVO>(
     `/api/shop/aftersale/returns/${encodeURIComponent(returnNo)}`,
     { signal },
+  )
+}
+
+// ---------------------------------------------------------------
+// 客服（B1）
+// ---------------------------------------------------------------
+
+/**
+ * 客服售后列表。
+ *
+ * **不做买家归属过滤**：单店 demo 里客服就是这家店的处理人。
+ * 服务端用 ADMIN 角色守卫；前端隐藏按钮只是不让人白点一次。
+ */
+export function listAdminReturns(
+  params: { status?: string | null; page?: number; size?: number },
+  signal?: AbortSignal,
+): Promise<AfterSalePageVO<AfterSaleReturnVO>> {
+  return requestJson<AfterSalePageVO<AfterSaleReturnVO>>('/api/shop/admin/aftersale/returns', {
+    query: {
+      status: params.status ?? undefined,
+      page: params.page ?? 1,
+      size: params.size ?? 20,
+    },
+    signal,
+  })
+}
+
+/** 客服视角的退货申请详情（含事件流与决策记录）。 */
+export function getAdminReturn(
+  returnNo: string,
+  signal?: AbortSignal,
+): Promise<AfterSaleReturnVO> {
+  return requestJson<AfterSaleReturnVO>(
+    `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}`,
+    { signal },
+  )
+}
+
+/**
+ * 批准：保留原额度。
+ *
+ * 重复批准返回 409 `ALREADY_APPROVED`；此时**不要**当成成功，
+ * 去读详情核对原决策即可（详情里有决策人、时间与结果）。
+ */
+export function approveAdminReturn(
+  returnNo: string,
+  signal?: AbortSignal,
+): Promise<AfterSaleReturnVO> {
+  return requestJson<AfterSaleReturnVO>(
+    `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}/approve`,
+    { method: 'POST', signal },
+  )
+}
+
+/**
+ * 驳回：释放本单申请数量（同一事务内）。
+ *
+ * `reason` 必填——"为什么驳回"是买家唯一能拿到的解释。
+ * 请求体里没有操作人字段：决策人由服务端身份决定。
+ */
+export function rejectAdminReturn(
+  returnNo: string,
+  reason: string,
+  signal?: AbortSignal,
+): Promise<AfterSaleReturnVO> {
+  return requestJson<AfterSaleReturnVO>(
+    `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}/reject`,
+    { method: 'POST', body: { reason }, signal },
   )
 }
 

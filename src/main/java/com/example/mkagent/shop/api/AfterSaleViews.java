@@ -1,5 +1,6 @@
 package com.example.mkagent.shop.api;
 
+import com.example.mkagent.shop.aftersale.AfterSaleDecision;
 import com.example.mkagent.shop.aftersale.AfterSaleEligibility;
 import com.example.mkagent.shop.aftersale.AfterSaleEvent;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
@@ -59,13 +60,31 @@ public final class AfterSaleViews {
     }
 
     /**
+     * 客服决策（一单一决）。
+     *
+     * <p>买家在自己的详情里也看得到：状态变成「已批准 / 已驳回」之后，
+     * 他需要知道"谁在什么时候、为什么"。这里只下发决策事实，不下发内部备注。
+     */
+    public record DecisionVO(
+            String decision,
+            String label,
+            String reason,
+            String decidedBy,
+            LocalDateTime decidedAt
+    ) {
+    }
+
+    /**
      * 退货申请。
      *
-     * @param events 事件流；列表接口为 {@code null}（未加载），详情接口为数组
+     * @param buyerId 买家身份（客服视角需要它定位是谁的单；对买家自己无隐私问题）
+     * @param events  事件流；列表接口为 {@code null}（未加载），详情接口为数组
+     * @param decision 决策记录；列表接口与未决策时为 {@code null}
      */
     public record ReturnVO(
             String returnNo,
             String orderNo,
+            String buyerId,
             String status,
             String statusLabel,
             String source,
@@ -79,6 +98,7 @@ public final class AfterSaleViews {
             String refundText,
             String reason,
             LocalDateTime createdAt,
+            DecisionVO decision,
             List<EventVO> events
     ) {
     }
@@ -131,19 +151,46 @@ public final class AfterSaleViews {
                 event.createdAt());
     }
 
-    /** 列表用：不带事件流（未查询，不等于"没有事件"）。 */
+    public static DecisionVO decision(AfterSaleDecision decision) {
+        return new DecisionVO(
+                decision.decision().name(),
+                decision.label(),
+                decision.reason(),
+                decision.decidedBy(),
+                decision.decidedAt());
+    }
+
+    /**
+     * 列表用：不带事件流与决策记录（未查询，不等于"没有"）。
+     *
+     * <p>为什么不在这里顺手查决策：列表是一次 SQL，决策是每行一次，
+     * 50 行就是 51 次查询。列表已经用 {@code statusLabel} 表达了结果，
+     * 需要"谁在什么时候为什么"时点开详情即可。
+     */
     public static ReturnVO summary(AfterSaleReturn value) {
-        return render(value, null);
+        return render(value, null, null);
     }
 
-    public static ReturnVO detail(AfterSaleReturn value, List<AfterSaleEvent> events) {
-        return render(value, events.stream().map(AfterSaleViews::event).toList());
+    public static ReturnVO detail(
+            AfterSaleReturn value,
+            List<AfterSaleEvent> events,
+            AfterSaleDecision decision
+    ) {
+        return render(
+                value,
+                events.stream().map(AfterSaleViews::event).toList(),
+                decision == null ? null : decision(decision));
     }
 
-    private static ReturnVO render(AfterSaleReturn value, List<EventVO> events) {
+    private static ReturnVO render(
+            AfterSaleReturn value,
+            List<EventVO> events,
+            DecisionVO decision
+    ) {
         return new ReturnVO(
                 value.returnNo(),
                 value.orderNo(),
+                value.buyerId(),
                 value.status().name(),
                 value.status().label(),
                 value.source().name(),
@@ -157,6 +204,7 @@ public final class AfterSaleViews {
                 ShopViews.money(value.refundCents()),
                 value.reason(),
                 value.createdAt(),
+                decision,
                 events);
     }
 

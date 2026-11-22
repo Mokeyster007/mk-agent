@@ -120,7 +120,10 @@ public class AfterSaleController {
                 request.reason(),
                 request.clientRequestId());
 
-        return AfterSaleViews.detail(created, afterSaleService.events(created.id()));
+        return AfterSaleViews.detail(
+                created,
+                afterSaleService.events(created.id()),
+                afterSaleService.decision(created.id()).orElse(null));
     }
 
     /** 我的售后列表（新的在前，不含事件流）。 */
@@ -143,7 +146,10 @@ public class AfterSaleController {
         }
 
         return afterSaleService.myReturn(buyerId, returnNo)
-                .map(value -> AfterSaleViews.detail(value, afterSaleService.events(value.id())))
+                .map(value -> AfterSaleViews.detail(
+                        value,
+                        afterSaleService.events(value.id()),
+                        afterSaleService.decision(value.id()).orElse(null)))
                 .orElseThrow(() -> new BusinessException(
                         404, "RETURN_NOT_FOUND", "退货申请不存在：" + returnNo));
     }

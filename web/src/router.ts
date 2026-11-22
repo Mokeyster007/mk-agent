@@ -47,6 +47,17 @@ const router = createRouter({
       component: () => import('@/views/AfterSaleView.vue'),
       meta: { title: '售后' },
     },
+    /*
+     * 客服售后处理（B1）：与买家售后页分开。
+     * 权限完全不同（ADMIN vs 买家），塞进同一个页面只会让"谁能做什么"
+     * 变成靠按钮显隐来判断的事——那是前端假装在管权限。
+     */
+    {
+      path: '/shop/admin/aftersale',
+      name: 'shop-admin-aftersale',
+      component: () => import('@/views/AfterSaleAdminView.vue'),
+      meta: { title: '售后处理' },
+    },
     {
       path: '/:pathMatch(.*)*',
       redirect: '/',

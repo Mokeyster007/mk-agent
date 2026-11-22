@@ -1,21 +1,26 @@
 <script setup lang="ts">
 /**
- * 售后详情抽屉。
+ * 买家售后详情抽屉。
  *
  * 只显示服务端返回的事实：
  * - 退货单号、状态、来源（普通表单 / 售后 Agent）、数量、金额、原因；
- * - 处理记录（A1 只有"买家提交退货申请"一条）。
+ * - 客服决策（谁在什么时候、批准还是驳回、驳回原因）——B1 起有；
+ * - 处理记录（提交 → 决策，一个动作一条）。
  *
- * 不显示、也不推断"客服已批准 / 已退款 / 已入库"——
- * 本轮状态只有「已提交」，详情里写别的就是骗人。
+ * 不显示、也不推断"已退款 / 已入库"：B1 只做到批准与驳回，
+ * 实物仍在买家手里，退款要等仓库验收之后。
  */
+import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
+import { afterSaleStatusTone } from '@/stores/aftersale'
 import type { AfterSaleReturnVO } from '@/api/aftersale'
 import { formatDateTime } from '@/utils/format'
 
-defineProps<{ value: AfterSaleReturnVO }>()
+const props = defineProps<{ value: AfterSaleReturnVO }>()
 
 const emit = defineEmits<{ (e: 'close'): void }>()
+
+const tone = computed(() => afterSaleStatusTone(props.value.status))
 </script>
 
 <template>
@@ -23,7 +28,9 @@ const emit = defineEmits<{ (e: 'close'): void }>()
     <header class="panel__head">
       <div class="panel__title">
         <span class="panel__no">{{ value.returnNo }}</span>
-        <span class="panel__status">{{ value.statusLabel }}</span>
+        <span class="panel__status" :class="`panel__status--${tone}`">
+          {{ value.statusLabel }}
+        </span>
       </div>
       <button type="button" class="panel__close" aria-label="关闭详情" @click="emit('close')">
         <AppIcon name="x" :size="14" />
@@ -65,6 +72,22 @@ const emit = defineEmits<{ (e: 'close'): void }>()
       </div>
     </dl>
 
+    <section v-if="value.decision" class="decision" data-decision>
+      <h3 class="events__title">客服处理结果</h3>
+      <p class="decision__line">
+        <span class="decision__kind" :class="`decision__kind--${tone}`">
+          {{ value.decision.label }}
+        </span>
+        <span class="decision__when">{{ formatDateTime(value.decision.decidedAt) }}</span>
+      </p>
+      <p v-if="value.decision.reason" class="decision__reason">
+        驳回原因：{{ value.decision.reason }}
+      </p>
+      <p v-else class="decision__reason decision__reason--muted">
+        已批准：这 {{ value.quantity }} 件仍计入已占用额度，等仓库验收（不在本轮范围）。
+      </p>
+    </section>
+
     <section class="events">
       <h3 class="events__title">处理记录</h3>
       <p v-if="!value.events || !value.events.length" class="events__empty">暂无记录。</p>
@@ -84,8 +107,8 @@ const emit = defineEmits<{ (e: 'close'): void }>()
     </section>
 
     <p class="foot">
-      本轮只做到「已提交、可查」。客服审核、仓库验收、退货入库与退款都不在本轮范围，
-      可售库存与出库流水没有变化。
+      批准只代表"同意退"，实物仍在买家手里；驳回会在同一事务里释放本单占用的额度。
+      可售库存与出库流水在两种情况下都没有变化。仓库验收、退货入库与退款不在本轮范围。
     </p>
   </aside>
 </template>
@@ -121,7 +144,18 @@ const emit = defineEmits<{ (e: 'close'): void }>()
 
 .panel__status {
   font-size: var(--fs-xs);
+}
+
+.panel__status--wait {
+  color: var(--c-warn);
+}
+
+.panel__status--ok {
   color: var(--c-ok);
+}
+
+.panel__status--neutral {
+  color: var(--c-text-3);
 }
 
 .panel__close {
@@ -184,6 +218,46 @@ const emit = defineEmits<{ (e: 'close'): void }>()
 .events {
   display: grid;
   gap: var(--s-2);
+}
+
+.decision {
+  display: grid;
+  gap: 4px;
+  padding: var(--s-3);
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--r-md);
+  background: var(--c-bg-soft);
+}
+
+.decision__line {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+}
+
+.decision__kind--ok {
+  color: var(--c-ok);
+}
+
+.decision__kind--neutral {
+  color: var(--c-warn);
+}
+
+.decision__when {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+}
+
+.decision__reason {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  overflow-wrap: anywhere;
+}
+
+.decision__reason--muted {
+  color: var(--c-text-3);
 }
 
 .events__title {

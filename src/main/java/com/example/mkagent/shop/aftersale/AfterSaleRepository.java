@@ -92,6 +92,15 @@ public class AfterSaleRepository {
             rs.getString("note"),
             toLocal(rs.getTimestamp("created_at")));
 
+    private static final RowMapper<AfterSaleDecision> DECISION_MAPPER =
+            (rs, rowNum) -> new AfterSaleDecision(
+                    rs.getLong("id"),
+                    rs.getLong("return_id"),
+                    AfterSaleStatus.parse(rs.getString("decision")),
+                    rs.getString("reason"),
+                    rs.getString("decided_by"),
+                    toLocal(rs.getTimestamp("decided_at")));
+
     private final JdbcTemplate jdbcTemplate;
 
     public AfterSaleRepository(JdbcTemplate jdbcTemplate) {
@@ -183,6 +192,55 @@ public class AfterSaleRepository {
                 returnId);
     }
 
+    /**
+     * 客服视角的退货单分页（**不带 buyer_id 过滤**）。
+     *
+     * <p>为什么客服可以看全部：这是单店 demo，客服就是这家店的处理人，
+     * 把"买家所有权"规则套到客服身上会得出"客服只能处理自己的退货申请"这种
+     * 没有意义的结论。真正的多租户隔离应该在店铺维度上做，不是在这里。
+     *
+     * @param status 为空表示全部
+     */
+    public List<AfterSaleReturn> findReturnsForAdmin(String status, int limit, int offset) {
+        if (status == null || status.isBlank()) {
+            return jdbcTemplate.query(
+                    SELECT_RETURN + " ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
+                    RETURN_MAPPER,
+                    limit,
+                    offset);
+        }
+        return jdbcTemplate.query(
+                SELECT_RETURN + " WHERE r.status = ? ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
+                RETURN_MAPPER,
+                status,
+                limit,
+                offset);
+    }
+
+    /** 客服视角的退货单总数（分页用）。 */
+    public long countReturnsForAdmin(String status) {
+        Long count = (status == null || status.isBlank())
+                ? jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM shop_aftersale_return", Long.class)
+                : jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM shop_aftersale_return WHERE status = ?",
+                        Long.class,
+                        status);
+        return count == null ? 0L : count;
+    }
+
+    /** 某退货单的决策记录（没有则空）。 */
+    public Optional<AfterSaleDecision> findDecision(long returnId) {
+        return jdbcTemplate.query(
+                """
+                        SELECT id, return_id, decision, reason, decided_by, decided_at
+                        FROM shop_aftersale_decision
+                        WHERE return_id = ?
+                        """,
+                DECISION_MAPPER,
+                returnId).stream().findFirst();
+    }
+
     // ---------------------------------------------------------------
     // 写：事务内（调用方必须已开启事务）
     // ---------------------------------------------------------------
@@ -248,6 +306,61 @@ public class AfterSaleRepository {
                         rs.getInt("quantity_total"), rs.getInt("reserved_qty")),
                 orderItemId);
         return rows.stream().findFirst();
+    }
+
+    /**
+     * 条件状态转换：只有当前状态仍是 {@code from} 时才改。
+     *
+     * <p>这是"只有赢得决策权的操作可以继续"的唯一判据：
+     * 返回 1 表示这一笔赢了（可以往下释放额度、写决策、写事件），
+     * 返回 0 表示别人已经决策过（必须原样退出，不碰额度）。
+     *
+     * <p>用它而不是"先 SELECT 判断再 UPDATE"：
+     * 两步之间会插进另一个事务，两个请求都会认为自己是第一个。
+     */
+    public int transitionStatus(long returnId, AfterSaleStatus from, AfterSaleStatus to) {
+        return jdbcTemplate.update("""
+                UPDATE shop_aftersale_return
+                   SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND status = ?
+                """, to.name(), returnId, from.name());
+    }
+
+    /**
+     * 释放额度（驳回时用）。
+     *
+     * <p>条件 {@code reserved_qty >= ?} 是防负数的关键：
+     * 即使前面的重读被绕过，也只会更新 0 行，调用方据此整笔回滚，
+     * 而不是把 {@code reserved_qty} 减成负数再靠 CHECK 抛约束冲突。
+     *
+     * @return 影响行数；0 表示额度不足以释放（数据异常，调用方必须失败）
+     */
+    public int releaseQuota(long orderItemId, int quantity) {
+        return jdbcTemplate.update("""
+                UPDATE shop_aftersale_quota
+                   SET reserved_qty = reserved_qty - ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE order_item_id = ? AND reserved_qty >= ?
+                """, quantity, orderItemId, quantity);
+    }
+
+    /**
+     * 写决策记录。
+     *
+     * <p>调用方必须已经赢得状态转换：{@code uk(return_id)} 是兜底，
+     * 不是去重手段——靠撞唯一键来处理重试，会把"重复提交"变成一条
+     * 事务中止的错误，而不是一个可解释的 409。
+     */
+    public void insertDecision(
+            long returnId,
+            AfterSaleStatus decision,
+            String reason,
+            String decidedBy
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_decision
+                    (return_id, decision, reason, decided_by, decided_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, returnId, decision.name(), reason, decidedBy);
     }
 
     /** 插入退货单，返回自增 id。 */

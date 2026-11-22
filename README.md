@@ -78,19 +78,20 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - 详见 [`docs/shop-a0.md`](docs/shop-a0.md) 与 [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)
 
 > 演示付款：`payment_mode = 'DEMO'`，没有真实资金交易、没有退款、没有物流。
-> 售后（A1）已实施，见 1.3；B（客服审批 / 仓库验收 / 退货入库 / 退款）仍未实施。
+> 售后 A1（退货申请）与 B1（客服批准 / 驳回）已实施，见 1.3、1.4；
+> B2（仓库验收 / 退货入库 / 退款）仍未实施。
 
 ### 1.3 售后（A1：退货申请 + 售后 Agent）
 
 买家可以对**已签收**的订单申请退货（支持部分数量），普通表单与售后 Agent
-写的是同一套 Java 服务。本轮只做到 **「已提交、可查」**。
+写的是同一套 Java 服务。A1 只做到 **「已提交、可查」**；客服决策见 1.4。
 
 - **入口**：`/shop/aftersale`（对话 + 可退订单 + 表单 + 我的售后）；
   对话走 `GET /api/ai/aftersale/chat`
-- **状态只有一种**：`SUBMITTED`（已提交）。数据库 `CHECK` 钉住，
-  写不出「已批准 / 已退款」
-- **额度三算**：已购 / 已占用 / 剩余可退，全部服务端算；A1 里只有"已提交"的申请占额度，
-  客服驳回与释放额度留到 B 阶段
+- **状态**：A1 交付时只有 `SUBMITTED`（已提交），数据库 `CHECK` 钉住；
+  B1 把 `CHECK` 扩成 `SUBMITTED / APPROVED / REJECTED`（见 1.4）
+- **额度三算**：已购 / 已占用 / 剩余可退，全部服务端算；
+  只有"已提交"与"已批准"的申请占额度，**只有驳回释放额度**
 - **不超卖**：订单行 `SELECT … FOR UPDATE` + 原子条件更新
   `WHERE reserved_qty + ? <= quantity_total` + `CHECK (reserved_qty <= quantity_total)` 兜底；
   额度占用与建单在**同一个事务**里，占用后建单失败整体回滚
@@ -108,6 +109,32 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 > ⚠️ 本轮**不是**真实认证上线：`X-User-Id` 仍是 demo 边界内的占位方案。
 > 共享部署请保持 `mkagent.shop.demo-identity-enabled=false`（默认），
 > 此时售后所有入口一律 403（有测试钉住）。
+
+### 1.4 售后（B1：客服批准 / 驳回）
+
+客服对一张**已提交**的退货申请给出终态。状态只有三种，已决策的单不可回退、不可二次转换。
+
+- **入口**：`/shop/admin/aftersale`（全部 / 待处理 / 已批准 / 已驳回四个 Tab，
+  行内批准 / 驳回，驳回原因必填且未填时按钮禁用；详情抽屉里有决策记录与事件流）
+- **状态机**：`SUBMITTED → APPROVED`（保留原额度）或 `SUBMITTED → REJECTED`（释放本单数量）
+- **谁赢**：`UPDATE … WHERE status='SUBMITTED'` 的 0/1 行判定，
+  **不靠**先写再撞唯一键；`uk(return_id)` 只作兜底
+- **锁顺序**：`shop_order_item` 行锁 → 退货单条件 UPDATE → 额度条件 UPDATE →
+  决策记录 → 事件，与 A1 新申请**同一把订单行锁**（先订单行、再退货单）
+- **一个事务**：状态转换 + 额度释放 + 决策记录 + 事件；任一步失败整笔回滚
+- **操作者只来自服务端身份上下文**：请求体里没有操作人字段，
+  `decided_by` 取自 `X-User-Id` 解析后的身份
+- **权限**：商城后台角色守卫（缺身份 401 → demo 关闭 403 `SHOP_IDENTITY_NOT_CONFIGURED`
+  → 非 ADMIN 403 `NOT_ADMIN`）；普通买家打开客服页只能看到"当前身份不能处理售后"
+- **不碰库存**：不改可售库存、不写退货入库流水、不产生真实退款
+- **旧库可迁移**：状态 / 事件 `CHECK` 用 `DROP IF EXISTS` + `ADD`；
+  新表 `CREATE IF NOT EXISTS`；老会话的 `agent_type` 由 `ConversationDomainBackfill` 按
+  `agent_run.agent_type` 回填（否则老售后会话会被当成音乐会话）
+- **两种数据库都验过**：H2（B1 专项 22 项：决策 13 + 旧库迁移 4 + 回填 5）+
+  真实 PostgreSQL 16（专项 5 项，`./mvnw -Ppg test "-Dtest=AfterSaleDecisionPostgresTest"`）
+- 详见 [`docs/shop-b1.md`](docs/shop-b1.md)
+
+> B2（仓库验收 / 退货入库 / 退款）未实施，设计建议见 `docs/shop-b1.md` 第 11 节。
 
 ### 2. 弹性与成本控制（resilience）
 
@@ -729,6 +756,10 @@ cd web && node tools/e2e-aftersale-shopbuyer.mjs
 | `GET /api/shop/aftersale/returns` | 我的售后列表（新的在前，不含事件流） |
 | `GET /api/shop/aftersale/returns/{returnNo}` | 售后详情（含处理记录）；别人的单 → **404** |
 | `GET /api/ai/aftersale/chat?message=...` | 售后 Agent（`AFTER_SALES`，SSE），需商城买家身份；可选 `conversationId` 表示同一会话的下一轮 |
+| `GET /api/shop/admin/aftersale/returns` | 客服售后列表（`status` 省略=全部，`page` / `size`，需 ADMIN） |
+| `GET /api/shop/admin/aftersale/returns/{returnNo}` | 客服售后详情（含决策记录与事件流，需 ADMIN） |
+| `POST /api/shop/admin/aftersale/returns/{returnNo}/approve` | 批准：保留原额度；重复/相反决策 409，零写入 |
+| `POST /api/shop/admin/aftersale/returns/{returnNo}/reject` | 驳回：body `{"reason": "..."}`，必填；同事务释放本单数量 |
 
 Agent 任务 SSE 事件流示例：
 
@@ -784,6 +815,18 @@ event:done       [DONE]
 # 售后 A1 的真实 PostgreSQL 回归（额度争抢 / 同键并发 / 占用后回滚，5 个用例）
 ./mvnw -Ppg test "-Dtest=AfterSalePostgres*"
 
+# 售后 B1：客服批准 / 驳回 / 权限 / 一单一决（H2，13 个用例）
+./mvnw test "-Dtest=AfterSaleDecisionIntegrationTest"
+
+# 售后 B1：旧库迁移（把 schema 退回 A1 形状再迁移，4 个用例）
+./mvnw test "-Dtest=AfterSaleOldSchemaMigrationTest"
+
+# 售后 B1：老库会话领域回填（5 个用例，先证缺陷再证修复）
+./mvnw test "-Dtest=ConversationDomainBackfillTest"
+
+# 售后 B1 的真实 PostgreSQL 专项（并发驳回 / 批准+驳回 / 驳回+新申请 / 故障注入回滚，5 个用例）
+./mvnw -Ppg test "-Dtest=AfterSaleDecisionPostgresTest"
+
 # live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
 ./mvnw -Plive test "-Dtest=MkManusTest"
 ```
@@ -808,6 +851,7 @@ event:done       [DONE]
 - [`docs/shop-a0.md`](docs/shop-a0.md)：商城 A0——模块关系、六张表、状态机、接口与权限矩阵、并发与幂等设计、实跑测试结果、限制，以及 A1 售后 Agent 的最小接入设计（只设计）
 - [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)：A0 的真实 PostgreSQL 16 回归——一次性容器接线、A/B/C/D/E 五场景实测证据（含受控锁等待与事务回滚注入）、Testcontainers 与 Docker 29 不兼容的根因与替代方案
 - [`docs/shop-a1.md`](docs/shop-a1.md)：售后 A1——模块与四张表、额度算法、五个接口与权限、确认→建单的调用链与事务边界、两套幂等身份、实跑结果（H2 / 真实 PG / 浏览器 / 模型）、限制与 B 阶段边界
+- [`docs/shop-b1.md`](docs/shop-b1.md)：售后 B1——状态机、客服四个接口与权限、锁顺序与事务边界、决策表与两个 CHECK 的迁移、会话领域回填、重复/并发决策口径、实跑结果与未验证项、B2 设计建议
 
 ---
 

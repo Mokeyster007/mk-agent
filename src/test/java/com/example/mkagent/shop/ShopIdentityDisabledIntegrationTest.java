@@ -146,4 +146,37 @@ class ShopIdentityDisabledIntegrationTest {
                 Integer.class);
         assertEquals(0, runs, "身份被拒绝时不得启动售后 Agent");
     }
+
+    /**
+     * 客服售后接口（B1）：关闭 demo 且没有可信身份时，后台私有读写一律不放行。
+     *
+     * <p>这几个入口能改状态、能释放额度，比"读"更危险：
+     * 身份不可信时放行它们，等于任何人都能把别人的退货申请批掉。
+     * 断言的是 {@code SHOP_IDENTITY_NOT_CONFIGURED}（身份不可用）
+     * 而不是 {@code NOT_ADMIN}（权限不足）——先解释"为什么不行"。
+     */
+    @Test
+    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回都不放行")
+    void afterSaleAdminEntriesRejected() {
+        ShopApiClient.Reply list = api.get("/shop/admin/aftersale/returns", ADMIN);
+        assertEquals(403, list.status(), list.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", list.text("code"));
+
+        assertEquals(403, api.get("/shop/admin/aftersale/returns/RT-ANY", ADMIN).status());
+
+        ShopApiClient.Reply approve = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/approve", ADMIN, null);
+        assertEquals(403, approve.status(), approve.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", approve.text("code"));
+
+        ShopApiClient.Reply reject = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/reject", ADMIN,
+                Map.of("reason", "尝试驳回"));
+        assertEquals(403, reject.status(), reject.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", reject.text("code"));
+
+        Integer decisions = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_decision", Integer.class);
+        assertEquals(0, decisions, "被拒绝的请求不得留下决策记录");
+    }
 }

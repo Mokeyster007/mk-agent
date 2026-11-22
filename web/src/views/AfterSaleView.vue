@@ -18,7 +18,7 @@ import AfterSaleChatPanel from '@/components/AfterSaleChatPanel.vue'
 import AfterSaleReturnPanel from '@/components/AfterSaleReturnPanel.vue'
 import { session } from '@/stores/session'
 import { shop } from '@/stores/shop'
-import { afterSale } from '@/stores/aftersale'
+import { afterSale, afterSaleStatusTone } from '@/stores/aftersale'
 import { createAfterSaleChatStore } from '@/stores/aftersaleChat'
 import { runAfterSaleChat } from '@/api/aftersale'
 import {
@@ -137,7 +137,7 @@ onMounted(async () => {
     <template #topbar>
       <div class="topbar">
         <h1 class="topbar__title">售后</h1>
-        <span class="topbar__demo">A1 · 只到「已提交」</span>
+        <span class="topbar__demo">B1 · 客服可批准 / 驳回</span>
 
         <div class="topbar__right">
           <span class="topbar__identity" :title="shop.state.session?.userId ?? '未识别'">
@@ -358,7 +358,9 @@ onMounted(async () => {
             >
               <div class="return__main">
                 <div class="return__title">
-                  <span class="chip chip--ok">{{ item.statusLabel }}</span>
+                  <span class="chip" :class="`chip--${afterSaleStatusTone(item.status)}`">
+                    {{ item.statusLabel }}
+                  </span>
                   <span class="return__no">{{ item.returnNo }}</span>
                   <span class="return__source">{{ item.sourceLabel }}</span>
                 </div>
@@ -371,6 +373,12 @@ onMounted(async () => {
                   {{ formatDateTime(item.createdAt) }}
                 </p>
                 <p class="return__reason">原因：{{ item.reason }}</p>
+                <p v-if="item.status === 'REJECTED'" class="return__decision" data-reject-note>
+                  客服已驳回，本次申请占用的额度已释放；驳回原因在详情里。
+                </p>
+                <p v-else-if="item.status === 'APPROVED'" class="return__decision" data-approve-note>
+                  客服已批准，这 {{ item.quantity }} 件仍计入已占用额度，等仓库验收。
+                </p>
               </div>
 
               <div class="return__side">
@@ -387,8 +395,8 @@ onMounted(async () => {
         </section>
 
         <p class="foot-note">
-          本轮只做到「已提交、可查」。A1 不修改可售库存、不写退货入库流水；
-          客服审核、仓库验收、退货入库与退款都在后续阶段。
+          B1 起客服会批准或驳回：批准保留原额度，驳回释放本单占用的额度。
+          两种结果都不修改可售库存、不写退货入库流水；仓库验收、退货入库与退款仍在后续阶段。
         </p>
       </div>
     </div>
@@ -586,6 +594,12 @@ onMounted(async () => {
   overflow-wrap: anywhere;
 }
 
+.return__decision {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  overflow-wrap: anywhere;
+}
+
 .order__side,
 .return__side {
   display: flex;
@@ -740,6 +754,11 @@ onMounted(async () => {
 .chip--wait {
   background: var(--c-warn-weak);
   color: var(--c-warn);
+}
+
+.chip--neutral {
+  background: var(--c-surface-2);
+  color: var(--c-text-2);
 }
 
 .muted {

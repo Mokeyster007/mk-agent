@@ -75,6 +75,10 @@ function onChange(event: Event): void {
         <AppIcon name="shield" :size="14" />
         商城后台
       </RouterLink>
+      <RouterLink class="shop-nav__link" to="/shop/admin/aftersale">
+        <AppIcon name="check" :size="14" />
+        售后处理
+      </RouterLink>
       <RouterLink class="shop-nav__link" to="/">
         <AppIcon name="wave" :size="14" />
         音乐工作台

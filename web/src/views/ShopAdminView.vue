@@ -97,6 +97,7 @@ onMounted(loadAll)
 
         <div class="topbar__right">
           <span class="topbar__identity">{{ shop.state.session?.userId ?? '未识别身份' }}</span>
+          <RouterLink class="topbar__link" to="/shop/admin/aftersale">售后处理</RouterLink>
           <RouterLink class="topbar__link" to="/shop">返回商城</RouterLink>
         </div>
       </div>

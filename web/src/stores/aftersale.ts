@@ -1,9 +1,9 @@
 /**
- * 售后状态（A1：普通表单 + 我的售后）。
+ * 买家售后状态（B1：普通表单 + 我的售后 + 客服决策结果）。
  *
  * 四条边界：
  * 1. **额度三个数由服务端给**：已购 / 已占用 / 剩余，前端不自己减。
- *    A1 里占额度的只有"已提交"的退货申请；客服驳回与释放额度不在本轮。
+ *    B1 起「已提交」与「已批准」都占额度，「已驳回」不占（服务端已释放）。
  * 2. **`clientRequestId` 的生命周期只在这里**：
  *    同一次提交重试必须沿用同一个值（后端据此重放，不会重复建单）；
  *    用户改了订单/数量/原因就是另一次提交，必须换新值
@@ -15,6 +15,7 @@
  */
 import { reactive } from 'vue'
 import { ApiError, describeError } from '@/api/errors'
+import type { Tone } from '@/utils/status'
 import {
   getMyReturn,
   listAfterSaleOrders,
@@ -68,6 +69,20 @@ export function describeAfterSaleError(error: unknown): string {
       return '退货单写入冲突（不是重复提交），本次提交没有生效。请重新提交；若反复出现请联系管理员。'
     case 'REFUND_AMOUNT_OUT_OF_RANGE':
       return '退款金额超出可表示范围，请减少退货数量后重新提交。'
+    case 'ALREADY_APPROVED':
+      return '这一单已经是「已批准」，重复操作不会产生新的决策或额度变化。请以详情里的决策记录为准。'
+    case 'ALREADY_REJECTED':
+      return '这一单已经是「已驳回」，重复操作不会再次释放额度。请以详情里的决策记录为准。'
+    case 'DECISION_CONFLICT':
+      return '这一单已经做出过决策，不能再改成相反结果。请刷新后以详情里的决策记录为准。'
+    case 'INVALID_REJECT_REASON':
+      return '驳回原因必填（最多 200 字）。'
+    case 'RETURN_QUOTA_INCONSISTENT':
+      return '额度与退货单不一致，本次操作已回滚（没有释放任何额度）。请联系管理员核对数据。'
+    case 'INVALID_STATUS':
+      return '状态筛选值不合法，请重新选择。'
+    case 'NOT_ADMIN':
+      return '当前身份不是商城后台人员，不能处理售后。演示可切换为 music-admin-1。'
     case 'ORDER_STATUS_CONFLICT':
     case 'DATA_CONFLICT':
       return '数据状态已变化，请刷新后重试。'
@@ -75,6 +90,27 @@ export function describeAfterSaleError(error: unknown): string {
       return '模型不可用；售后表单与查询不依赖模型，可以继续使用。'
     default:
       return describeError(error)
+  }
+}
+
+/**
+ * 售后状态 → 色调。
+ *
+ * 只做"枚举 → 颜色"的翻译，不改变任何后端语义：
+ * 已提交（等客服）用 warn，已批准用 ok，已驳回用 neutral
+ * （驳回不是"错误"，是"处理完了，结果是不退"）。
+ * 未知状态一律中性色 + 原值，不猜。
+ */
+export function afterSaleStatusTone(status: string): Tone {
+  switch (status) {
+    case 'SUBMITTED':
+      return 'wait'
+    case 'APPROVED':
+      return 'ok'
+    case 'REJECTED':
+      return 'neutral'
+    default:
+      return 'neutral'
   }
 }
 
@@ -301,7 +337,7 @@ export function createAfterSaleStore(deps: AfterSaleDeps) {
 
     try {
       const created = await deps.submit(input)
-      state.notice = `退货申请已提交：${created.returnNo}（${created.quantity} 件，预计退款 ${created.refundText}）。当前状态「${created.statusLabel}」，客服审核不在本轮范围。`
+      state.notice = `退货申请已提交：${created.returnNo}（${created.quantity} 件，预计退款 ${created.refundText}）。当前状态「${created.statusLabel}」，等客服处理；结果会显示在「我的售后」里。`
       state.preview = null
       // 下一笔申请是新的提交身份
       rekey()

@@ -59,15 +59,19 @@ public class AfterSaleService {
 
     private final AfterSaleWriter writer;
 
+    private final AfterSaleDecisionWriter decisionWriter;
+
     private final ShopProperties properties;
 
     public AfterSaleService(
             AfterSaleRepository repository,
             AfterSaleWriter writer,
+            AfterSaleDecisionWriter decisionWriter,
             ShopProperties properties
     ) {
         this.repository = repository;
         this.writer = writer;
+        this.decisionWriter = decisionWriter;
         this.properties = properties;
     }
 
@@ -364,5 +368,61 @@ public class AfterSaleService {
             boolean expired,
             boolean returnable
     ) {
+    }
+
+    // ---------------------------------------------------------------
+    // 客服（B1）：读 + 决策
+    // ---------------------------------------------------------------
+
+    /**
+     * 客服视角的退货单分页。
+     *
+     * <p>**不做买家归属过滤**：这是单店 demo，客服就是这家店的处理人。
+     * 把"买家所有权"规则套到客服身上，会得出"客服只能处理自己的申请"
+     * 这种没有意义的结论；多租户隔离应该发生在店铺维度，不是这里。
+     *
+     * @param status 状态筛选（{@code null} 表示全部），由控制器负责校验取值
+     */
+    public List<AfterSaleReturn> adminReturns(String status, int limit, int offset) {
+        return repository.findReturnsForAdmin(status, limit, offset);
+    }
+
+    /** 客服列表的总数（分页用）。 */
+    public long adminReturnCount(String status) {
+        return repository.countReturnsForAdmin(status);
+    }
+
+    /**
+     * 客服视角的单据详情（不校验买家归属）。
+     *
+     * <p>仍然返回 {@link Optional}：不存在就是不存在，与"无权访问"在客服侧
+     * 不需要合并——客服本来就能看全部。
+     */
+    public Optional<AfterSaleReturn> adminReturn(String returnNo) {
+        return repository.findReturnByNo(returnNo);
+    }
+
+    /** 某退货单的决策记录（没有则空）。买家与客服共用。 */
+    public Optional<AfterSaleDecision> decision(long returnId) {
+        return repository.findDecision(returnId);
+    }
+
+    /**
+     * 批准：保留原额度。
+     *
+     * @param operatorId 客服身份（服务端解析，不来自请求体）
+     */
+    public AfterSaleReturn approve(String operatorId, String returnNo) {
+        return decisionWriter.approve(operatorId, returnNo);
+    }
+
+    /**
+     * 驳回：释放本单申请数量。
+     *
+     * @param operatorId 客服身份（服务端解析，不来自请求体）
+     * @param reason     驳回原因（必填）
+     */
+    public AfterSaleReturn reject(String operatorId, String returnNo, String reason) {
+        return decisionWriter.reject(operatorId, returnNo, reason);
     }
 }

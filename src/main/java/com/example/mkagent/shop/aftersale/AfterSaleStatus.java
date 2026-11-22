@@ -1,20 +1,33 @@
 package com.example.mkagent.shop.aftersale;
 
 /**
- * 退货申请状态。
+ * 退货申请状态（B1 起的完整状态机）。
  *
- * <p>A1 只有 {@link #SUBMITTED} 一个值，这是刻意的：
- * 本轮做到"买家已提交、可查询"就停，**不假装客服已批准**。
- * 数据库里的 {@code ck_shop_aftersale_return_status} 同样只允许这一个值，
- * 因此"多出一个没人认识的状态"在写入时就会失败。
+ * <pre>
+ * SUBMITTED ──客服批准──→ APPROVED   保留原额度（那部分数量仍然不能再申请）
+ * SUBMITTED ──客服驳回──→ REJECTED   释放本单申请数量（reserved_qty 减回去）
+ * </pre>
  *
- * <p>B 段新增 {@code APPROVED} / {@code REJECTED} / {@code RECEIVED} 时，
- * 必须同时改这里的枚举和那条 CHECK——让状态机的扩张成为一次看得见的变更。
+ * <p>两个终态都**不可回退**，也不允许"再决策一次"：
+ * 状态转换用条件更新（{@code WHERE status = 'SUBMITTED'}）实现，
+ * 只有 0 行 / 1 行两种结果，没有"改回去"的入口。
+ *
+ * <p>数据库里的 {@code ck_shop_aftersale_return_status} 与这里的枚举必须一致：
+ * 写入一个枚举之外的值会在数据库层失败，而不是变成一个没人认识的字符串。
+ *
+ * <p>仍然没有 {@code RECEIVED} / {@code REFUNDED}：仓库验收与退款是 B2 之后的事，
+ * 提前放进来会让"页面显示已退款、实际一分钱没退"成为可能。
  */
 public enum AfterSaleStatus {
 
-    /** 买家已提交，等待客服处理（A1 的唯一状态）。 */
-    SUBMITTED("已提交");
+    /** 买家已提交，等待客服处理。 */
+    SUBMITTED("已提交"),
+
+    /** 客服批准：申请成立，但实物仍在买家手里（等仓库验收，不在 B1 范围）。 */
+    APPROVED("已批准"),
+
+    /** 客服驳回：申请不成立，本次申请占用的额度已释放。 */
+    REJECTED("已驳回");
 
     private final String label;
 
@@ -24,6 +37,11 @@ public enum AfterSaleStatus {
 
     public String label() {
         return label;
+    }
+
+    /** 是否已经做出决策（两个终态）。 */
+    public boolean decided() {
+        return this != SUBMITTED;
     }
 
     /**

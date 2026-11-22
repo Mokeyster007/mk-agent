@@ -3,6 +3,11 @@
 > 本轮只做到 **「退货申请已提交、可查」**。
 > 客服审核、仓库验收、退货入库、退款、Redis / MQ / 外部 ERP **都没有做**，
 > A1 也**不修改可售库存、不写退货入库流水**。
+>
+> 📌 **后续阶段**：客服批准 / 驳回已在 **B1** 实施（`docs/shop-b1.md`）。
+> B1 把状态 `CHECK` 扩成 `SUBMITTED / APPROVED / REJECTED`，并新增
+> `shop_aftersale_decision` 表；本文中"状态只有一种"等描述记录的是 **A1 交付时**的事实，
+> 迁移与扩展方式见 `docs/shop-b1.md` 第 5、6 节。
 
 ---
 
@@ -113,6 +118,9 @@ remaining = max(0, purchased - occupied)
 **A1 哪些记录占额度**：只有 `shop_aftersale_return.status = 'SUBMITTED'` 的申请占额度，
 数量就是 `return.quantity`。客服驳回 / 释放额度不在本轮——所以本轮**没有**释放路径，
 额度只增不减（除非事务回滚）。
+
+> B1 之后不变式变成：`reserved_qty = Σ(status ∈ {SUBMITTED, APPROVED} 的 quantity)`。
+> 批准仍占额度（实物还在买家手里），**只有驳回**释放。见 `docs/shop-b1.md` 第 4.1 节。
 
 判定顺序（`AfterSaleEligibility`，服务端唯一一份）：
 

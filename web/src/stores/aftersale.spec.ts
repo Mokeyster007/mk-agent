@@ -40,6 +40,7 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
   return {
     returnNo: 'RT20261122101500-00A1',
     orderNo: 'SO20261122100000-0001',
+    buyerId: 'music-user-1',
     status: 'SUBMITTED',
     statusLabel: '已提交',
     source: 'FORM',
@@ -53,6 +54,7 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
     refundText: '¥299.00',
     reason: '键盘按键失灵',
     createdAt: '2026-11-22T10:15:00',
+    decision: null,
     events: null,
     ...overrides,
   }
