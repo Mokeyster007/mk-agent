@@ -104,6 +104,25 @@ export interface AfterSaleReceiptVO {
   movement: AfterSaleMovementVO | null
 }
 
+/**
+ * 模拟退款记录（B3）：一张退货单最多一笔。
+ *
+ * **它是"模拟"**：不接支付平台，没有真实资金流，`label` 恒为「模拟退款」。
+ * 界面不能写成"已到账""已原路退回"——那是在骗人。
+ *
+ * 与 `AfterSaleReturnVO.refundCents`（提交时的**预计**退款）区别：
+ * 那个是按下单时的申请数量估的，这个是**收货完成后**按累计实收结算的。
+ */
+export interface AfterSaleRefundVO {
+  refundNo: string
+  amountCents: number
+  amountText: string
+  operatorId: string
+  createdAt: string | null
+  /** 服务端给的口径文案（「模拟退款」），页面直接用它，不自己造词 */
+  label: string
+}
+
 /** 退货申请。列表接口 `events` / `receipts` 为 null（未加载），详情接口才有值。 */
 export interface AfterSaleReturnVO {
   returnNo: string
@@ -118,12 +137,15 @@ export interface AfterSaleReturnVO {
   unitPriceCents: number
   unitPriceText: string
   quantity: number
+  /** 提交时按申请数量估的退款（不是结算金额） */
   refundCents: number
   refundText: string
   reason: string
   createdAt: string | null
   progress: AfterSaleProgressVO | null
   receipts: AfterSaleReceiptVO[] | null
+  /** 已生成的模拟退款；没退过是 null */
+  refund: AfterSaleRefundVO | null
   decision: AfterSaleDecisionVO | null
   events: AfterSaleEventVO[] | null
 }
@@ -316,6 +338,26 @@ export function receiveAdminReturn(
       },
       signal,
     },
+  )
+}
+
+/**
+ * 模拟退款（B3）。
+ *
+ * 只有「已批准且全部实收」的退货单能退；金额由**服务端**按
+ * 原订单成交单价 × 累计实收算出来，请求体里没有金额字段
+ * （前端传不了，也改不了）。
+ *
+ * 一张退货单最多一笔：重复调用返回 409 `REFUND_ALREADY_EXISTS`，
+ * 消息里带着已存在的那张退款单号。**不要**当成成功，去读详情核对即可。
+ */
+export function refundAdminReturn(
+  returnNo: string,
+  signal?: AbortSignal,
+): Promise<AfterSaleReturnVO> {
+  return requestJson<AfterSaleReturnVO>(
+    `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}/refund`,
+    { method: 'POST', signal },
   )
 }
 

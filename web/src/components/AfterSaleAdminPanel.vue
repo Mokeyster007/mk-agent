@@ -1,14 +1,16 @@
 <script setup lang="ts">
 /**
- * 客服售后详情抽屉（B1 决策 + B2 收货验货）。
+ * 客服售后详情抽屉（B1 决策 + B2 收货验货 + B3 模拟退款）。
  *
  * 只显示服务端返回的事实：
  * - 退货单号、买家、商品、数量、金额、原因、来源；
  * - 决策记录（谁在什么时候、批准还是驳回、驳回原因）；
  * - 收货进度（批准 / 已收 / 还可收）与每一批的验货结果；
+ * - 模拟退款记录（单号、金额、操作人、时间）；
  * - 处理记录（提交 → 决策，一个动作一条）。
  *
- * 仍然不显示"已退款"——B2 只做到收货验货与可售库存回补，退款是后续阶段。
+ * 退款是**模拟**的：文案只说"模拟退款"，不写"已到账""已原路退回"——
+ * 这个 demo 没有接支付平台，写那句话就是骗人。
  */
 import { computed, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
@@ -79,7 +81,7 @@ function signed(value: number): string {
         <dd>{{ value.quantity }} 件</dd>
       </div>
       <div class="fact">
-        <dt>预计退款</dt>
+        <dt>预计退款（按申请数量估）</dt>
         <dd>{{ value.refundText }}</dd>
       </div>
       <div class="fact">
@@ -144,6 +146,22 @@ function signed(value: number): string {
       </ol>
     </section>
 
+    <section v-if="value.refund" class="refund" data-refund>
+      <h3 class="section__title">{{ value.refund.label }}</h3>
+      <p class="refund__amount">
+        <strong class="mono" data-refund-amount>{{ value.refund.amountText }}</strong>
+        <span class="refund__no mono">{{ value.refund.refundNo }}</span>
+      </p>
+      <p class="refund__meta">
+        {{ formatDateTime(value.refund.createdAt) }}
+        <span class="mono">· {{ value.refund.operatorId }}</span>
+      </p>
+      <p class="refund__meta refund__meta--muted">
+        按「原订单成交单价 × 累计实收」结算（含损坏件）。这是模拟退款，不接支付平台、没有真实资金流；
+        可售库存与可退额度都没有变化。
+      </p>
+    </section>
+
     <section v-if="value.decision" class="decision" data-decision>
       <h3 class="section__title">决策记录</h3>
       <p class="decision__line">
@@ -166,6 +184,10 @@ function signed(value: number): string {
       <p class="hint-block__text">
         在列表里点「收货」登记这一批的实收 / 合格 / 损坏。还可收
         <strong class="mono">{{ value.progress?.remainingQty ?? 0 }}</strong> 件；只有合格数量回补可售库存。
+      </p>
+      <p v-if="!value.refund" class="hint-block__text">
+        收满（{{ value.progress?.receivedQty ?? 0 }}/{{ value.progress?.approvedQty ?? 0 }}）之后，
+        列表里会出现「模拟退款」按钮。
       </p>
     </section>
 
@@ -226,8 +248,9 @@ function signed(value: number): string {
     </section>
 
     <p class="foot">
-      B2 停在收货验货与可售库存回补：只有合格数量增加可售库存，损坏只留记录、不建残次库存；
-      收货**不释放**买家可退额度，也没有产生退款。退款与通知属于后续阶段。
+      B3 停在模拟退款：只有「已批准且全部实收」的退货单能生成一笔退款记录，金额按
+      「原订单成交单价 × 累计实收」结算。退款不动可售库存、不写第二条入库流水、不释放可退额度，
+      也不接支付平台——这里没有真实资金流，所以只写「模拟退款」，不写任何资金已结清的措辞。
     </p>
   </aside>
 </template>
@@ -503,6 +526,45 @@ function signed(value: number): string {
   border: 1px solid var(--c-line-soft);
   border-radius: var(--r-md);
   background: var(--c-accent-weak);
+}
+
+.refund {
+  display: grid;
+  gap: 4px;
+  padding: var(--s-3);
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--r-md);
+  background: var(--c-ok-weak);
+}
+
+.refund__amount {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+}
+
+.refund__amount strong {
+  font-size: var(--fs-lg);
+  color: var(--c-ok);
+}
+
+.refund__no {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  overflow-wrap: anywhere;
+}
+
+.refund__meta {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: var(--lh-base);
+}
+
+.refund__meta--muted {
+  color: var(--c-text-3);
 }
 
 .hint-block__text {

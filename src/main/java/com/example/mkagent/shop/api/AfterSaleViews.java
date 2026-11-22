@@ -7,6 +7,7 @@ import com.example.mkagent.shop.aftersale.AfterSalePreview;
 import com.example.mkagent.shop.aftersale.AfterSaleQuota;
 import com.example.mkagent.shop.aftersale.AfterSaleReceipt;
 import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 
@@ -23,6 +24,14 @@ import java.util.List;
  * （前端 {@code formatDateTime} 直接吃 {@code 2026-11-22T10:00:00}）。
  */
 public final class AfterSaleViews {
+
+    /**
+     * 模拟退款的固定中文标签（页面、接口、工具共用同一句口径）。
+     *
+     * <p>刻意不叫"退款"：本轮不接支付平台，没有任何资金到账，
+     * 少一个字就会让买家以为钱已经退回来了。
+     */
+    public static final String LABEL_SIMULATED_REFUND = "模拟退款";
 
     private AfterSaleViews() {
     }
@@ -109,11 +118,30 @@ public final class AfterSaleViews {
     }
 
     /**
+     * 模拟退款（B3）。
+     *
+     * <p>{@code label} 固定为「模拟退款」：这是**业务上的退款记录**，
+     * 不是资金到账。页面与工具都必须按这个口径说，不能对买家说"钱已退回"。
+     *
+     * @param amountCents 退款金额（分）= 原订单成交单价 × 累计实收数量
+     */
+    public record RefundVO(
+            String refundNo,
+            long amountCents,
+            String amountText,
+            String operatorId,
+            LocalDateTime createdAt,
+            String label
+    ) {
+    }
+
+    /**
      * 退货申请。
      *
      * @param buyerId  买家身份（客服视角需要它定位是谁的单；对买家自己无隐私问题）
      * @param progress 收货进度；非「已批准」状态为 {@code null}
      * @param receipts 收货记录；列表接口为 {@code null}（未加载），详情接口为数组
+     * @param refund   模拟退款；没退过款时为 {@code null}
      * @param events   事件流；列表接口为 {@code null}（未加载），详情接口为数组
      * @param decision 决策记录；列表接口与未决策时为 {@code null}
      */
@@ -136,6 +164,7 @@ public final class AfterSaleViews {
             LocalDateTime createdAt,
             ProgressVO progress,
             List<ReceiptVO> receipts,
+            RefundVO refund,
             DecisionVO decision,
             List<EventVO> events
     ) {
@@ -203,13 +232,18 @@ public final class AfterSaleViews {
      *
      * <p>进度会带上：列表需要显示"已批准 / 部分收货 / 全部收货"，
      * 它是**一次批量查询**算出来的（见 {@code AfterSaleService#progressOf}），
-     * 不是每行一次查询。
+     * 不是每行一次查询。退款同理（{@code refundsOf}）：列表要据此决定
+     * 显示「模拟退款」按钮还是"已退款"标签。
      */
-    public static ReturnVO summary(AfterSaleReturn value, AfterSaleReceiptProgress progress) {
-        return render(value, null, null, progress, null);
+    public static ReturnVO summary(
+            AfterSaleReturn value,
+            AfterSaleReceiptProgress progress,
+            AfterSaleRefund refund
+    ) {
+        return render(value, null, null, progress, null, refund);
     }
 
-    /** 详情用：退货单 + 事件 + 决策 + 进度 + 每批收货（含入库流水）。 */
+    /** 详情用：退货单 + 事件 + 决策 + 进度 + 每批收货（含入库流水）+ 模拟退款。 */
     public static ReturnVO detail(AfterSaleService.ReturnDetail detail) {
         List<ReceiptVO> receipts = detail.receipts().stream()
                 .map(AfterSaleViews::receipt)
@@ -220,7 +254,8 @@ public final class AfterSaleViews {
                 detail.events().stream().map(AfterSaleViews::event).toList(),
                 decision == null ? null : decision(decision),
                 detail.progress(),
-                receipts);
+                receipts,
+                detail.refund());
     }
 
     public static ProgressVO progress(AfterSaleReceiptProgress progress) {
@@ -245,12 +280,29 @@ public final class AfterSaleViews {
                 value.movement() == null ? null : ShopViews.movement(value.movement()));
     }
 
+    /**
+     * 模拟退款映射。
+     *
+     * <p>金额文案在这里算一次：{@code ¥598.00}。前端不再自己除 100，
+     * 避免"列表一个数、详情另一个数"。
+     */
+    public static RefundVO refund(AfterSaleRefund value) {
+        return new RefundVO(
+                value.refundNo(),
+                value.amountCents(),
+                ShopViews.money(value.amountCents()),
+                value.operatorId(),
+                value.createdAt(),
+                LABEL_SIMULATED_REFUND);
+    }
+
     private static ReturnVO render(
             AfterSaleReturn value,
             List<EventVO> events,
             DecisionVO decision,
             AfterSaleReceiptProgress progress,
-            List<ReceiptVO> receipts
+            List<ReceiptVO> receipts,
+            AfterSaleRefund refund
     ) {
         return new ReturnVO(
                 value.returnNo(),
@@ -271,6 +323,7 @@ public final class AfterSaleViews {
                 value.createdAt(),
                 progress == null ? null : progress(progress),
                 receipts,
+                refund == null ? null : refund(refund),
                 decision,
                 events);
     }

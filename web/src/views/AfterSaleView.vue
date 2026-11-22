@@ -373,6 +373,16 @@ onMounted(async () => {
                   {{ formatDateTime(item.createdAt) }}
                 </p>
                 <p class="return__reason">原因：{{ item.reason }}</p>
+                <p
+                  v-if="item.refund"
+                  class="return__refund"
+                  :data-refund-for="item.returnNo"
+                >
+                  {{ item.refund.label }} {{ item.refund.amountText }}
+                  <span class="return__refund-note">
+                    （{{ item.refund.refundNo }} · 模拟流程，不会真的打款）
+                  </span>
+                </p>
                 <p v-if="item.status === 'REJECTED'" class="return__decision" data-reject-note>
                   客服已驳回，本次申请占用的额度已释放；驳回原因在详情里。
                 </p>
@@ -403,7 +413,9 @@ onMounted(async () => {
         <p class="foot-note">
           B1 起客服会批准或驳回：批准保留原额度，驳回释放本单占用的额度。
           批准后仓库会分批收货验货，只有合格数量回补可售库存，损坏只留记录；
-          收货不释放额度，退款仍在后续阶段。
+          收货不释放额度。
+          B3 起全部收满后客服会生成一笔<strong>模拟退款</strong>：金额按「成交单价 × 累计实收」结算，
+          不动库存、不释放额度、不接支付平台——这里没有真实资金流，页面上不会出现任何资金已结清的措辞。
         </p>
       </div>
     </div>
@@ -599,6 +611,16 @@ onMounted(async () => {
   font-size: var(--fs-xs);
   color: var(--c-text-2);
   overflow-wrap: anywhere;
+}
+
+.return__refund {
+  font-size: var(--fs-xs);
+  color: var(--c-ok);
+  overflow-wrap: anywhere;
+}
+
+.return__refund-note {
+  color: var(--c-text-3);
 }
 
 .return__decision {

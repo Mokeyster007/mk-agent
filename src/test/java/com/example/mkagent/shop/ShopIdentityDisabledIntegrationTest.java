@@ -156,7 +156,7 @@ class ShopIdentityDisabledIntegrationTest {
      * 而不是 {@code NOT_ADMIN}（权限不足）——先解释"为什么不行"。
      */
     @Test
-    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回、收货都不放行")
+    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回、收货、模拟退款都不放行")
     void afterSaleAdminEntriesRejected() {
         ShopApiClient.Reply list = api.get("/shop/admin/aftersale/returns", ADMIN);
         assertEquals(403, list.status(), list.raw());
@@ -183,6 +183,16 @@ class ShopIdentityDisabledIntegrationTest {
         assertEquals(403, receive.status(), receive.raw());
         assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", receive.text("code"));
 
+        /*
+         * B3：模拟退款虽然是"模拟"，但它会落一条不可重复的退款记录（一张退货单最多一笔）。
+         * 身份不可信时放行，等于谁都能把别人的退货单标成"已退款"，
+         * 而且这个标记一旦落下就没有第二笔来纠正——所以同样必须在这里先拒绝。
+         */
+        ShopApiClient.Reply refund = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/refund", ADMIN, null);
+        assertEquals(403, refund.status(), refund.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", refund.text("code"));
+
         Integer decisions = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM shop_aftersale_decision", Integer.class);
         assertEquals(0, decisions, "被拒绝的请求不得留下决策记录");
@@ -190,5 +200,9 @@ class ShopIdentityDisabledIntegrationTest {
         Integer receipts = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM shop_aftersale_receipt", Integer.class);
         assertEquals(0, receipts, "被拒绝的请求不得留下收货记录");
+
+        Integer refunds = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_refund", Integer.class);
+        assertEquals(0, refunds, "被拒绝的请求不得留下退款记录");
     }
 }

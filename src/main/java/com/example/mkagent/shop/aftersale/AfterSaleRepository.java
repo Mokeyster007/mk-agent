@@ -120,6 +120,20 @@ public class AfterSaleRepository {
                     rs.getString("operator_id"),
                     toLocal(rs.getTimestamp("created_at")));
 
+    private static final String SELECT_REFUND = """
+            SELECT id, refund_no, return_id, amount_cents, operator_id, created_at
+            FROM shop_aftersale_refund
+            """;
+
+    private static final RowMapper<AfterSaleRefund> REFUND_MAPPER = (rs, rowNum) ->
+            new AfterSaleRefund(
+                    rs.getLong("id"),
+                    rs.getString("refund_no"),
+                    rs.getLong("return_id"),
+                    rs.getLong("amount_cents"),
+                    rs.getString("operator_id"),
+                    toLocal(rs.getTimestamp("created_at")));
+
     private final JdbcTemplate jdbcTemplate;
 
     public AfterSaleRepository(JdbcTemplate jdbcTemplate) {
@@ -274,8 +288,11 @@ public class AfterSaleRepository {
      */
     public Optional<LockedItem> lockOrderItem(long orderItemId) {
         List<LockedItem> rows = jdbcTemplate.query(
-                "SELECT id, quantity FROM shop_order_item WHERE id = ? FOR UPDATE",
-                (rs, rowNum) -> new LockedItem(rs.getLong("id"), rs.getInt("quantity")),
+                "SELECT id, quantity, unit_price_cents FROM shop_order_item WHERE id = ? FOR UPDATE",
+                (rs, rowNum) -> new LockedItem(
+                        rs.getLong("id"),
+                        rs.getInt("quantity"),
+                        rs.getLong("unit_price_cents")),
                 orderItemId);
         return rows.stream().findFirst();
     }
@@ -535,6 +552,74 @@ public class AfterSaleRepository {
     }
 
     // ---------------------------------------------------------------
+    // B3：模拟退款
+    // ---------------------------------------------------------------
+
+    /** 某退货单的模拟退款（没有则空；一张退货单最多一笔）。 */
+    public Optional<AfterSaleRefund> findRefundByReturnId(long returnId) {
+        return jdbcTemplate.query(
+                SELECT_REFUND + " WHERE return_id = ?",
+                REFUND_MAPPER,
+                returnId).stream().findFirst();
+    }
+
+    /**
+     * 一批退货单的模拟退款（列表 / 工具用，避免每行一次查询）。
+     *
+     * @return key = return_id；没退过款的退货单不出现在结果里
+     */
+    public java.util.Map<Long, AfterSaleRefund> findRefundsByReturns(List<Long> returnIds) {
+        if (returnIds == null || returnIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(returnIds.size(), "?"));
+        java.util.Map<Long, AfterSaleRefund> result = new java.util.HashMap<>();
+        jdbcTemplate.query(
+                SELECT_REFUND + " WHERE return_id IN (" + placeholders + ")",
+                rs -> {
+                    AfterSaleRefund refund = REFUND_MAPPER.mapRow(rs, 0);
+                    result.put(refund.returnId(), refund);
+                },
+                returnIds.toArray());
+        return result;
+    }
+
+    /**
+     * 写一笔模拟退款，返回自增 id。
+     *
+     * <p>{@code uk(return_id)} 是"一张退货单最多一笔"的数据库兜底：
+     * 并发重复退款时只有一个能插入成功，输的那个由服务层翻译成 409。
+     *
+     * @throws org.springframework.dao.DuplicateKeyException 这张退货单已经退过款
+     */
+    public long insertRefund(
+            String refundNo,
+            long returnId,
+            long amountCents,
+            String operatorId
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_refund
+                    (refund_no, return_id, amount_cents, operator_id, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, refundNo, returnId, amountCents, operatorId);
+
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM shop_aftersale_refund WHERE refund_no = ?", Long.class, refundNo);
+        if (id == null) {
+            throw new IllegalStateException("模拟退款记录插入后取不到 id：" + refundNo);
+        }
+        return id;
+    }
+
+    public Optional<AfterSaleRefund> findRefundById(long refundId) {
+        return jdbcTemplate.query(
+                SELECT_REFUND + " WHERE id = ?",
+                REFUND_MAPPER,
+                refundId).stream().findFirst();
+    }
+
+    // ---------------------------------------------------------------
     // 写：表单幂等记录
     // ---------------------------------------------------------------
 
@@ -576,10 +661,11 @@ public class AfterSaleRepository {
     /**
      * 事务里锁住的订单行。
      *
-     * @param id       订单行 id
-     * @param quantity 已购数量（额度上限）
+     * @param id             订单行 id
+     * @param quantity       已购数量（额度上限）
+     * @param unitPriceCents 成交单价快照（分）；模拟退款按它算，**不读请求、不读退货单估算值**
      */
-    public record LockedItem(long id, int quantity) {
+    public record LockedItem(long id, int quantity, long unitPriceCents) {
     }
 
     /**

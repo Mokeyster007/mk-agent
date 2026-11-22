@@ -6,6 +6,7 @@ import com.example.mkagent.shop.ShopProperties;
 import com.example.mkagent.shop.aftersale.AfterSaleDecisionWriter;
 import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
 import com.example.mkagent.shop.aftersale.AfterSaleReceiptWriter;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.aftersale.AfterSaleStatus;
@@ -116,9 +117,11 @@ public class ShopAfterSaleAdminController {
         List<AfterSaleReturn> values =
                 afterSaleService.adminReturns(normalized, safeSize, (safePage - 1) * safeSize);
         Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(values);
 
         List<ReturnVO> items = values.stream()
-                .map(value -> AfterSaleViews.summary(value, progress.get(value.id())))
+                .map(value -> AfterSaleViews.summary(
+                        value, progress.get(value.id()), refunds.get(value.id())))
                 .toList();
 
         return new PageVO<>(items, safePage, safeSize, afterSaleService.adminReturnCount(normalized));
@@ -212,6 +215,28 @@ public class ShopAfterSaleAdminController {
                 request.damagedQty(),
                 request.note(),
                 request.clientRequestId());
+
+        return AfterSaleViews.detail(afterSaleService.detail(requireReturn(returnNo)));
+    }
+
+    /**
+     * 模拟退款（B3）：为一张"已批准 + 全部收货"的退货单生成一笔退款记录。
+     *
+     * <p><b>没有请求体</b>：金额由服务端按"原订单成交单价 × 累计实收数量"算，
+     * 客户端传不进来，也就无从改价。
+     *
+     * <p>重复调用 → 409 {@code REFUND_ALREADY_EXISTS}（一张退货单最多一笔）。
+     * 退款**不动可售库存、不写第二条入库流水、不释放可退额度**——
+     * 那三件事分别属于 B2 收货与 B1 驳回。
+     *
+     * <p>本轮不接支付平台：这里只落一条"模拟退款"记录，没有真实资金流。
+     */
+    @PostMapping("/returns/{returnNo}/refund")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReturnVO refund(@PathVariable String returnNo) {
+        String operatorId = accessGuard.requireAdmin();
+
+        afterSaleService.refund(operatorId, returnNo);
 
         return AfterSaleViews.detail(afterSaleService.detail(requireReturn(returnNo)));
     }

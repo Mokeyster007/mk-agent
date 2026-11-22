@@ -214,6 +214,47 @@ SELECT * FROM shop_inventory_movement WHERE receipt_id = ?   -- 整批损坏时 
 所以参数校验、幂等预检、`DuplicateKeyException` 之后的回查都在事务外，
 只有"写事实"那一段在事务里。
 
+### 4.4 B3 阶段回补：最后一批收货的幂等边界（缺陷 + 修法）
+
+**缺陷**：拿锁后的顺序原本是"先判超收、再插收货记录"，而幂等键只在事务外预检过。
+两个同键同参请求都可能在预检时看不到记录（赢家还没提交），而这一批**正好把批准数量收满**：
+
+```
+A: 预检无记录 → 拿锁 → 累计实收 0，1+0 ≤ 1 → 插入 → 提交（累计实收 = 1）
+B: 预检无记录（A 未提交）→ 拿锁 → 累计实收 1，1+1 > 1 → 409 RECEIPT_OVER_APPROVED
+```
+
+B 其实只是一次重试，却被告知"超收"。调用方无法区分"我多收了"和"这一批已经成功"。
+
+**修法**（最小改动，只调顺序）：拿锁后**先**按 `request_key` 查同次操作是否已落库，
+命中就核对 `request_hash` 并回放原记录，**未命中才**判状态与可收数量：
+
+```java
+AfterSaleReturn fresh = repository.findReturnByNo(returnNo).orElseThrow(...);
+
+Optional<StoredReceipt> existing = repository.findReceiptByRequestKey(requestKey);
+if (existing.isPresent()) {
+    return replay(existing.get(), requestHash);   // 重试 → 回放原记录
+}
+
+requireApproved(fresh);                            // 新收货 → 才判状态与数量
+int alreadyReceived = repository.sumReceivedQty(fresh.id());
+if (alreadyReceived + receivedQty > fresh.quantity()) { ... 409 ... }
+```
+
+`replay(...)` 抽成 `static`，事务外预检与锁内回放共用同一份实现（哈希不一致 → 409
+`RECEIPT_REQUEST_CONFLICT`），两处口径不会漂移。
+
+**语义变得干净**：同一次操作的重试 → 回放；真的想多收 → 409。
+
+**定向验收**（`AfterSaleReceiptPostgresTest`）：
+
+| 场景 | 期望 | 用例 |
+| --- | --- | --- |
+| 同键同参并发 + 这一批正好收满 | 两次都 201、指向同一条记录、只入库一次、额度不变 | `concurrentSameKeyWritesOnce` |
+| 同键不同参 | 409 `RECEIPT_REQUEST_CONFLICT`，零写入 | `AfterSaleReceiptIntegrationTest` |
+| 不同键争最后一件 | 一个 201、一个 409 `RECEIPT_OVER_APPROVED`，累计不超批准数量 | `concurrentReceiptsCannotOverReceive` |
+
 ---
 
 ## 5. 旧库升级（不清库）
@@ -316,7 +357,7 @@ DROP INDEX IF EXISTS uk_shop_inventory_movement_source;
 | 用例 | 断言 |
 | --- | --- |
 | 两个请求争最后一件 | 一个成功、一个 409；累计不超过批准数量 |
-| 同键并发 | 只落一条记录、只加一次库存 |
+| 同键并发 | 只落一条记录、只加一次库存；**这一批正好收满时两次都成功**（B3 阶段修复，见 4.4） |
 | 两批都在上限内并发 | 各自入库，互不覆盖 |
 | 库存已加后写流水失败 | 收货记录、库存、流水一起回滚（回调里先读到"已加过"） |
 
@@ -400,8 +441,9 @@ cd web && node tools/e2e-aftersale-receipt.mjs
 
 ## 10. 限制与未验证项
 
-- **不做退款**：本轮停在"货收进来了、可售库存回补了"。退款是资金动作，
-  应该与收货**分开事务**（退款失败不该让收货回滚）。
+- **本轮不做退款**：B2 停在"货收进来了、可售库存回补了"。退款是资金动作，
+  应该与收货**分开事务**（退款失败不该让收货回滚）——B3 已按这条边界实现「模拟退款」，
+  见 [`docs/shop-b3.md`](shop-b3.md)：独立表、独立事务、不动库存与额度。
 - **不建残次库存**：损坏数量只留在收货记录里，没有"残次品仓"、没有二次上架流程。
 - **单仓**：没有多仓 / 分仓，`shop_inventory` 仍是"一个 SKU 一行"。
 - **多实例**：并发正确性由数据库行锁 + 条件更新保证（不依赖 JVM 内锁），

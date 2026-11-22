@@ -68,7 +68,7 @@ export function describeAfterSaleError(error: unknown): string {
     case 'RETURN_WRITE_CONFLICT':
       return '退货单写入冲突（不是重复提交），本次提交没有生效。请重新提交；若反复出现请联系管理员。'
     case 'REFUND_AMOUNT_OUT_OF_RANGE':
-      return '退款金额超出可表示范围，请减少退货数量后重新提交。'
+      return '退款金额超出可表示范围：请核对成交单价与实收数量（金额按整数分计算）。'
     case 'ALREADY_APPROVED':
       return '这一单已经是「已批准」，重复操作不会产生新的决策或额度变化。请以详情里的决策记录为准。'
     case 'ALREADY_REJECTED':
@@ -93,6 +93,14 @@ export function describeAfterSaleError(error: unknown): string {
       return '收货记录写入冲突（不是重复提交），本次收货没有生效。请重新提交；若反复出现请联系管理员。'
     case 'INVALID_RECEIPT_NOTE':
       return '验货备注最多 200 字。'
+    case 'REFUND_NOT_ALLOWED':
+      return '只有「已批准」的退货单才能模拟退款：待审批的还没同意退，已驳回的本来就不退钱。'
+    case 'REFUND_NOT_RECEIVED':
+      return '还没收满批准数量，不能模拟退款：必须全部实收（含损坏件）之后才能结算。'
+    case 'REFUND_ALREADY_EXISTS':
+      return '这张退货单已经生成过一笔模拟退款，重复操作不会产生第二笔。请以详情里的退款记录为准。'
+    case 'REFUND_AMOUNT_MISMATCH':
+      return '退货单上的单价快照与订单行成交单价不一致，已拒绝退款（没有写入任何金额）。请联系管理员核对数据。'
     case 'INVENTORY_ROW_MISSING':
       return '库存行不存在，本次收货已回滚（库存没有变化）。请联系管理员核对商品库存。'
     case 'NOT_ADMIN':

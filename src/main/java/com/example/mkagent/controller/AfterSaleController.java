@@ -3,6 +3,7 @@ package com.example.mkagent.controller;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopAccessGuard;
 import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.api.AfterSaleViews;
@@ -128,7 +129,8 @@ public class AfterSaleController {
     /**
      * 我的售后列表（新的在前，不含事件流与收货明细）。
      *
-     * <p>进度会带上：买家需要一眼看出"仓库收了没有"。
+     * <p>进度会带上：买家需要一眼看出"仓库收了没有"；退款也会带上，
+     * 让他知道这张单有没有生成过**模拟退款**（不代表资金到账）。
      */
     @GetMapping("/returns")
     public List<ReturnVO> myReturns() {
@@ -136,9 +138,11 @@ public class AfterSaleController {
 
         List<AfterSaleReturn> values = afterSaleService.myReturns(buyerId);
         Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(values);
 
         return values.stream()
-                .map(value -> AfterSaleViews.summary(value, progress.get(value.id())))
+                .map(value -> AfterSaleViews.summary(
+                        value, progress.get(value.id()), refunds.get(value.id())))
                 .toList();
     }
 

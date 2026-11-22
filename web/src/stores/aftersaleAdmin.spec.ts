@@ -23,6 +23,7 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
     createdAt: '2026-11-22T10:15:00',
     progress: null,
     receipts: null,
+    refund: null,
     decision: null,
     events: null,
     ...overrides,
@@ -70,6 +71,22 @@ function buildDeps(overrides: Partial<AfterSaleAdminDeps> = {}): AfterSaleAdminD
         statusLabel: '已批准',
         progress: { code: 'PARTIAL', label: '部分收货', approvedQty: 2, receivedQty: 1, remainingQty: 1 },
         receipts: [],
+      }),
+    ),
+    refund: vi.fn().mockResolvedValue(
+      returnOf({
+        status: 'APPROVED',
+        statusLabel: '已批准',
+        progress: { code: 'COMPLETE', label: '全部收货', approvedQty: 2, receivedQty: 2, remainingQty: 0 },
+        receipts: [],
+        refund: {
+          refundNo: 'RF20261122120000-1A2B',
+          amountCents: 59800,
+          amountText: '¥598.00',
+          operatorId: 'music-admin-1',
+          createdAt: '2026-11-22T12:00:00',
+          label: '模拟退款',
+        },
       }),
     ),
     ...overrides,
@@ -337,6 +354,98 @@ describe('客服售后 store', () => {
     const second = await store.approve('RT20261122101500-00A1')
     expect(second).toBeNull()
     expect(deps.approve).not.toHaveBeenCalled()
+
+    holder.resolve!(returnOf({ status: 'APPROVED', statusLabel: '已批准' }))
+    await first
+    expect(store.state.busyReturnNo).toBeNull()
+  })
+
+  // ---------------------------------------------------------------
+  // B3 模拟退款
+  // ---------------------------------------------------------------
+
+  it('模拟退款成功：详情换成带退款记录的单据，提示写明是模拟、且库存额度未变', async () => {
+    const deps = buildDeps()
+    const store = createAfterSaleAdminStore(deps)
+
+    const updated = await store.refund('RT20261122101500-00A1')
+
+    expect(deps.refund).toHaveBeenCalledWith('RT20261122101500-00A1')
+    expect(updated?.refund?.amountText).toBe('¥598.00')
+    expect(store.state.detail?.refund?.refundNo).toBe('RF20261122120000-1A2B')
+    expect(store.state.notice).toContain('模拟退款 ¥598.00')
+    expect(store.state.notice).toContain('RF20261122120000-1A2B')
+    // 不许出现"到账"这类没发生过的说法
+    expect(store.state.notice).not.toContain('到账')
+    expect(deps.list).toHaveBeenCalled()
+    expect(store.state.busyReturnNo).toBeNull()
+    expect(store.state.busyAction).toBeNull()
+  })
+
+  it('重复退款 409：先重读详情与列表，再写错误，不重试', async () => {
+    const already = returnOf({
+      status: 'APPROVED',
+      statusLabel: '已批准',
+      progress: { code: 'COMPLETE', label: '全部收货', approvedQty: 2, receivedQty: 2, remainingQty: 0 },
+      refund: {
+        refundNo: 'RF20261122120000-1A2B',
+        amountCents: 59800,
+        amountText: '¥598.00',
+        operatorId: 'music-admin-1',
+        createdAt: '2026-11-22T12:00:00',
+        label: '模拟退款',
+      },
+    })
+
+    const deps = buildDeps({
+      refund: vi.fn().mockRejectedValue(
+        new ApiError('conflict', { status: 409, code: 'REFUND_ALREADY_EXISTS' }),
+      ),
+      detail: vi.fn().mockResolvedValue(already),
+    })
+    const store = createAfterSaleAdminStore(deps)
+
+    const result = await store.refund('RT20261122101500-00A1')
+
+    expect(result).toBeNull()
+    expect(deps.refund).toHaveBeenCalledTimes(1)
+    expect(deps.detail).toHaveBeenCalledWith('RT20261122101500-00A1')
+    // 详情里能看到真实的那一笔，用户不会以为"操作失败什么都没发生"
+    expect(store.state.detail?.refund?.refundNo).toBe('RF20261122120000-1A2B')
+    expect(store.state.error).toContain('已经生成过一笔模拟退款')
+    expect(store.state.notice).toBeNull()
+  })
+
+  it('未收满就退款：错误文案说清楚"必须先全部实收"', async () => {
+    const deps = buildDeps({
+      refund: vi.fn().mockRejectedValue(
+        new ApiError('conflict', { status: 409, code: 'REFUND_NOT_RECEIVED' }),
+      ),
+    })
+    const store = createAfterSaleAdminStore(deps)
+
+    await store.refund('RT20261122101500-00A1')
+
+    expect(store.state.error).toContain('还没收满批准数量')
+    expect(store.state.error).toContain('不能模拟退款')
+  })
+
+  it('退款与收货共用忙碌标记：处理中不接受第二个写动作', async () => {
+    const holder: { resolve?: (value: AfterSaleReturnVO) => void } = {}
+    const refund = vi.fn().mockImplementation(
+      () => new Promise<AfterSaleReturnVO>((resolve) => {
+        holder.resolve = resolve
+      }),
+    )
+    const deps = buildDeps({ refund })
+    const store = createAfterSaleAdminStore(deps)
+
+    const first = store.refund('RT20261122101500-00A1')
+    await vi.waitFor(() => expect(holder.resolve).toBeTypeOf('function'))
+
+    const second = await store.refund('RT20261122101500-00A1')
+    expect(second).toBeNull()
+    expect(deps.refund).toHaveBeenCalledTimes(1)
 
     holder.resolve!(returnOf({ status: 'APPROVED', statusLabel: '已批准' }))
     await first

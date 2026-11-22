@@ -3,9 +3,12 @@ package com.example.mkagent.tools;
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
 import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.aftersale.ReturnSubject;
+import com.example.mkagent.shop.api.AfterSaleViews;
+import com.example.mkagent.shop.api.ShopViews;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -129,8 +132,9 @@ public class AfterSaleQueryTool {
         List<Object> returns = new ArrayList<>();
         List<AfterSaleReturn> existingReturns = afterSaleService.returnsOfOrderItem(value.orderItemId());
         Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(existingReturns);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(existingReturns);
         for (AfterSaleReturn existing : existingReturns) {
-            returns.add(toReturnRow(existing, progress.get(existing.id())));
+            returns.add(toReturnRow(existing, progress.get(existing.id()), refunds.get(existing.id())));
         }
 
         return ToolResponseEnvelope.okSingle(new OrderDetailRow(
@@ -200,7 +204,13 @@ public class AfterSaleQueryTool {
                     receiptProgress / receiptProgressLabel（NONE/PARTIAL/COMPLETE，
                     未收货 / 部分收货 / 全部收货）；未批准时这些字段为 null。
 
-                    本轮没有退款：不要回答"已退款"。
+                    退款字段（只读）：refundNo（模拟退款单号）、refundAmountCents /
+                    refundAmountText（金额，分 / ¥ 文案）、refundLabel（固定为"模拟退款"）。
+                    它们为 null 表示这单还没有退款记录。
+
+                    口径必须说对：这是**模拟退款**，只代表业务上生成了一条退款记录，
+                    没有真实资金流、没有到账。不要说"钱已退回"或"已到账"；
+                    也不要因为收了货就回答"已退款"——退款是单独一步。
                     """
     )
     public String listMyReturnRequests(
@@ -214,11 +224,12 @@ public class AfterSaleQueryTool {
         List<Object> rows = new ArrayList<>();
         List<AfterSaleReturn> values = afterSaleService.myReturns(userId);
         Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(values);
         for (AfterSaleReturn value : values) {
             if (!filter.isEmpty() && !filter.equals(value.orderNo())) {
                 continue;
             }
-            rows.add(toReturnRow(value, progress.get(value.id())));
+            rows.add(toReturnRow(value, progress.get(value.id()), refunds.get(value.id())));
         }
 
         if (rows.isEmpty()) {
@@ -230,10 +241,15 @@ public class AfterSaleQueryTool {
     /**
      * 退货申请 → 工具行。
      *
-     * <p>收货进度对模型是**只读事实**：{@code receiptProgress} 为空表示这单还没批准，
-     * 模型应当据此说明"还在等客服处理"，而不是编造"已入库"。
+     * <p>收货进度与退款对模型都是**只读事实**：{@code receiptProgress} 为空表示这单还没批准，
+     * 模型应当据此说明"还在等客服处理"，而不是编造"已入库"；
+     * {@code refundNo} 为空表示还没退款，不能因为收满了就推断"已退款"。
      */
-    private static ReturnRow toReturnRow(AfterSaleReturn value, AfterSaleReceiptProgress progress) {
+    private static ReturnRow toReturnRow(
+            AfterSaleReturn value,
+            AfterSaleReceiptProgress progress,
+            AfterSaleRefund refund
+    ) {
         return new ReturnRow(
                 value.returnNo(),
                 value.orderNo(),
@@ -246,7 +262,11 @@ public class AfterSaleQueryTool {
                 progress == null ? null : progress.receivedQty(),
                 progress == null ? null : progress.remainingQty(),
                 progress == null ? null : progress.code(),
-                progress == null ? null : progress.label());
+                progress == null ? null : progress.label(),
+                refund == null ? null : refund.refundNo(),
+                refund == null ? null : refund.amountCents(),
+                refund == null ? null : ShopViews.money(refund.amountCents()),
+                refund == null ? null : AfterSaleViews.LABEL_SIMULATED_REFUND);
     }
 
     @Tool(
@@ -334,7 +354,11 @@ public class AfterSaleQueryTool {
             Integer receivedQty,
             Integer remainingQty,
             String receiptProgress,
-            String receiptProgressLabel
+            String receiptProgressLabel,
+            String refundNo,
+            Long refundAmountCents,
+            String refundAmountText,
+            String refundLabel
     ) {
     }
 

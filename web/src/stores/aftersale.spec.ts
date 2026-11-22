@@ -56,6 +56,7 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
     createdAt: '2026-11-22T10:15:00',
     progress: null,
     receipts: null,
+    refund: null,
     decision: null,
     events: null,
     ...overrides,
@@ -117,6 +118,21 @@ describe('describeAfterSaleError', () => {
       '服务端处理失败，请稍后重试。',
     )
     expect(describeAfterSaleError(new Error('boom'))).toContain('未预期')
+  })
+
+  it('B3 退款错误各有独立文案：未批准 / 未收满 / 已退过 / 单价不一致', () => {
+    expect(describeAfterSaleError(new ApiError('conflict', { code: 'REFUND_NOT_ALLOWED' }))).toContain(
+      '只有「已批准」的退货单才能模拟退款',
+    )
+    expect(describeAfterSaleError(new ApiError('conflict', { code: 'REFUND_NOT_RECEIVED' }))).toContain(
+      '还没收满批准数量',
+    )
+    expect(
+      describeAfterSaleError(new ApiError('conflict', { code: 'REFUND_ALREADY_EXISTS' })),
+    ).toContain('不会产生第二笔')
+    expect(
+      describeAfterSaleError(new ApiError('conflict', { code: 'REFUND_AMOUNT_MISMATCH' })),
+    ).toContain('单价快照与订单行成交单价不一致')
   })
 })
 

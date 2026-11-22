@@ -73,13 +73,14 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - **价格与归属由服务端决定**：下单请求体只有 `productId` + `quantity`，
   没有价格、没有 buyerId 字段可绑
 - **不依赖大模型**：模型不可用或没配凭据时，商城闭环照常运行
-- **两种数据库都验过**：H2（全量套件，当前 931 项）+ 真实 PostgreSQL 16.15（专项 13 项，
+- **两种数据库都验过**：H2（全量套件，当前 941 项）+ 真实 PostgreSQL 16.15（专项 13 项，
   `./mvnw -Ppg test "-Dtest=ShopPostgres*"`）
 - 详见 [`docs/shop-a0.md`](docs/shop-a0.md) 与 [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)
 
-> 演示付款：`payment_mode = 'DEMO'`，没有真实资金交易、没有退款、没有物流。
-> 售后 A1（退货申请）、B1（客服批准 / 驳回）、B2（仓库收货验货 / 库存回补）已实施，见 1.3、1.4、1.5；
-> 退款仍未实施。
+> 演示付款：`payment_mode = 'DEMO'`，没有真实资金交易、没有物流；
+> 退款只有**模拟**形态（B3，不接支付平台），见 1.6。
+> 售后 A1（退货申请）、B1（客服批准 / 驳回）、B2（仓库收货验货 / 库存回补）、
+> B3（模拟退款）已实施，见 1.3、1.4、1.5、1.6。
 
 ### 1.3 售后（A1：退货申请 + 售后 Agent）
 
@@ -134,7 +135,7 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
   真实 PostgreSQL 16（专项 5 项，`./mvnw -Ppg test "-Dtest=AfterSaleDecisionPostgresTest"`）
 - 详见 [`docs/shop-b1.md`](docs/shop-b1.md)
 
-> B2（收货验货 / 可售库存回补）见 1.5；退款仍未实施。
+> B2（收货验货 / 可售库存回补）见 1.5；B3（模拟退款）见 1.6。
 
 ### 1.5 售后（B2：仓库收货、验货与可售库存回补）
 
@@ -153,7 +154,9 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - **不超收**：与 A1 / B1 **同一把订单行锁**（`SELECT … FOR UPDATE`），
   拿锁后重读累计值；"累计 ≤ 批准数量"是跨行约束，靠串行化点而不是 `CHECK`
 - **幂等**：`clientRequestId` → 同键同参返回**原收货记录**（不重复加库存），
-  同键不同参 409 `RECEIPT_REQUEST_CONFLICT`；不同批次各自入库
+  同键不同参 409 `RECEIPT_REQUEST_CONFLICT`；不同批次各自入库。
+  B3 阶段修掉一个时序边界：**拿锁后先查"这一次操作是否已落库"，再判可收数量**——
+  否则"同键并发 + 这一批正好收满"会被误判成超收（详见 `docs/shop-b2.md` 4.4）
 - **流水可追溯**：`shop_inventory_movement.receipt_id` 外键指向收货记录，
   `dedupe_key` = `OUT:{订单行id}` / `IN:{收货记录id}`（旧的 `(order_item_id, movement_type)`
   唯一索引会挡掉同一订单行的第二批入库，已换成 `uk(dedupe_key)`）
@@ -164,6 +167,28 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - **两种数据库都验过**：H2（B2 专项 13 项 + 旧库迁移 5 项）+
   真实 PostgreSQL 16（专项 4 项：争最后一件 / 同键并发 / 双批并发 / 故障注入回滚）
 - 详见 [`docs/shop-b2.md`](docs/shop-b2.md)
+
+### 1.6 售后（B3：模拟退款）
+
+一张**已批准且全部实收**的退货单可以生成**一笔**退款记录。它是**模拟**退款：
+不接支付平台、不产生真实资金流、不发通知；**不动可售库存、不写第二条入库流水、不释放可退额度**。
+
+- **谁能退**：`status = APPROVED` 且 `Σ received_qty = quantity`。待审批 / 已驳回 → 409 `REFUND_NOT_ALLOWED`；
+  没收到批准数量 → 409 `REFUND_NOT_RECEIVED`（判断用**累计实收**，损坏件也算收回来了）
+- **金额**：`原订单行成交单价 × 累计实收`，整数分、`multiplyExact` 防溢出。
+  **不用合格件数**（退款退的是"寄回来几件"，合格与否只决定能不能再卖），
+  **不用退货单上的估算快照**（与订单行不一致时直接 409 `REFUND_AMOUNT_MISMATCH`，
+  宁可拒绝也不按来源不明的单价退钱）。金额由服务端算，接口没有金额字段
+- **一张单最多一笔**：`uk_shop_aftersale_refund_return (return_id)` 兜底；
+  服务层把 `DuplicateKeyException` 翻译成 409 `REFUND_ALREADY_EXISTS`（消息带原退款单号）
+- **入口**：`/shop/admin/aftersale` 列表行上，收满且未退过的单出现「模拟退款」按钮，
+  确认面板写明金额算法、"不接支付平台"、"库存与额度不变"；退过之后按钮消失，行内显示「模拟退款 ¥598.00」
+- **只读可见**：买家列表 / 详情、客服列表 / 详情、售后 Agent 的 `list_my_return_requests` /
+  `get_my_order_detail` 都带退款字段；**买家侧没有退款按钮，Agent 没有退款写工具**
+- **文案纪律**：页面只写「模拟退款」，不出现"已退款 / 已到账 / 已原路退回"
+  （浏览器脚本有一条断言专门盯这个）
+- **两种数据库都验过**：H2（B3 专项 10 项）+ 真实 PostgreSQL 16（专项 2 项：并发重复退款、真库上不动库存与额度）
+- 详见 [`docs/shop-b3.md`](docs/shop-b3.md)
 
 ### 2. 弹性与成本控制（resilience）
 
@@ -731,8 +756,8 @@ cd web && node tools/e2e-aftersale-shopbuyer.mjs
 也可以完全不用模型：同一个页面下半部分是**普通退货表单**，
 选单 → 数量 → 原因 → 提交，效果与 Agent 路径一致（同一个 Java 服务）。
 
-> 额度规则：只有「已提交」的申请占额度；客服驳回、释放额度、仓库验收、
-> 退货入库与退款都在 B 阶段，本轮没有。
+> 额度规则：只有「已提交」与「已批准」的申请占额度；驳回释放额度。
+> 仓库验收 / 退货入库见 B2（2.7），模拟退款见 B3（2.8）。
 
 ### 2.7 售后 B2 闭环（收货验货 + 库存回补）
 
@@ -764,6 +789,39 @@ cd web && node tools/e2e-aftersale-receipt.mjs
 5. 抽屉里能看到两批记录，只有第一批挂着「退货入库 +1」的流水；
 6. 切回买家 → 售后页显示「仓库收货：全部收货 2/2 件，还可收 0 件」，额度仍是 `2/0`；
 7. 后台「商城后台」页：库存回到 9（只回补了合格的 1 件），流水里多一条 `RETURN_INBOUND`。
+
+### 2.8 售后 B3 闭环（模拟退款）
+
+```bash
+# 后端 / 前端同 2.5；退货申请这一步走售后 Agent，需要模型凭据
+cd web && node tools/e2e-aftersale-refund.mjs
+```
+
+脚本走完整条链路，并在每一步核对**数字**（全新 H2 库、键盘可售 10 件起）：
+
+```
+库存 10 → 买 2 件 + 发货签收 → 8
+售后 Agent 提交退 2 件（确认卡 → 建单）→ 额度 2/0 → 客服批准 → 未收货 0/2
+未收满：界面没有按钮 + 直接调接口 409 REFUND_NOT_RECEIVED
+第一批：实收 1 / 合格 1 / 损坏 0 → 9        ← 1 条 RETURN_INBOUND +1
+第二批：实收 1 / 合格 0 / 损坏 1 → 9        ← 没有流水
+生成模拟退款：¥598.00（RF…）
+重复调用：409 REFUND_ALREADY_EXISTS（消息带原单号）
+退款后：库存 9 → 9，流水 2 → 2，额度 2/0 → 2/0
+买家刷新：列表与详情都能看到「模拟退款 ¥598.00」，页面不出现"已退款 / 到账"
+```
+
+浏览器里手动走一遍：
+
+1. `/shop/admin/aftersale` → 已收满（`全部收货 2/2`）的单右侧出现「模拟退款」；
+2. 点开确认面板：写明"金额按成交单价 ¥299.00 × 累计实收 2 件，由服务端计算，预计 ¥598.00"，
+   并写明"不接支付平台、不会真的打款、库存与额度都不变"；
+3. 点「确认模拟退款」→ 提示「已生成一笔模拟退款 ¥598.00（RF…）」，
+   行内按钮消失、变成「模拟退款 ¥598.00」；
+4. 抽屉里新增「模拟退款」区块（金额 / 单号 / 操作人 / 时间）；
+5. 再点一次（或直接调接口）→ 409，提示里带着原退款单号，不会产生第二笔；
+6. 切回买家 → 售后列表与详情都能看到这笔模拟退款，额度仍是 `2/0`；
+7. 后台库存仍是 9、流水仍是 2 条——退款没有动库存，也没有写第二条入库流水。
 
 ### 3. 接口文档
 
@@ -821,6 +879,7 @@ cd web && node tools/e2e-aftersale-receipt.mjs
 | `POST /api/shop/admin/aftersale/returns/{returnNo}/approve` | 批准：保留原额度；重复/相反决策 409，零写入 |
 | `POST /api/shop/admin/aftersale/returns/{returnNo}/reject` | 驳回：body `{"reason": "..."}`，必填；同事务释放本单数量 |
 | `POST /api/shop/admin/aftersale/returns/{returnNo}/receipts` | 收货验货（B2）：body `{"receivedQty","qualifiedQty","damagedQty","note","clientRequestId"}`，201；只有合格数量回补库存；非已批准 409 / 超收 409 / 同键不同参 409 |
+| `POST /api/shop/admin/aftersale/returns/{returnNo}/refund` | 模拟退款（B3）：无 body（金额服务端算 = 成交单价 × 累计实收），201 + 详情（含 `refund`）；未批准 409 `REFUND_NOT_ALLOWED` / 未收满 409 `REFUND_NOT_RECEIVED` / 已退过 409 `REFUND_ALREADY_EXISTS`；**不动库存、不写流水、不释放额度** |
 
 Agent 任务 SSE 事件流示例：
 
@@ -894,6 +953,12 @@ event:done       [DONE]
 # 售后 B2 的真实 PostgreSQL 专项（争最后一件 / 同键并发 / 双批并发 / 库存已加后回滚，4 个用例）
 ./mvnw -Ppg test "-Dtest=AfterSaleReceiptPostgresTest"
 
+# 售后 B3：模拟退款 / 金额口径 / 去重 / 权限 / 可见性（H2，10 个用例）
+./mvnw test "-Dtest=AfterSaleRefundIntegrationTest"
+
+# 售后 B3 的真实 PostgreSQL 专项（并发重复退款只落一笔 / 真库上不动库存与额度，2 个用例）
+./mvnw -Ppg test "-Dtest=AfterSaleRefundPostgresTest"
+
 # live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
 ./mvnw -Plive test "-Dtest=MkManusTest"
 ```
@@ -919,7 +984,8 @@ event:done       [DONE]
 - [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)：A0 的真实 PostgreSQL 16 回归——一次性容器接线、A/B/C/D/E 五场景实测证据（含受控锁等待与事务回滚注入）、Testcontainers 与 Docker 29 不兼容的根因与替代方案
 - [`docs/shop-a1.md`](docs/shop-a1.md)：售后 A1——模块与四张表、额度算法、五个接口与权限、确认→建单的调用链与事务边界、两套幂等身份、实跑结果（H2 / 真实 PG / 浏览器 / 模型）、限制与 B 阶段边界
 - [`docs/shop-b1.md`](docs/shop-b1.md)：售后 B1——状态机、客服四个接口与权限、锁顺序与事务边界、决策表与两个 CHECK 的迁移、会话领域回填、重复/并发决策口径、实跑结果与未验证项、B2 已实施对照
-- [`docs/shop-b2.md`](docs/shop-b2.md)：售后 B2——收货记录表与三态进度、`dedupe_key` 与旧唯一索引的替换、锁顺序与事务边界（含 `MANDATORY` 库存写入）、幂等与并发口径、旧库不清库的迁移与验证、页面联动、实跑数字与限制
+- [`docs/shop-b2.md`](docs/shop-b2.md)：售后 B2——收货记录表与三态进度、`dedupe_key` 与旧唯一索引的替换、锁顺序与事务边界（含 `MANDATORY` 库存写入）、幂等与并发口径（含 4.4 最后一批收货的幂等边界修复）、旧库不清库的迁移与验证、页面联动、实跑数字与限制
+- [`docs/shop-b3.md`](docs/shop-b3.md)：售后 B3——模拟退款的四条业务规则（谁能退 / 金额口径 / 一张单最多一笔 / 三条边界）、独立退款表与锁顺序、错误码表、B2 幂等边界修复的定向验收、页面文案纪律、实跑数字（含一次被断言抓到的文案问题）
 
 ---
 

@@ -1,7 +1,7 @@
 /**
- * 客服售后状态（B1：按状态看申请、批准、驳回；B2：收货验货）。
+ * 客服售后状态（B1：按状态看申请、批准、驳回；B2：收货验货；B3：模拟退款）。
  *
- * 五条边界：
+ * 六条边界：
  * 1. **权限只在服务端**：页面隐藏按钮只是不让人白点一次，
  *    真正拦住越权的是后端 `requireAdmin()`（非 ADMIN 一律 403）。
  * 2. **重复/相反决策是 409，不是成功**：`ALREADY_APPROVED` / `ALREADY_REJECTED` /
@@ -12,7 +12,11 @@
  *    后端仍会独立校验（前端校验不算数）。
  * 4. **收货只有已批准的单能做**，且只有合格数量回补可售库存。
  *    `RECEIPT_OVER_APPROVED` / `RETURN_NOT_APPROVED` 也是 409：同样先刷新再报错。
- * 5. **不显示退款**：B2 停在收货验货与库存回补，页面写"已退款"就是骗人。
+ * 5. **退款是"模拟"的，且只有全部实收之后能做**：不接支付平台、没有资金流，
+ *    金额由服务端按成交单价 × 累计实收算。一张单最多一笔，
+ *    `REFUND_ALREADY_EXISTS` 是 409（先刷新再看真实退款记录），不是失败。
+ * 6. **退款不改状态、不动库存、不释放额度**：所以成功后不重算任何数字，
+ *    只把详情里的退款记录显示出来。页面写"已到账"就是骗人。
  */
 import { computed, reactive } from 'vue'
 import { ApiError } from '@/api/errors'
@@ -21,6 +25,7 @@ import {
   getAdminReturn,
   listAdminReturns,
   receiveAdminReturn,
+  refundAdminReturn,
   rejectAdminReturn,
   type AfterSaleReturnVO,
 } from '@/api/aftersale'
@@ -29,8 +34,8 @@ import { describeAfterSaleError } from '@/stores/aftersale'
 /** 决策动作（用于"哪一行正在处理中"）。 */
 export type DecisionAction = 'approve' | 'reject'
 
-/** 后台写动作：决策 + 收货（共用"同时只允许一个"的忙碌标记）。 */
-export type AdminAction = DecisionAction | 'receive'
+/** 后台写动作：决策 + 收货 + 模拟退款（共用"同时只允许一个"的忙碌标记）。 */
+export type AdminAction = DecisionAction | 'receive' | 'refund'
 
 /** 一批收货的输入（数量与备注都来自操作员）。 */
 export interface ReceiveInput {
@@ -64,6 +69,7 @@ export interface AfterSaleAdminDeps {
   approve: typeof approveAdminReturn
   reject: typeof rejectAdminReturn
   receive: typeof receiveAdminReturn
+  refund: typeof refundAdminReturn
 }
 
 export function createAfterSaleAdminStore(deps: AfterSaleAdminDeps) {
@@ -280,6 +286,55 @@ export function createAfterSaleAdminStore(deps: AfterSaleAdminDeps) {
     }
   }
 
+  /**
+   * 模拟退款（B3）。
+   *
+   * **只做"点一次"**：金额由服务端按成交单价 × 累计实收算，这里不传任何金额；
+   * 能不能退（已批准 + 全部实收）也由服务端判定——前端只负责
+   * 不让用户在明显不该退的行上白点一次。
+   *
+   * 成功后**不动**库存、额度、状态（退款本来就不改这些），只把详情刷新成
+   * 带退款记录的那一版。重复调用是 409 `REFUND_ALREADY_EXISTS`：
+   * 与决策一致，先刷新把真实记录摆出来，再报错。
+   *
+   * @return 成功返回带退款记录的详情；失败返回 null
+   */
+  async function refund(returnNo: string): Promise<AfterSaleReturnVO | null> {
+    if (state.busyReturnNo) {
+      return null
+    }
+
+    state.busyReturnNo = returnNo
+    state.busyAction = 'refund'
+    clearFeedback()
+
+    try {
+      const updated = await deps.refund(returnNo)
+
+      state.detail = updated
+      // 顺序同决策：先重载列表（会清提示），再写提示
+      await loadList()
+      const record = updated.refund
+      state.notice = record
+        ? `${updated.returnNo} 已生成一笔${record.label} ${record.amountText}（${record.refundNo}）。`
+          + '这是模拟退款，不接支付平台、没有真实资金流；可售库存与可退额度均未变化。'
+        : `${updated.returnNo} 已处理退款。`
+      return updated
+    } catch (error) {
+      const message = describeAfterSaleError(error)
+      // 409（已退过 / 未收满 / 状态不对）最有用的是把最新事实摆出来
+      if (error instanceof ApiError && error.status === 409) {
+        await openDetail(returnNo)
+        await loadList()
+      }
+      state.error = message
+      return null
+    } finally {
+      state.busyReturnNo = null
+      state.busyAction = null
+    }
+  }
+
   function reset(): void {
     Object.assign(state, {
       returns: [],
@@ -309,6 +364,7 @@ export function createAfterSaleAdminStore(deps: AfterSaleAdminDeps) {
     approve,
     reject,
     receive,
+    refund,
     reset,
   }
 }
@@ -319,6 +375,7 @@ export const afterSaleAdmin = createAfterSaleAdminStore({
   approve: approveAdminReturn,
   reject: rejectAdminReturn,
   receive: receiveAdminReturn,
+  refund: refundAdminReturn,
 })
 
 export type AfterSaleAdminStore = ReturnType<typeof createAfterSaleAdminStore>

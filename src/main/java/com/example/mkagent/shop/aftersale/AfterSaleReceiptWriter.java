@@ -10,6 +10,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Optional;
 
 /**
  * 收货 / 验货的**唯一**写入点（B2）。
@@ -20,15 +21,24 @@ import java.time.format.DateTimeFormatter;
  * TX:
  *   1. 锁订单行（SELECT ... FOR UPDATE）        ← 与 A1 新申请、B1 决策同一把锁
  *   2. 拿锁后重读退货单状态（必须是 APPROVED）
- *   3. 拿锁后重读累计实收，判断"本次实收 + 已收 ≤ 批准数量"
- *   4. 插入收货记录
- *   5. 合格数量 &gt; 0 时：增加可售库存 + 写 RETURN_INBOUND 流水（去重键 IN:{收货记录id}）
+ *   3. 拿锁后先查"这一次操作是不是已经落库了"：命中就核对哈希、返回原记录
+ *   4. 未命中才重读累计实收，判断"本次实收 + 已收 ≤ 批准数量"
+ *   5. 插入收货记录
+ *   6. 合格数量 &gt; 0 时：增加可售库存 + 写 RETURN_INBOUND 流水（去重键 IN:{收货记录id}）
  * COMMIT
  * </pre>
  *
- * 五步同一个事务：提交了就一定"收货记录 + 库存 + 流水"三者齐全，
+ * 六步同一个事务：提交了就一定"收货记录 + 库存 + 流水"三者齐全，
  * 回滚了就一件都没发生。不会出现"库存加了但没有收货记录"，
  * 也不会出现"收货记了、库存没加"。
+ *
+ * <h2>为什么第 3 步必须排在第 4 步前面</h2>
+ *
+ * 两个同键请求都可能在外层预检时查不到记录（赢家还没提交），
+ * 而这一批正好把批准数量收满。输家拿到锁时，累计实收已经等于批准数量：
+ * 若先判超收，它会得到 409 {@code RECEIPT_OVER_APPROVED}——可这明明是一次重试，
+ * 调用方应当看到"成功、同一条收货记录"。先查同键、命中就回放，
+ * 才能让"重试"和"真的想多收"区分开：前者回放原记录，后者才 409。
  *
  * <h2>为什么必须拿订单行锁</h2>
  *
@@ -128,6 +138,22 @@ public class AfterSaleReceiptWriter {
         // 3. 拿锁后重读：状态可能刚被驳回，累计实收也可能刚被上一批改掉。
         AfterSaleReturn fresh = repository.findReturnByNo(returnNo)
                 .orElseThrow(() -> notFound(returnNo));
+
+        /*
+         * 4. 先确认"这一次操作是不是已经落库了"，**再**判还能收几件。
+         *
+         * 两个同键请求都可能在外层预检查不到记录（赢家还没提交），而这一批正好收满：
+         * 输家拿到锁时累计实收已经等于批准数量。若先判超收，它会被判成
+         * 409 RECEIPT_OVER_APPROVED——可这明明是一次重试。
+         * 顺序反了，"重试"就会被误判成"想多收"。
+         */
+        Optional<AfterSaleRepository.StoredReceipt> existing =
+                repository.findReceiptByRequestKey(requestKey);
+        if (existing.isPresent()) {
+            return replay(existing.get(), requestHash);
+        }
+
+        // 5. 只有确认这是一次新收货，才判状态与可收数量。
         requireApproved(fresh);
 
         int alreadyReceived = repository.sumReceivedQty(fresh.id());
@@ -140,7 +166,7 @@ public class AfterSaleReceiptWriter {
                             + Math.max(0, fresh.quantity() - alreadyReceived) + " 件");
         }
 
-        // 4. 收货记录（uk(request_key) 是并发同键的兜底）。
+        // 6. 收货记录（uk(request_key) 是并发同键的兜底）。
         String receiptNo = newReceiptNo();
         long receiptId = repository.insertReceipt(
                 receiptNo,
@@ -154,7 +180,7 @@ public class AfterSaleReceiptWriter {
                 requestHash,
                 operatorId);
 
-        // 5. 只有合格数量入可售库存；整批损坏不写流水。
+        // 7. 只有合格数量入可售库存；整批损坏不写流水。
         if (qualifiedQty > 0) {
             inventoryService.applyInbound(
                     fresh.sku(),
@@ -171,6 +197,25 @@ public class AfterSaleReceiptWriter {
         return repository.findReceiptById(receiptId)
                 .orElseThrow(() -> new IllegalStateException(
                         "收货记录写入后读不到：" + receiptNo));
+    }
+
+    /**
+     * 命中同一个收货标识时的统一口径：哈希一致返回原记录，不一致拒绝。
+     *
+     * <p>抽成 {@code static} 是因为两条路径都要用：事务外的预检回放
+     * （{@link AfterSaleService#receive}）与拿锁后的并发回放（本类第 4 步）。
+     * 规则只写一遍，就不会出现"一条路径校验了哈希、另一条忘了"。
+     *
+     * @throws BusinessException 409 {@code RECEIPT_REQUEST_CONFLICT}
+     */
+    static AfterSaleReceipt replay(AfterSaleRepository.StoredReceipt stored, String requestHash) {
+        if (!stored.requestHash().equals(requestHash)) {
+            throw new BusinessException(
+                    409,
+                    CODE_REQUEST_CONFLICT,
+                    "同一个收货标识被用于不同的验货参数，已拒绝执行");
+        }
+        return stored.receipt();
     }
 
     /**

@@ -1,16 +1,20 @@
 <script setup lang="ts">
 /**
- * 客服售后处理（B1 决策 + B2 收货验货）。
+ * 客服售后处理（B1 决策 + B2 收货验货 + B3 模拟退款）。
  *
- * 四点必须说清楚：
+ * 五点必须说清楚：
  * 1. 权限由服务端判定（`requireAdmin`）。页面隐藏按钮只是不让人白点一次，
  *    真正拦住越权的是后端 403；普通买家打开这个页面只会看到"当前身份不能处理"；
  * 2. 批准 = **保留额度**（那部分数量仍然不能再申请）；驳回 = **释放额度**
  *    （同一事务内把 reserved_qty 减回去）；
  * 3. 收货 = **只有已批准的单能收**，只有合格数量回补可售库存。
  *    收货**不释放**额度：收进来的件数已经把这份退货资格用掉了；
- * 4. 重复或相反决策、超收、状态已变都会被后端 409 拒绝，页面不重试、不猜测，
- *    而是重新读详情把真实事实摆出来。
+ * 4. 模拟退款 = **只有已批准且全部实收**才能做，金额由服务端按
+ *    「原订单成交单价 × 累计实收」算（含损坏件），一张单最多一笔。
+ *    它**不动库存、不写流水、不释放额度**，也不接支付平台——所以文案只说
+ *    "模拟退款"，绝不说"已到账"；
+ * 5. 重复或相反决策、超收、重复退款、状态已变都会被后端 409 拒绝，
+ *    页面不重试、不猜测，而是重新读详情把真实事实摆出来。
  */
 import { computed, onMounted, ref } from 'vue'
 import AppShell from '@/components/AppShell.vue'
@@ -50,6 +54,14 @@ const receiveNote = ref('')
  * 改完数量再提交则是另一批，必须换新值——所以成功后才重置。
  */
 const receiveRequestId = ref('')
+
+/** 正在确认模拟退款的那一单（null 表示没有）。 */
+const refundingNo = ref<string | null>(null)
+
+/** 能不能对这一单发起模拟退款：已批准 + 全部实收 + 还没退过。 */
+function canRefund(item: AfterSaleReturnVO): boolean {
+  return item.status === 'APPROVED' && item.progress?.code === 'COMPLETE' && !item.refund
+}
 
 const detailOpen = computed(() => afterSaleAdmin.state.detail !== null)
 
@@ -184,6 +196,21 @@ async function confirmReceive(returnNo: string): Promise<void> {
   }
 }
 
+function startRefund(returnNo: string): void {
+  refundingNo.value = returnNo
+}
+
+function cancelRefund(): void {
+  refundingNo.value = null
+}
+
+async function confirmRefund(returnNo: string): Promise<void> {
+  const updated = await afterSaleAdmin.refund(returnNo)
+  if (updated) {
+    cancelRefund()
+  }
+}
+
 onMounted(async () => {
   /*
    * 进入页面先关掉上一次留下的详情抽屉。
@@ -211,7 +238,7 @@ onMounted(async () => {
     <template #topbar>
       <div class="topbar">
         <h1 class="topbar__title">售后处理</h1>
-        <span class="topbar__demo">B2 · 批准 / 驳回 / 收货</span>
+        <span class="topbar__demo">B3 · 批准 / 驳回 / 收货 / 模拟退款</span>
 
         <div class="topbar__right">
           <span class="topbar__identity">{{ shop.state.session?.userId ?? '未识别身份' }}</span>
@@ -272,6 +299,8 @@ onMounted(async () => {
             <p class="section__hint">
               批准保留原额度，驳回释放本单申请数量。两种操作都不改可售库存、不写退货入库流水。
               已批准的单可以收货：只有合格数量回补可售库存，损坏只留记录；收货不释放额度。
+              收满之后可以生成一笔<strong>模拟退款</strong>：金额按「原订单成交单价 × 累计实收」算
+              （损坏件也算），一张单最多一笔；退款不动库存、不释放额度，也不接支付平台。
             </p>
 
             <p
@@ -366,6 +395,28 @@ onMounted(async () => {
                   >
                     {{ (item.progress?.remainingQty ?? 0) <= 0 ? '已收满' : '收货' }}
                   </button>
+                  <button
+                    v-if="canRefund(item)"
+                    type="button"
+                    class="mk-btn mk-btn--sm mk-btn--primary"
+                    data-action="refund"
+                    :disabled="afterSaleAdmin.state.busyReturnNo !== null"
+                    @click="startRefund(item.returnNo)"
+                  >
+                    {{
+                      afterSaleAdmin.state.busyReturnNo === item.returnNo &&
+                      afterSaleAdmin.state.busyAction === 'refund'
+                        ? '处理中…'
+                        : '模拟退款'
+                    }}
+                  </button>
+                  <span
+                    v-else-if="item.refund"
+                    class="row__refund"
+                    :data-refund-for="item.returnNo"
+                  >
+                    {{ item.refund.label }} {{ item.refund.amountText }}
+                  </span>
                   <button
                     type="button"
                     class="link-btn"
@@ -498,6 +549,42 @@ onMounted(async () => {
                     实收要大于 0 且不超过本批上限 {{ receiveLimit }} 件，并且「合格 + 损坏 = 实收」。
                   </p>
                 </div>
+
+                <div
+                  v-if="refundingNo === item.returnNo"
+                  class="refund"
+                  :data-refund-confirm-for="item.returnNo"
+                >
+                  <p class="refund__meta">
+                    将为 {{ item.returnNo }} 生成一笔<strong>模拟退款</strong>：金额按「成交单价
+                    {{ item.unitPriceText }} × 累计实收
+                    {{ item.progress?.receivedQty ?? 0 }} 件」由服务端计算，预计
+                    <strong>{{ item.refundText }}</strong>（最终以服务端结果为准）。
+                  </p>
+                  <p class="refund__meta">
+                    这是模拟退款：不接支付平台、不会真的打款到买家账户；
+                    可售库存与可退额度都不变，一张退货单最多一笔。
+                  </p>
+                  <div class="refund__actions">
+                    <button
+                      type="button"
+                      class="mk-btn mk-btn--sm mk-btn--primary"
+                      data-action="refund-confirm"
+                      :disabled="afterSaleAdmin.state.busyReturnNo !== null"
+                      @click="confirmRefund(item.returnNo)"
+                    >
+                      {{
+                        afterSaleAdmin.state.busyReturnNo === item.returnNo &&
+                        afterSaleAdmin.state.busyAction === 'refund'
+                          ? '处理中…'
+                          : '确认模拟退款'
+                      }}
+                    </button>
+                    <button type="button" class="mk-btn mk-btn--sm" @click="cancelRefund()">
+                      取消
+                    </button>
+                  </div>
+                </div>
               </li>
             </ul>
 
@@ -531,6 +618,9 @@ onMounted(async () => {
             重复或相反决策一律 409，不新增事件、不改额度。
             收货同样在一个事务里：锁原订单行 → 重读状态与累计实收 → 校验不超收 → 写收货记录 →
             （合格数量）加可售库存 + 写一条退货入库流水。只有全部成功才提交，库存和记录不会只落一半。
+            模拟退款也走同一把订单行锁：校验已批准 → 查是否已退过 → 校验累计实收已满 → 核对单价快照 →
+            写一条退款记录。唯一键 `(return_id)` 保证一张退货单最多一笔，
+            并发重复点击只有一个成功，另一个拿到可解释的 409。
           </p>
         </template>
       </div>
@@ -848,6 +938,40 @@ onMounted(async () => {
   font-size: var(--fs-xs);
   color: var(--c-danger);
   line-height: var(--lh-base);
+}
+
+.row__refund {
+  font-size: var(--fs-xs);
+  color: var(--c-ok);
+  white-space: nowrap;
+}
+
+.refund {
+  flex-basis: 100%;
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  border: 1px dashed var(--c-warn);
+  border-radius: var(--r-md);
+  background: var(--c-warn-weak);
+}
+
+.refund__meta {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: var(--lh-base);
+}
+
+.refund__meta strong {
+  font-family: var(--font-mono);
+  color: var(--c-text);
+}
+
+.refund__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
 }
 
 .field {

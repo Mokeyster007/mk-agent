@@ -6,10 +6,12 @@
  * - 退货单号、状态、来源（普通表单 / 售后 Agent）、数量、金额、原因；
  * - 客服决策（谁在什么时候、批准还是驳回、驳回原因）——B1 起有；
  * - 收货进度与每一批的验货结果——B2 起有；
+ * - 模拟退款记录（单号、金额、操作人、时间）——B3 起有，**只读**；
  * - 处理记录（提交 → 决策，一个动作一条）。
  *
- * 不显示、也不推断"已退款"：B2 只做到收货验货与可售库存回补。
- * 收货**不释放**额度，所以"已收满"不等于"能再退一次"。
+ * 买家侧**没有任何退款按钮**：退款是客服动作，写权限不在买家（更不在买家 Agent）手里。
+ * 而且这里的退款是**模拟**的——没有真实资金流，所以文案只说"模拟退款"，
+ * 绝不写"已到账""已原路退回"。
  */
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
@@ -65,7 +67,7 @@ const progressPercent = computed(() => {
         <dd>{{ value.unitPriceText }}</dd>
       </div>
       <div class="fact">
-        <dt>预计退款</dt>
+        <dt>预计退款（按申请数量估）</dt>
         <dd>{{ value.refundText }}</dd>
       </div>
       <div class="fact">
@@ -121,6 +123,19 @@ const progressPercent = computed(() => {
       </ol>
     </section>
 
+    <section v-if="value.refund" class="refund" data-refund>
+      <h3 class="events__title">{{ value.refund.label }}</h3>
+      <p class="refund__amount">
+        <strong class="mono" data-refund-amount>{{ value.refund.amountText }}</strong>
+        <span class="refund__no mono">{{ value.refund.refundNo }}</span>
+      </p>
+      <p class="refund__meta">{{ formatDateTime(value.refund.createdAt) }}</p>
+      <p class="refund__meta refund__meta--muted">
+        金额按「成交单价 × 累计实收」结算（含损坏件）。这是模拟退款：不接支付平台，
+        没有真实资金流动，也不需要你提供任何账户信息。
+      </p>
+    </section>
+
     <section v-if="value.decision" class="decision" data-decision>
       <h3 class="events__title">客服处理结果</h3>
       <p class="decision__line">
@@ -158,7 +173,9 @@ const progressPercent = computed(() => {
 
     <p class="foot">
       批准只代表"同意退"；驳回会在同一事务里释放本单占用的额度。仓库收货后只有合格数量回补可售库存，
-      损坏只留记录、不建残次库存，额度也不会因为收货而释放。退款不在本轮范围。
+      损坏只留记录、不建残次库存，额度也不会因为收货而释放。
+      全部收满后，客服会生成一笔模拟退款（成交单价 × 累计实收）；退款不改库存、不释放额度，
+      也不接支付平台——这里没有真实资金流。
     </p>
   </aside>
 </template>
@@ -277,6 +294,45 @@ const progressPercent = computed(() => {
   border: 1px solid var(--c-line-soft);
   border-radius: var(--r-md);
   background: var(--c-bg-soft);
+}
+
+.refund {
+  display: grid;
+  gap: 4px;
+  padding: var(--s-3);
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--r-md);
+  background: var(--c-ok-weak);
+}
+
+.refund__amount {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+}
+
+.refund__amount strong {
+  font-size: var(--fs-lg);
+  color: var(--c-ok);
+}
+
+.refund__no {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  overflow-wrap: anywhere;
+}
+
+.refund__meta {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: var(--lh-base);
+}
+
+.refund__meta--muted {
+  color: var(--c-text-3);
 }
 
 .progress {

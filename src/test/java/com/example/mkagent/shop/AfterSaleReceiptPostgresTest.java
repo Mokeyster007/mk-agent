@@ -116,12 +116,21 @@ class AfterSaleReceiptPostgresTest extends AbstractPostgresShopTest {
         assertEquals(1, ShopTestFixture.movementCountOfType(jdbc, SKU, "RETURN_INBOUND"));
     }
 
-    // ==================== 2. 同键并发 ====================
+    // ==================== 2. 同键并发（这一批正好收满） ====================
 
+    /**
+     * 同键并发里最难的一种：**这一批正好把批准数量收满**。
+     *
+     * <p>两个请求都可能在事务外的幂等预检里查不到记录（赢家还没提交）。
+     * 输家拿到锁时，累计实收已经等于批准数量——如果先判"还能收几件"，
+     * 它会被判成 409 {@code RECEIPT_OVER_APPROVED}，而它其实只是一次重试。
+     * 修复后：拿锁后先按 {@code request_key} 查同次操作的结果，
+     * 命中就核对哈希、返回原记录，未命中才判数量。
+     */
     @Test
-    @DisplayName("同键并发收货：只落一条记录、只加一次库存")
+    @DisplayName("同键并发收货且正好收满：两次都成功、指向同一条记录、只入库一次")
     void concurrentSameKeyWritesOnce() throws Exception {
-        String returnNo = givenApprovedReturn("SO-B2-PG-KEY", 2);
+        String returnNo = givenApprovedReturn("SO-B2-PG-KEY", 1);
         int stockBefore = ShopTestFixture.stockOf(jdbc, SKU);
 
         List<ShopApiClient.Reply> replies = runConcurrently(2,
@@ -129,15 +138,18 @@ class AfterSaleReceiptPostgresTest extends AbstractPostgresShopTest {
 
         // 一个真写、一个命中幂等键回放：都应当看到"收货成功"
         assertEquals(List.of(201, 201), statuses(replies),
-                "同键重试对调用方必须表现为成功：" + statuses(replies));
+                "同键重试对调用方必须表现为成功（不能因为这一批收满就报超收）：" + statuses(replies));
 
         String first = replies.get(0).body().get("receipts").get(0).get("receiptNo").asText();
         String second = replies.get(1).body().get("receipts").get(0).get("receiptNo").asText();
         assertEquals(first, second, "两次响应必须指向同一条收货记录");
 
         assertEquals(1, ShopTestFixture.receiptCount(jdbc, returnNo));
+        assertEquals(1, ShopTestFixture.receivedQtyOf(jdbc, returnNo));
         assertEquals(stockBefore + 1, ShopTestFixture.stockOf(jdbc, SKU), "库存只能加一次");
         assertEquals(1, ShopTestFixture.movementCountOfType(jdbc, SKU, "RETURN_INBOUND"));
+        assertNull(ShopTestFixture.quotaConsistencyError(jdbc, "SO-B2-PG-KEY"),
+                "收货不释放额度");
     }
 
     // ==================== 3. 两批都在上限内 ====================

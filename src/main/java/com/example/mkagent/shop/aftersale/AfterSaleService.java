@@ -67,6 +67,8 @@ public class AfterSaleService {
 
     private final AfterSaleReceiptWriter receiptWriter;
 
+    private final AfterSaleRefundWriter refundWriter;
+
     private final InventoryService inventoryService;
 
     private final ShopProperties properties;
@@ -76,6 +78,7 @@ public class AfterSaleService {
             AfterSaleWriter writer,
             AfterSaleDecisionWriter decisionWriter,
             AfterSaleReceiptWriter receiptWriter,
+            AfterSaleRefundWriter refundWriter,
             InventoryService inventoryService,
             ShopProperties properties
     ) {
@@ -83,6 +86,7 @@ public class AfterSaleService {
         this.writer = writer;
         this.decisionWriter = decisionWriter;
         this.receiptWriter = receiptWriter;
+        this.refundWriter = refundWriter;
         this.inventoryService = inventoryService;
         this.properties = properties;
     }
@@ -515,7 +519,20 @@ public class AfterSaleService {
                 repository.findEvents(value.id()),
                 repository.findDecision(value.id()).orElse(null),
                 progress,
-                receipts);
+                receipts,
+                repository.findRefundByReturnId(value.id()).orElse(null));
+    }
+
+    /**
+     * 一批退货单的模拟退款（列表 / 工具用，一次查询算完）。
+     *
+     * @return key = return_id；没退过款的退货单不出现在结果里
+     */
+    public Map<Long, AfterSaleRefund> refundsOf(List<AfterSaleReturn> returns) {
+        if (returns == null || returns.isEmpty()) {
+            return Map.of();
+        }
+        return repository.findRefundsByReturns(returns.stream().map(AfterSaleReturn::id).toList());
     }
 
     /**
@@ -628,22 +645,80 @@ public class AfterSaleService {
     }
 
     /**
+     * 模拟退款（B3）。
+     *
+     * <h2>为什么预检放在事务外</h2>
+     *
+     * 与收货同一个理由：并发重复退款时，输的那一方要么被事务内的
+     * {@code uk(return_id)} 拒绝（{@link DuplicateKeyException}），
+     * 要么在预检里就命中已有记录。前者需要"回滚后换新事务读结果"，
+     * 而 PostgreSQL 上事务一旦中止就连 {@code SELECT} 都拒绝，
+     * 所以"读已有结果"这件事必须发生在事务外。
+     *
+     * <h2>金额与规则</h2>
+     *
+     * 只有「已批准 + 全部实收」的退货单能退；金额 = 原订单成交单价 × 累计实收，
+     * 由服务端算，请求体里没有金额字段。
+     *
+     * @param operatorId 操作人（服务端身份）
+     * @param returnNo   退货单号
+     * @throws BusinessException 404 不存在；409 未批准 / 未收满 / 已退过款
+     */
+    public AfterSaleRefund refund(String operatorId, String returnNo) {
+        if (returnNo == null || returnNo.isBlank()) {
+            throw new BusinessException(400, "INVALID_RETURN_NO", "退货单号不能为空");
+        }
+
+        // 1. 先看这张单有没有退过款：命中就直接 409，不再进事务。
+        AfterSaleReturn current = repository.findReturnByNo(returnNo)
+                .orElseThrow(() -> new BusinessException(
+                        404, "RETURN_NOT_FOUND", "退货申请不存在：" + returnNo));
+        repository.findRefundByReturnId(current.id()).ifPresent(existing -> {
+            throw new BusinessException(
+                    409,
+                    AfterSaleRefundWriter.CODE_ALREADY_REFUNDED,
+                    "这张退货单已经生成过模拟退款（" + existing.refundNo() + "），不会重复退款");
+        });
+
+        // 2. 在一个事务里"校验 + 算金额 + 落库"。
+        try {
+            return refundWriter.refund(operatorId, returnNo);
+        } catch (DuplicateKeyException e) {
+            /*
+             * 并发重复退款：另一个请求刚插入成功。
+             * 换新事务（这里是普通查询）读赢家结果，给出可解释的 409。
+             */
+            Optional<AfterSaleRefund> winner = repository.findReturnByNo(returnNo)
+                    .flatMap(value -> repository.findRefundByReturnId(value.id()));
+            if (winner.isPresent()) {
+                throw new BusinessException(
+                        409,
+                        AfterSaleRefundWriter.CODE_ALREADY_REFUNDED,
+                        "这张退货单刚刚生成过模拟退款（" + winner.get().refundNo()
+                                + "），不会重复退款");
+            }
+            log.error("模拟退款命中非幂等的唯一键冲突：returnNo={}", returnNo, e);
+            throw new BusinessException(
+                    409,
+                    AfterSaleRefundWriter.CODE_ALREADY_REFUNDED,
+                    "模拟退款写入冲突，本次没有生效，请刷新后查看");
+        }
+    }
+
+    /**
      * 回放首次收货结果。
      *
      * <p>哈希不一致说明同一个收货标识被用于不同参数（改了数量或备注），
      * 必须明确拒绝：静默返回上一条会让操作员以为改动生效了。
+     *
+     * <p>判定逻辑在 {@link AfterSaleReceiptWriter#replay}：拿锁后那条并发回放路径
+     * 用的是同一份实现，两处口径不会漂移。
      */
     private AfterSaleReceipt replay(
             AfterSaleRepository.StoredReceipt stored,
             String requestHash
     ) {
-        if (!stored.requestHash().equals(requestHash)) {
-            throw new BusinessException(
-                    409,
-                    AfterSaleReceiptWriter.CODE_REQUEST_CONFLICT,
-                    "同一个收货标识被用于不同的验货参数，已拒绝执行");
-        }
-        return stored.receipt();
+        return AfterSaleReceiptWriter.replay(stored, requestHash);
     }
 
     /**
@@ -661,13 +736,15 @@ public class AfterSaleService {
      *
      * @param progress 收货进度；非已批准状态为 {@code null}
      * @param receipts 每批收货 + 它产生的库存流水（整批损坏时 movement 为 null）
+     * @param refund   模拟退款（B3）；没退过款时为 {@code null}
      */
     public record ReturnDetail(
             AfterSaleReturn value,
             List<AfterSaleEvent> events,
             AfterSaleDecision decision,
             AfterSaleReceiptProgress progress,
-            List<ReceiptWithMovement> receipts
+            List<ReceiptWithMovement> receipts,
+            AfterSaleRefund refund
     ) {
     }
 

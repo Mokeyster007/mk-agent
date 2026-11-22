@@ -21,17 +21,19 @@ final class ShopTestFixture {
 
     static void reset(JdbcTemplate jdbc) {
         /*
-         * 先清售后（A1 / B1 / B2），再清订单（A0）：
-         * shop_aftersale_return / quota / event / decision / receipt 都有外键指向订单与订单行，
+         * 先清售后（A1 / B1 / B2 / B3），再清订单（A0）：
+         * shop_aftersale_return / quota / event / decision / receipt / refund 都有外键指向订单与订单行，
          * 顺序反了会直接违反外键约束。
          *
          * shop_inventory_movement 有外键指向收货记录（B2），
-         * 所以它必须排在收货记录**之前**删除。
+         * 所以它必须排在收货记录**之前**删除；
+         * shop_aftersale_refund 有外键指向退货单（B3），必须排在退货单之前。
          */
         jdbc.update("DELETE FROM shop_aftersale_event");
         jdbc.update("DELETE FROM shop_aftersale_decision");
         jdbc.update("DELETE FROM shop_inventory_movement");
         jdbc.update("DELETE FROM shop_aftersale_receipt");
+        jdbc.update("DELETE FROM shop_aftersale_refund");
         jdbc.update("DELETE FROM shop_aftersale_return");
         jdbc.update("DELETE FROM shop_aftersale_quota");
         jdbc.update("DELETE FROM shop_aftersale_idempotency");
@@ -342,5 +344,49 @@ final class ShopTestFixture {
                 WHERE c.receipt_no = ?
                 """, Integer.class, receiptNo);
         return count == null ? 0 : count;
+    }
+
+    // ---------------------------------------------------------------
+    // B3 模拟退款夹具
+    // ---------------------------------------------------------------
+
+    /** 某退货单的模拟退款条数（一张退货单最多 1）。 */
+    static int refundCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 全库模拟退款条数（断言"重复点击没有多出一笔"）。 */
+    static int totalRefunds(JdbcTemplate jdbc) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_refund", Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的退款金额（分）；没退过款返回 -1。 */
+    static long refundAmountOf(JdbcTemplate jdbc, String returnNo) {
+        List<Long> values = jdbc.queryForList("""
+                SELECT f.amount_cents
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, Long.class, returnNo);
+        return values.isEmpty() ? -1L : values.get(0);
+    }
+
+    /** 某退货单的模拟退款单号；没退过款返回 {@code null}。 */
+    static String refundNoOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT f.refund_no
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
     }
 }
