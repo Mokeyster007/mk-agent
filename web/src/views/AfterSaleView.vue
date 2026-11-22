@@ -377,7 +377,13 @@ onMounted(async () => {
                   客服已驳回，本次申请占用的额度已释放；驳回原因在详情里。
                 </p>
                 <p v-else-if="item.status === 'APPROVED'" class="return__decision" data-approve-note>
-                  客服已批准，这 {{ item.quantity }} 件仍计入已占用额度，等仓库验收。
+                  客服已批准，这 {{ item.quantity }} 件仍计入已占用额度。
+                  <span v-if="item.progress" data-receipt-note>
+                    仓库收货：{{ item.progress.label }} {{ item.progress.receivedQty }}/{{
+                      item.progress.approvedQty
+                    }}
+                    件，还可收 {{ item.progress.remainingQty }} 件。
+                  </span>
                 </p>
               </div>
 
@@ -396,7 +402,8 @@ onMounted(async () => {
 
         <p class="foot-note">
           B1 起客服会批准或驳回：批准保留原额度，驳回释放本单占用的额度。
-          两种结果都不修改可售库存、不写退货入库流水；仓库验收、退货入库与退款仍在后续阶段。
+          批准后仓库会分批收货验货，只有合格数量回补可售库存，损坏只留记录；
+          收货不释放额度，退款仍在后续阶段。
         </p>
       </div>
     </div>

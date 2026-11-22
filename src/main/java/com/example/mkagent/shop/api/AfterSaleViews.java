@@ -5,6 +5,8 @@ import com.example.mkagent.shop.aftersale.AfterSaleEligibility;
 import com.example.mkagent.shop.aftersale.AfterSaleEvent;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
 import com.example.mkagent.shop.aftersale.AfterSaleQuota;
+import com.example.mkagent.shop.aftersale.AfterSaleReceipt;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 
@@ -75,10 +77,44 @@ public final class AfterSaleViews {
     }
 
     /**
+     * 收货进度（B2）。
+     *
+     * <p>进度是**算出来的**：批准数量来自退货单，累计实收来自收货记录。
+     * 它不是一个独立状态，所以退货单的 {@code status} 仍然只有三种值。
+     */
+    public record ProgressVO(
+            String code,
+            String label,
+            int approvedQty,
+            int receivedQty,
+            int remainingQty
+    ) {
+    }
+
+    /**
+     * 一批收货 / 验货记录。
+     *
+     * @param movement 这一批产生的库存流水；整批损坏（合格 0 件）时为 {@code null}
+     */
+    public record ReceiptVO(
+            String receiptNo,
+            int receivedQty,
+            int qualifiedQty,
+            int damagedQty,
+            String note,
+            String operatorId,
+            LocalDateTime createdAt,
+            ShopViews.MovementVO movement
+    ) {
+    }
+
+    /**
      * 退货申请。
      *
-     * @param buyerId 买家身份（客服视角需要它定位是谁的单；对买家自己无隐私问题）
-     * @param events  事件流；列表接口为 {@code null}（未加载），详情接口为数组
+     * @param buyerId  买家身份（客服视角需要它定位是谁的单；对买家自己无隐私问题）
+     * @param progress 收货进度；非「已批准」状态为 {@code null}
+     * @param receipts 收货记录；列表接口为 {@code null}（未加载），详情接口为数组
+     * @param events   事件流；列表接口为 {@code null}（未加载），详情接口为数组
      * @param decision 决策记录；列表接口与未决策时为 {@code null}
      */
     public record ReturnVO(
@@ -98,6 +134,8 @@ public final class AfterSaleViews {
             String refundText,
             String reason,
             LocalDateTime createdAt,
+            ProgressVO progress,
+            List<ReceiptVO> receipts,
             DecisionVO decision,
             List<EventVO> events
     ) {
@@ -161,31 +199,58 @@ public final class AfterSaleViews {
     }
 
     /**
-     * 列表用：不带事件流与决策记录（未查询，不等于"没有"）。
+     * 列表用：不带事件流与收货记录（未查询，不等于"没有"）。
      *
-     * <p>为什么不在这里顺手查决策：列表是一次 SQL，决策是每行一次，
-     * 50 行就是 51 次查询。列表已经用 {@code statusLabel} 表达了结果，
-     * 需要"谁在什么时候为什么"时点开详情即可。
+     * <p>进度会带上：列表需要显示"已批准 / 部分收货 / 全部收货"，
+     * 它是**一次批量查询**算出来的（见 {@code AfterSaleService#progressOf}），
+     * 不是每行一次查询。
      */
-    public static ReturnVO summary(AfterSaleReturn value) {
-        return render(value, null, null);
+    public static ReturnVO summary(AfterSaleReturn value, AfterSaleReceiptProgress progress) {
+        return render(value, null, null, progress, null);
     }
 
-    public static ReturnVO detail(
-            AfterSaleReturn value,
-            List<AfterSaleEvent> events,
-            AfterSaleDecision decision
-    ) {
+    /** 详情用：退货单 + 事件 + 决策 + 进度 + 每批收货（含入库流水）。 */
+    public static ReturnVO detail(AfterSaleService.ReturnDetail detail) {
+        List<ReceiptVO> receipts = detail.receipts().stream()
+                .map(AfterSaleViews::receipt)
+                .toList();
+        AfterSaleDecision decision = detail.decision();
         return render(
-                value,
-                events.stream().map(AfterSaleViews::event).toList(),
-                decision == null ? null : decision(decision));
+                detail.value(),
+                detail.events().stream().map(AfterSaleViews::event).toList(),
+                decision == null ? null : decision(decision),
+                detail.progress(),
+                receipts);
+    }
+
+    public static ProgressVO progress(AfterSaleReceiptProgress progress) {
+        return new ProgressVO(
+                progress.code(),
+                progress.label(),
+                progress.approvedQty(),
+                progress.receivedQty(),
+                progress.remainingQty());
+    }
+
+    public static ReceiptVO receipt(AfterSaleService.ReceiptWithMovement value) {
+        AfterSaleReceipt receipt = value.receipt();
+        return new ReceiptVO(
+                receipt.receiptNo(),
+                receipt.receivedQty(),
+                receipt.qualifiedQty(),
+                receipt.damagedQty(),
+                receipt.note(),
+                receipt.operatorId(),
+                receipt.createdAt(),
+                value.movement() == null ? null : ShopViews.movement(value.movement()));
     }
 
     private static ReturnVO render(
             AfterSaleReturn value,
             List<EventVO> events,
-            DecisionVO decision
+            DecisionVO decision,
+            AfterSaleReceiptProgress progress,
+            List<ReceiptVO> receipts
     ) {
         return new ReturnVO(
                 value.returnNo(),
@@ -204,6 +269,8 @@ public final class AfterSaleViews {
                 ShopViews.money(value.refundCents()),
                 value.reason(),
                 value.createdAt(),
+                progress == null ? null : progress(progress),
+                receipts,
                 decision,
                 events);
     }

@@ -4,21 +4,26 @@ import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopAccessGuard;
 import com.example.mkagent.shop.ShopProperties;
 import com.example.mkagent.shop.aftersale.AfterSaleDecisionWriter;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptWriter;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.aftersale.AfterSaleStatus;
 import com.example.mkagent.shop.api.AfterSaleViews;
 import com.example.mkagent.shop.api.AfterSaleViews.ReturnVO;
 import com.example.mkagent.shop.api.ShopViews.PageVO;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 客服售后接口（B1）：按状态看退货申请、批准、驳回。
@@ -108,26 +113,23 @@ public class ShopAfterSaleAdminController {
         int defaultSize = properties.getAdminPageSize() > 0 ? properties.getAdminPageSize() : 20;
         int safeSize = size <= 0 ? defaultSize : Math.min(size, MAX_PAGE_SIZE);
 
-        List<ReturnVO> items = afterSaleService
-                .adminReturns(normalized, safeSize, (safePage - 1) * safeSize)
-                .stream()
-                .map(AfterSaleViews::summary)
+        List<AfterSaleReturn> values =
+                afterSaleService.adminReturns(normalized, safeSize, (safePage - 1) * safeSize);
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+
+        List<ReturnVO> items = values.stream()
+                .map(value -> AfterSaleViews.summary(value, progress.get(value.id())))
                 .toList();
 
         return new PageVO<>(items, safePage, safeSize, afterSaleService.adminReturnCount(normalized));
     }
 
-    /** 任意退货申请详情（含事件流与决策记录）。 */
+    /** 任意退货申请详情（含事件流、决策记录与收货记录）。 */
     @GetMapping("/returns/{returnNo}")
     public ReturnVO detail(@PathVariable String returnNo) {
         accessGuard.requireAdmin();
 
-        AfterSaleReturn value = requireReturn(returnNo);
-
-        return AfterSaleViews.detail(
-                value,
-                afterSaleService.events(value.id()),
-                afterSaleService.decision(value.id()).orElse(null));
+        return AfterSaleViews.detail(afterSaleService.detail(requireReturn(returnNo)));
     }
 
     /**
@@ -164,11 +166,58 @@ public class ShopAfterSaleAdminController {
         return detailOf(afterSaleService.reject(operatorId, returnNo, request.reason()));
     }
 
+    /**
+     * 收货 / 验货请求体（B2）。
+     *
+     * <p>只有"这一批的事实"：实收、合格、损坏、备注，以及前端生成的动作标识。
+     * 没有 {@code operatorId}（身份来自服务端）、没有 {@code approvedQty}
+     * （来自退货单）、没有 {@code returnId}（来自路径）。
+     */
+    public record ReceiveRequest(
+            Integer receivedQty,
+            Integer qualifiedQty,
+            Integer damagedQty,
+            String note,
+            String clientRequestId
+    ) {
+    }
+
+    /**
+     * 登记一批收货 + 验货结果（B2）。
+     *
+     * <p>只有**已批准**的退货单能收货；实收累计不得超过批准数量。
+     * 合格数量增加可售库存并写一条 {@code RETURN_INBOUND} 流水，
+     * 损坏数量只留在收货记录里。返回收货后的完整详情，
+     * 页面不必再发一次 GET 就能看到进度与这批入库流水。
+     */
+    @PostMapping("/returns/{returnNo}/receipts")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ReturnVO receive(
+            @PathVariable String returnNo,
+            @RequestBody(required = false) ReceiveRequest request
+    ) {
+        String operatorId = accessGuard.requireAdmin();
+
+        if (request == null) {
+            throw new BusinessException(
+                    400, AfterSaleReceiptWriter.CODE_INVALID_QUANTITY,
+                    "请求体不能为空：需要实收、合格与损坏数量");
+        }
+
+        afterSaleService.receive(
+                operatorId,
+                returnNo,
+                request.receivedQty(),
+                request.qualifiedQty(),
+                request.damagedQty(),
+                request.note(),
+                request.clientRequestId());
+
+        return AfterSaleViews.detail(afterSaleService.detail(requireReturn(returnNo)));
+    }
+
     private ReturnVO detailOf(AfterSaleReturn value) {
-        return AfterSaleViews.detail(
-                value,
-                afterSaleService.events(value.id()),
-                afterSaleService.decision(value.id()).orElse(null));
+        return AfterSaleViews.detail(afterSaleService.detail(value));
     }
 
     private AfterSaleReturn requireReturn(String returnNo) {

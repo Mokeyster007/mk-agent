@@ -193,6 +193,73 @@ class AfterSaleOldSchemaMigrationTest {
         assertTrue(ShopTestFixture.eventTypes(jdbc, returnNo).contains("APPROVED"));
     }
 
+    @Test
+    @DisplayName("旧流水表升级：补 dedupe_key 并回填，且允许同一订单行多笔退货入库")
+    void oldMovementTableMigratesWithoutClearingData() {
+        ShopTestFixture.createSignedOrder(
+                jdbc, ORDER_NO, BUYER, SKU, PRODUCT, "机械键盘 K87", 29900, 2, null);
+        Long orderId = jdbc.queryForObject(
+                "SELECT id FROM shop_order WHERE order_no = ?", Long.class, ORDER_NO);
+        Long itemId = jdbc.queryForObject(
+                "SELECT id FROM shop_order_item WHERE order_id = ?", Long.class, orderId);
+
+        rollbackMovementTableToA0(itemId);
+
+        // 老库：同一订单行 + 同类型只能一条 → 第一批入库可以，第二批被挡下来
+        jdbc.update("""
+                INSERT INTO shop_inventory_movement
+                    (sku, quantity_delta, movement_type, order_id, order_item_id,
+                     operator_id, note)
+                VALUES (?, 1, 'RETURN_INBOUND', ?, ?, ?, '第一批')
+                """, SKU, orderId, itemId, ADMIN);
+
+        assertThrows(DataAccessException.class, () -> jdbc.update("""
+                        INSERT INTO shop_inventory_movement
+                            (sku, quantity_delta, movement_type, order_id, order_item_id,
+                             operator_id, note)
+                        VALUES (?, 1, 'RETURN_INBOUND', ?, ?, ?, '第二批')
+                        """, SKU, orderId, itemId, ADMIN),
+                "老索引 (order_item_id, movement_type) 会把合法的第二批挡掉");
+
+        migrate();
+
+        // 老出库流水被回填成稳定的去重键，数据一条没丢
+        String backfilled = jdbc.queryForObject("""
+                SELECT dedupe_key FROM shop_inventory_movement
+                 WHERE order_item_id = ? AND movement_type = 'OUTBOUND_SHIPMENT'
+                """, String.class, itemId);
+        assertEquals("OUT:" + itemId, backfilled);
+
+        // 第一批入库流水也被回填（老库没有 dedupe_key，用主键兜底而不是丢掉）
+        String legacyInbound = jdbc.queryForObject("""
+                SELECT dedupe_key FROM shop_inventory_movement
+                 WHERE order_item_id = ? AND movement_type = 'RETURN_INBOUND'
+                """, String.class, itemId);
+        assertTrue(legacyInbound.startsWith("LEGACY:"), legacyInbound);
+
+        // 新的去重键按"收货记录"生效：同一订单行可以有多笔退货入库
+        jdbc.update("""
+                INSERT INTO shop_inventory_movement
+                    (sku, quantity_delta, movement_type, order_id, order_item_id,
+                     dedupe_key, operator_id, note)
+                VALUES (?, 1, 'RETURN_INBOUND', ?, ?, 'IN:2', ?, '第二批')
+                """, SKU, orderId, itemId, ADMIN);
+
+        Integer inbound = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM shop_inventory_movement
+                 WHERE order_item_id = ? AND movement_type = 'RETURN_INBOUND'
+                """, Integer.class, itemId);
+        assertEquals(2, inbound);
+
+        // 同一次入库写两遍仍然会被唯一索引挡住
+        assertThrows(DataAccessException.class, () -> jdbc.update("""
+                        INSERT INTO shop_inventory_movement
+                            (sku, quantity_delta, movement_type, order_id, order_item_id,
+                             dedupe_key, operator_id, note)
+                        VALUES (?, 1, 'RETURN_INBOUND', ?, ?, 'IN:2', ?, '重复')
+                        """, SKU, orderId, itemId, ADMIN));
+    }
+
     // ---------------------------------------------------------------
     // 辅助
     // ---------------------------------------------------------------
@@ -245,6 +312,36 @@ class AfterSaleOldSchemaMigrationTest {
                  WHERE UPPER(TABLE_NAME) = 'SHOP_AFTERSALE_DECISION'
                 """, Integer.class);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * 把库存流水表退回 A0 的形状。
+     *
+     * <p>三个动作缺一不可：去掉新的去重索引、去掉 dedupe_key 列、
+     * 恢复 A0 的 {@code (order_item_id, movement_type)} 唯一索引。
+     * 然后写一条"老出库流水"，用来验证迁移能把它回填而不是清掉。
+     */
+    private void rollbackMovementTableToA0(long orderItemId) {
+        jdbc.execute("DROP INDEX IF EXISTS uk_shop_inventory_movement_dedupe");
+        jdbc.execute("""
+                ALTER TABLE shop_inventory_movement
+                    DROP CONSTRAINT IF EXISTS ck_shop_inventory_movement_dedupe
+                """);
+        jdbc.execute("ALTER TABLE shop_inventory_movement DROP COLUMN IF EXISTS dedupe_key");
+        jdbc.execute("""
+                CREATE UNIQUE INDEX uk_shop_inventory_movement_source
+                    ON shop_inventory_movement (order_item_id, movement_type)
+                """);
+
+        Long orderId = jdbc.queryForObject("""
+                SELECT order_id FROM shop_order_item WHERE id = ?
+                """, Long.class, orderItemId);
+        jdbc.update("""
+                INSERT INTO shop_inventory_movement
+                    (sku, quantity_delta, movement_type, order_id, order_item_id,
+                     operator_id, note)
+                VALUES (?, -2, 'OUTBOUND_SHIPMENT', ?, ?, ?, '老库出库流水')
+                """, SKU, orderId, orderItemId, ADMIN);
     }
 
     /** 跑一遍真实的建表 / 迁移脚本（与启动时 `spring.sql.init` 用的是同一个文件）。 */

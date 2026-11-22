@@ -10,10 +10,11 @@ import java.util.List;
 /**
  * 库存服务。
  *
- * <p>写方法只有 {@link #applyOutbound}，且**强制要求已有事务**
+ * <p>写方法只有两个：{@link #applyOutbound}（发货出库）与
+ * {@link #applyInbound}（退货入库），且**都强制要求已有事务**
  * （{@code Propagation.MANDATORY}）：
- * "扣库存"与"更新订单状态"必须同生共死。允许它自己开一个事务，
- * 就等于允许"库存扣了、订单没发货"这种中间态出现在库里。
+ * "改库存"与"改业务单据"必须同生共死。允许它们自己开一个事务，
+ * 就等于允许"库存扣了、订单没发货"或"收货记了、库存没加"这种中间态出现在库里。
  * 用 MANDATORY 把这条约束变成运行时错误，而不是靠调用方自觉。
  */
 @Service
@@ -72,8 +73,70 @@ public class InventoryService {
                 InventoryMovement.TYPE_OUTBOUND_SHIPMENT,
                 orderId,
                 orderItemId,
+                null,
+                InventoryMovement.outboundKey(orderItemId),
                 operatorId,
                 "发货出库");
+    }
+
+    /**
+     * 退货入库：增加可售库存 + 写一笔正数流水。
+     *
+     * <p>调用方必须是收货写入服务，且已在事务里锁住订单行、并已把收货记录插入。
+     * 与出库一样用 {@link Propagation#MANDATORY}：
+     * "收货记录写了、库存没加"或"库存加了、收货记录没写"都是不可接受的状态。
+     *
+     * <p>去重键是 {@code IN:{收货记录id}}，不是订单行——
+     * 同一订单行可以有多批合法的退货入库，按订单行去重会把第二批挡掉。
+     *
+     * @param sku         入库 SKU
+     * @param quantity    合格数量（> 0；内部写成正数流水）
+     * @param orderId     来源订单 id
+     * @param orderItemId 来源订单行 id
+     * @param receiptId   收货记录 id（流水的唯一来源）
+     * @param operatorId  收货操作人
+     * @throws BusinessException 409 {@code INVENTORY_ROW_MISSING}（SKU 没有库存行，数据异常）
+     */
+    @Transactional(propagation = Propagation.MANDATORY)
+    public void applyInbound(
+            String sku,
+            int quantity,
+            long orderId,
+            long orderItemId,
+            long receiptId,
+            String operatorId
+    ) {
+        if (quantity <= 0) {
+            /*
+             * 合格数量为 0 时调用方不该调用本方法（整批损坏不入库）。
+             * 真调到了说明判断写错，直接失败比"入 0 件"更容易发现。
+             */
+            throw new IllegalStateException("退货入库数量必须为正数：" + quantity);
+        }
+
+        int updated = repository.addAvailable(sku, quantity);
+        if (updated == 0) {
+            throw new BusinessException(
+                    409,
+                    "INVENTORY_ROW_MISSING",
+                    "库存行不存在，无法回补：" + sku + "（本次收货已回滚）");
+        }
+
+        repository.insertMovement(
+                sku,
+                quantity,
+                InventoryMovement.TYPE_RETURN_INBOUND,
+                orderId,
+                orderItemId,
+                receiptId,
+                InventoryMovement.inboundKey(receiptId),
+                operatorId,
+                "退货入库（验货合格）");
+    }
+
+    /** 某张收货记录产生的流水（页面提交后直接展示）。 */
+    public List<InventoryMovement> movementsOfReceipt(long receiptId) {
+        return repository.findByReceiptId(receiptId);
     }
 
     /** 全部库存余额（后台核对）。 */

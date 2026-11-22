@@ -38,6 +38,7 @@ public class InventoryRepository {
     private static final RowMapper<InventoryMovement> MOVEMENT_MAPPER = (rs, rowNum) -> {
         Object orderId = rs.getObject("order_id");
         Object orderItemId = rs.getObject("order_item_id");
+        Object receiptId = rs.getObject("receipt_id");
         return new InventoryMovement(
                 rs.getLong("id"),
                 rs.getString("sku"),
@@ -45,6 +46,8 @@ public class InventoryRepository {
                 rs.getString("movement_type"),
                 orderId == null ? null : ((Number) orderId).longValue(),
                 orderItemId == null ? null : ((Number) orderItemId).longValue(),
+                receiptId == null ? null : ((Number) receiptId).longValue(),
+                rs.getString("dedupe_key"),
                 rs.getString("operator_id"),
                 rs.getString("note"),
                 rs.getTimestamp("created_at").toLocalDateTime());
@@ -70,15 +73,32 @@ public class InventoryRepository {
     }
 
     /**
+     * 原子增加可售库存（退货入库）。
+     *
+     * <p>加法不需要 {@code WHERE available >= ?}：可售数量没有上限约束，
+     * 唯一要防的是"重复入库"，那由调用方的事务 + {@code dedupe_key} 保证。
+     *
+     * @return 影响行数；0 表示该 SKU 没有库存行（数据异常，调用方必须失败）
+     */
+    public int addAvailable(String sku, int quantity) {
+        return jdbcTemplate.update("""
+                UPDATE shop_inventory_balance
+                   SET available = available + ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE sku = ?
+                """, quantity, sku);
+    }
+
+    /**
      * 写一条流水。
      *
      * <p>用 {@link PreparedStatement} 显式设置可空 BIGINT：
      * 直接把 {@code null} 当 Object 传，PostgreSQL 会报
      * "could not determine data type of parameter"（H2 不会，所以这种错只会在生产暴露）。
      *
-     * <p>同一订单行 + 同类型的重复写入会撞唯一索引
-     * {@code uk_shop_inventory_movement_source}。这里**不捕获**该异常：
-     * 唯一索引是兜底，触发即代表状态机被绕过，应当让事务整体失败。
+     * <p>{@code dedupeKey} 是"一次业务动作只写一条流水"的唯一键
+     * （出库 {@code OUT:{订单行}}、入库 {@code IN:{收货记录}}）。
+     * 这里**不捕获**撞键异常：唯一索引是兜底，触发即代表业务判断被绕过，
+     * 应当让事务整体失败，而不是悄悄吞掉一条流水。
      */
     public void insertMovement(
             String sku,
@@ -86,14 +106,17 @@ public class InventoryRepository {
             String movementType,
             Long orderId,
             Long orderItemId,
+            Long receiptId,
+            String dedupeKey,
             String operatorId,
             String note
     ) {
         jdbcTemplate.update(connection -> {
             PreparedStatement ps = connection.prepareStatement("""
                     INSERT INTO shop_inventory_movement
-                        (sku, quantity_delta, movement_type, order_id, order_item_id, operator_id, note)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (sku, quantity_delta, movement_type, order_id, order_item_id,
+                         receipt_id, dedupe_key, operator_id, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """);
             ps.setString(1, sku);
             ps.setInt(2, quantityDelta);
@@ -108,8 +131,14 @@ public class InventoryRepository {
             } else {
                 ps.setLong(5, orderItemId);
             }
-            ps.setString(6, operatorId);
-            ps.setString(7, note);
+            if (receiptId == null) {
+                ps.setNull(6, Types.BIGINT);
+            } else {
+                ps.setLong(6, receiptId);
+            }
+            ps.setString(7, dedupeKey);
+            ps.setString(8, operatorId);
+            ps.setString(9, note);
             return ps;
         });
     }
@@ -141,7 +170,7 @@ public class InventoryRepository {
     public List<InventoryMovement> findByOrderId(long orderId) {
         return jdbcTemplate.query("""
                 SELECT id, sku, quantity_delta, movement_type, order_id, order_item_id,
-                       operator_id, note, created_at
+                       receipt_id, dedupe_key, operator_id, note, created_at
                 FROM shop_inventory_movement
                 WHERE order_id = ?
                 ORDER BY id
@@ -152,7 +181,7 @@ public class InventoryRepository {
     public List<InventoryMovement> findRecent(int limit) {
         return jdbcTemplate.query("""
                 SELECT id, sku, quantity_delta, movement_type, order_id, order_item_id,
-                       operator_id, note, created_at
+                       receipt_id, dedupe_key, operator_id, note, created_at
                 FROM shop_inventory_movement
                 ORDER BY id DESC
                 LIMIT ?
@@ -163,12 +192,27 @@ public class InventoryRepository {
     public List<InventoryMovement> findBySku(String sku, int limit) {
         return jdbcTemplate.query("""
                 SELECT id, sku, quantity_delta, movement_type, order_id, order_item_id,
-                       operator_id, note, created_at
+                       receipt_id, dedupe_key, operator_id, note, created_at
                 FROM shop_inventory_movement
                 WHERE sku = ?
                 ORDER BY id DESC
                 LIMIT ?
                 """, MOVEMENT_MAPPER, sku, limit);
+    }
+
+    /**
+     * 某张收货记录产生的流水（B2：提交后直接看"这批入了多少"）。
+     *
+     * <p>一张收货记录最多一条流水：整批损坏时合格数量为 0，不写流水。
+     */
+    public List<InventoryMovement> findByReceiptId(long receiptId) {
+        return jdbcTemplate.query("""
+                SELECT id, sku, quantity_delta, movement_type, order_id, order_item_id,
+                       receipt_id, dedupe_key, operator_id, note, created_at
+                FROM shop_inventory_movement
+                WHERE receipt_id = ?
+                ORDER BY id
+                """, MOVEMENT_MAPPER, receiptId);
     }
 
     /** 库存行是否存在（种子与排查用）。 */

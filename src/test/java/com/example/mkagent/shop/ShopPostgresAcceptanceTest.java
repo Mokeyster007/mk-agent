@@ -336,8 +336,8 @@ class ShopPostgresAcceptanceTest extends AbstractPostgresShopTest {
                     Integer.class, SKU));
             throw new IllegalStateException("injected: 写流水失败（仅测试注入）");
         }).when(inventoryRepository)
-                .insertMovement(anyString(), anyInt(), anyString(), any(), any(),
-                        anyString(), anyString());
+                .insertMovement(anyString(), anyInt(), anyString(), any(), any(), any(),
+                        anyString(), anyString(), anyString());
 
         ShopApiClient.Reply failed = api.post(shipUrl(orderNo), ADMIN, null);
 

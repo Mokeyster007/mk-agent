@@ -156,7 +156,7 @@ class ShopIdentityDisabledIntegrationTest {
      * 而不是 {@code NOT_ADMIN}（权限不足）——先解释"为什么不行"。
      */
     @Test
-    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回都不放行")
+    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回、收货都不放行")
     void afterSaleAdminEntriesRejected() {
         ShopApiClient.Reply list = api.get("/shop/admin/aftersale/returns", ADMIN);
         assertEquals(403, list.status(), list.raw());
@@ -175,8 +175,20 @@ class ShopIdentityDisabledIntegrationTest {
         assertEquals(403, reject.status(), reject.raw());
         assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", reject.text("code"));
 
+        // B2：收货会改可售库存，身份不可信时同样一律拒绝
+        ShopApiClient.Reply receive = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/receipts", ADMIN,
+                Map.of("receivedQty", 1, "qualifiedQty", 1, "damagedQty", 0,
+                        "clientRequestId", "rc-disabled-0001"));
+        assertEquals(403, receive.status(), receive.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", receive.text("code"));
+
         Integer decisions = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM shop_aftersale_decision", Integer.class);
         assertEquals(0, decisions, "被拒绝的请求不得留下决策记录");
+
+        Integer receipts = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_receipt", Integer.class);
+        assertEquals(0, receipts, "被拒绝的请求不得留下收货记录");
     }
 }

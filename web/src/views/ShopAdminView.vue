@@ -277,7 +277,7 @@ onMounted(loadAll)
               </table>
 
               <div class="moves">
-                <h3 class="moves__title">最近出库流水</h3>
+                <h3 class="moves__title">最近库存流水</h3>
                 <p v-if="!shop.state.inventory?.movements.length" class="muted">
                   还没有任何流水。
                 </p>
@@ -286,12 +286,19 @@ onMounted(loadAll)
                     v-for="move in shop.state.inventory?.movements ?? []"
                     :key="move.id"
                     class="moves__item"
+                    :data-movement-type="move.type"
+                    :data-movement-id="move.id"
                   >
-                    <span class="moves__delta">{{ move.quantityDelta }}</span>
+                    <span
+                      class="moves__delta"
+                      :class="{ 'moves__delta--in': move.quantityDelta > 0 }"
+                    >
+                      {{ move.quantityDelta > 0 ? `+${move.quantityDelta}` : move.quantityDelta }}
+                    </span>
                     <div class="moves__body">
                       <p class="moves__sku">{{ move.sku }}</p>
                       <p class="moves__meta">
-                        {{ move.type }} · {{ move.operatorId ?? '未知' }} ·
+                        {{ move.typeLabel || move.type }} · {{ move.operatorId ?? '未知' }} ·
                         {{ formatDateTime(move.createdAt) }}
                       </p>
                     </div>
@@ -304,6 +311,8 @@ onMounted(loadAll)
           <p class="foot-note">
             发货在同一个数据库事务内完成：校验状态 → 扣减可售库存 → 写一笔出库流水 → 更新订单状态。
             库存不足时整体回滚，订单保持待发货。重复发货不会重复扣减。
+            退货入库是另一条流水（`RETURN_INBOUND`），只在仓库收货且本批有合格件时产生，
+            并按收货记录去重：同一批重试不会加两次库存。
           </p>
         </template>
       </div>
@@ -641,6 +650,10 @@ onMounted(loadAll)
   font-size: var(--fs-sm);
   color: var(--c-warn);
   min-width: 32px;
+}
+
+.moves__delta--in {
+  color: var(--c-ok);
 }
 
 .moves__sku {

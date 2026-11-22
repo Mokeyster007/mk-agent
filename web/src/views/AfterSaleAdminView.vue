@@ -1,14 +1,16 @@
 <script setup lang="ts">
 /**
- * 客服售后处理（B1）：按状态看退货申请、批准、驳回。
+ * 客服售后处理（B1 决策 + B2 收货验货）。
  *
- * 三点必须说清楚：
+ * 四点必须说清楚：
  * 1. 权限由服务端判定（`requireAdmin`）。页面隐藏按钮只是不让人白点一次，
  *    真正拦住越权的是后端 403；普通买家打开这个页面只会看到"当前身份不能处理"；
  * 2. 批准 = **保留额度**（那部分数量仍然不能再申请）；驳回 = **释放额度**
- *    （同一事务内把 reserved_qty 减回去）。两者都不动可售库存、不写入库流水；
- * 3. 重复或相反决策会被后端 409 拒绝，页面不重试、不猜测，
- *    而是重新读详情把真实决策摆出来。
+ *    （同一事务内把 reserved_qty 减回去）；
+ * 3. 收货 = **只有已批准的单能收**，只有合格数量回补可售库存。
+ *    收货**不释放**额度：收进来的件数已经把这份退货资格用掉了；
+ * 4. 重复或相反决策、超收、状态已变都会被后端 409 拒绝，页面不重试、不猜测，
+ *    而是重新读详情把真实事实摆出来。
  */
 import { computed, onMounted, ref } from 'vue'
 import AppShell from '@/components/AppShell.vue'
@@ -19,7 +21,8 @@ import AppIcon from '@/components/AppIcon.vue'
 import { session } from '@/stores/session'
 import { shop } from '@/stores/shop'
 import { afterSaleAdmin } from '@/stores/aftersaleAdmin'
-import { afterSaleStatusTone } from '@/stores/aftersale'
+import { afterSaleStatusTone, newClientRequestId } from '@/stores/aftersale'
+import type { AfterSaleReturnVO } from '@/api/aftersale'
 import { formatDateTime } from '@/utils/format'
 
 const navOpen = ref(false)
@@ -35,12 +38,44 @@ const TABS: { value: string | null; label: string }[] = [
 const rejectingNo = ref<string | null>(null)
 const rejectReason = ref('')
 
+/** 正在填写收货结果的那一单（null 表示没有）。 */
+const receivingNo = ref<string | null>(null)
+const receiveReceived = ref(1)
+const receiveQualified = ref(1)
+const receiveDamaged = ref(0)
+const receiveNote = ref('')
+/**
+ * 这一批收货的标识：打开面板时生成一次，提交期间不变。
+ * 同一次点击的重试会命中服务端的幂等键（不重复加库存）；
+ * 改完数量再提交则是另一批，必须换新值——所以成功后才重置。
+ */
+const receiveRequestId = ref('')
+
 const detailOpen = computed(() => afterSaleAdmin.state.detail !== null)
 
 const canOperate = computed(() => shop.canOperate.value)
 
 const identityDisabled = computed(
   () => shop.state.session !== null && shop.state.session.identityMode === 'DISABLED',
+)
+
+/** 当前打开的那一单（用来显示"批准 / 累计 / 本次上限"）。 */
+const receivingItem = computed<AfterSaleReturnVO | null>(
+  () => afterSaleAdmin.state.returns.find((item) => item.returnNo === receivingNo.value) ?? null,
+)
+
+/** 本次最多能收几件（批准数量 - 累计实收）。 */
+const receiveLimit = computed(() => receivingItem.value?.progress?.remainingQty ?? 0)
+
+/** 前端只挡"明显不合法"的输入；真正的判定在服务端事务里。 */
+const receiveInvalid = computed(
+  () =>
+    !Number.isInteger(receiveReceived.value) ||
+    receiveReceived.value <= 0 ||
+    receiveReceived.value > receiveLimit.value ||
+    receiveQualified.value < 0 ||
+    receiveDamaged.value < 0 ||
+    receiveQualified.value + receiveDamaged.value !== receiveReceived.value,
 )
 
 async function loadAll(): Promise<void> {
@@ -85,7 +120,81 @@ async function onApprove(returnNo: string): Promise<void> {
   await afterSaleAdmin.approve(returnNo)
 }
 
-onMounted(loadAll)
+function startReceive(item: AfterSaleReturnVO): void {
+  receivingNo.value = item.returnNo
+  const limit = Math.max(1, item.progress?.remainingQty ?? item.quantity)
+  receiveReceived.value = limit
+  receiveQualified.value = limit
+  receiveDamaged.value = 0
+  receiveNote.value = ''
+  receiveRequestId.value = newClientRequestId()
+}
+
+function cancelReceive(): void {
+  receivingNo.value = null
+  receiveNote.value = ''
+  receiveRequestId.value = ''
+}
+
+/**
+ * 三个数量联动，保证"合格 + 损坏 = 实收"恒成立。
+ *
+ * 规则：最后编辑的那个字段说话，另外两个跟着算。
+ * 不做"提交时再校验"，是因为操作员需要一个立刻能看懂的数字。
+ */
+function onReceivedChange(): void {
+  const received = clampReceive(receiveReceived.value)
+  receiveReceived.value = received
+  receiveQualified.value = Math.min(Math.max(receiveQualified.value, 0), received)
+  receiveDamaged.value = received - receiveQualified.value
+}
+
+function onQualifiedChange(): void {
+  const received = clampReceive(receiveReceived.value)
+  receiveQualified.value = Math.min(Math.max(receiveQualified.value, 0), received)
+  receiveDamaged.value = received - receiveQualified.value
+}
+
+function onDamagedChange(): void {
+  const received = clampReceive(receiveReceived.value)
+  receiveDamaged.value = Math.min(Math.max(receiveDamaged.value, 0), received)
+  receiveQualified.value = received - receiveDamaged.value
+}
+
+function clampReceive(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1
+  }
+  return Math.min(Math.max(Math.trunc(value), 1), Math.max(1, receiveLimit.value))
+}
+
+async function confirmReceive(returnNo: string): Promise<void> {
+  if (receiveInvalid.value) {
+    return
+  }
+  const updated = await afterSaleAdmin.receive(returnNo, {
+    receivedQty: receiveReceived.value,
+    qualifiedQty: receiveQualified.value,
+    damagedQty: receiveDamaged.value,
+    note: receiveNote.value,
+    clientRequestId: receiveRequestId.value,
+  })
+  if (updated) {
+    cancelReceive()
+  }
+}
+
+onMounted(async () => {
+  /*
+   * 进入页面先关掉上一次留下的详情抽屉。
+   *
+   * store 是模块级单例，跨路由不销毁：从别的页面回来时 `state.detail` 还挂着
+   * 上一单的内容，抽屉会盖住列表右半边（收货 / 详情按钮正好在那儿）。
+   * 关掉它比让用户先找关闭按钮更合理。
+   */
+  afterSaleAdmin.closeDetail()
+  await loadAll()
+})
 </script>
 
 <template>
@@ -102,7 +211,7 @@ onMounted(loadAll)
     <template #topbar>
       <div class="topbar">
         <h1 class="topbar__title">售后处理</h1>
-        <span class="topbar__demo">B1 · 批准 / 驳回</span>
+        <span class="topbar__demo">B2 · 批准 / 驳回 / 收货</span>
 
         <div class="topbar__right">
           <span class="topbar__identity">{{ shop.state.session?.userId ?? '未识别身份' }}</span>
@@ -162,6 +271,7 @@ onMounted(loadAll)
 
             <p class="section__hint">
               批准保留原额度，驳回释放本单申请数量。两种操作都不改可售库存、不写退货入库流水。
+              已批准的单可以收货：只有合格数量回补可售库存，损坏只留记录；收货不释放额度。
             </p>
 
             <p
@@ -207,6 +317,15 @@ onMounted(loadAll)
                     <span class="chip" :class="`chip--${afterSaleStatusTone(item.status)}`">
                       {{ item.statusLabel }}
                     </span>
+                    <span
+                      v-if="item.status === 'APPROVED' && item.progress"
+                      class="row__progress"
+                      :data-receipt-progress="item.returnNo"
+                    >
+                      {{ item.progress.label }} {{ item.progress.receivedQty }}/{{
+                        item.progress.approvedQty
+                      }}
+                    </span>
                   </div>
                 </div>
 
@@ -233,6 +352,19 @@ onMounted(loadAll)
                     @click="startReject(item.returnNo)"
                   >
                     驳回
+                  </button>
+                  <button
+                    v-if="item.status === 'APPROVED'"
+                    type="button"
+                    class="mk-btn mk-btn--sm mk-btn--primary"
+                    data-action="receive"
+                    :disabled="
+                      (item.progress?.remainingQty ?? 0) <= 0 ||
+                      afterSaleAdmin.state.busyReturnNo !== null
+                    "
+                    @click="startReceive(item)"
+                  >
+                    {{ (item.progress?.remainingQty ?? 0) <= 0 ? '已收满' : '收货' }}
                   </button>
                   <button
                     type="button"
@@ -275,6 +407,97 @@ onMounted(loadAll)
                     <span class="reject__hint">驳回后额度立即释放，买家在「我的售后」能看到原因。</span>
                   </div>
                 </div>
+
+                <div
+                  v-if="receivingNo === item.returnNo"
+                  class="receive"
+                  :data-receive-for="item.returnNo"
+                >
+                  <p class="receive__meta">
+                    批准 <strong>{{ item.quantity }}</strong> 件 · 已收
+                    <strong>{{ item.progress?.receivedQty ?? 0 }}</strong> 件 · 本批最多可收
+                    <strong data-receive-limit>{{ receiveLimit }}</strong> 件
+                  </p>
+
+                  <div class="receive__grid">
+                    <label class="field">
+                      <span class="field__label">实收数量</span>
+                      <input
+                        v-model.number="receiveReceived"
+                        class="field__input"
+                        type="number"
+                        min="1"
+                        :max="receiveLimit"
+                        data-receive-input="received"
+                        @input="onReceivedChange"
+                      />
+                    </label>
+                    <label class="field">
+                      <span class="field__label">合格（回补可售）</span>
+                      <input
+                        v-model.number="receiveQualified"
+                        class="field__input"
+                        type="number"
+                        min="0"
+                        :max="receiveReceived"
+                        data-receive-input="qualified"
+                        @input="onQualifiedChange"
+                      />
+                    </label>
+                    <label class="field">
+                      <span class="field__label">损坏（只留记录）</span>
+                      <input
+                        v-model.number="receiveDamaged"
+                        class="field__input"
+                        type="number"
+                        min="0"
+                        :max="receiveReceived"
+                        data-receive-input="damaged"
+                        @input="onDamagedChange"
+                      />
+                    </label>
+                  </div>
+
+                  <label class="field">
+                    <span class="field__label">备注（选填，最多 200 字）</span>
+                    <input
+                      v-model="receiveNote"
+                      class="field__input"
+                      type="text"
+                      maxlength="200"
+                      data-receive-input="note"
+                      placeholder="例如：外箱压瘪，内件完好"
+                    />
+                  </label>
+
+                  <div class="receive__actions">
+                    <button
+                      type="button"
+                      class="mk-btn mk-btn--sm mk-btn--primary"
+                      data-action="receive-confirm"
+                      :disabled="receiveInvalid || afterSaleAdmin.state.busyReturnNo !== null"
+                      @click="confirmReceive(item.returnNo)"
+                    >
+                      {{
+                        afterSaleAdmin.state.busyReturnNo === item.returnNo &&
+                        afterSaleAdmin.state.busyAction === 'receive'
+                          ? '入库中…'
+                          : '确认收货'
+                      }}
+                    </button>
+                    <button type="button" class="mk-btn mk-btn--sm" @click="cancelReceive()">
+                      取消
+                    </button>
+                    <span class="receive__hint">
+                      合格 {{ receiveQualified }} 件回补可售库存；损坏
+                      {{ receiveDamaged }} 件只留记录、不建残次库存；额度不释放。
+                    </span>
+                  </div>
+
+                  <p v-if="receiveInvalid" class="receive__error" data-receive-error>
+                    实收要大于 0 且不超过本批上限 {{ receiveLimit }} 件，并且「合格 + 损坏 = 实收」。
+                  </p>
+                </div>
               </li>
             </ul>
 
@@ -306,6 +529,8 @@ onMounted(loadAll)
             决策在同一个数据库事务内完成：校验前置状态 → 条件更新状态 → （驳回）释放额度 →
             写决策记录 → 写事件。任一步失败整笔回滚，不会留下"状态改了但额度没退"的中间态。
             重复或相反决策一律 409，不新增事件、不改额度。
+            收货同样在一个事务里：锁原订单行 → 重读状态与累计实收 → 校验不超收 → 写收货记录 →
+            （合格数量）加可售库存 + 写一条退货入库流水。只有全部成功才提交，库存和记录不会只落一半。
           </p>
         </template>
       </div>
@@ -545,6 +770,12 @@ onMounted(loadAll)
   justify-items: end;
 }
 
+.row__progress {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  white-space: nowrap;
+}
+
 .row__actions {
   display: flex;
   align-items: center;
@@ -571,6 +802,52 @@ onMounted(loadAll)
 .reject__hint {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
+}
+
+.receive {
+  flex-basis: 100%;
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  border: 1px dashed var(--c-accent-ink);
+  border-radius: var(--r-md);
+  background: var(--c-accent-weak);
+}
+
+.receive__meta {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: var(--lh-base);
+}
+
+.receive__meta strong {
+  font-family: var(--font-mono);
+  color: var(--c-text);
+}
+
+.receive__grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s-2);
+}
+
+.receive__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.receive__hint {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  line-height: var(--lh-base);
+}
+
+.receive__error {
+  font-size: var(--fs-xs);
+  color: var(--c-danger);
+  line-height: var(--lh-base);
 }
 
 .field {
@@ -670,6 +947,10 @@ onMounted(loadAll)
 
   .row__actions {
     justify-content: flex-end;
+  }
+
+  .receive__grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 </style>

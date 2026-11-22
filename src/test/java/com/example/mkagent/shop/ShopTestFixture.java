@@ -21,17 +21,21 @@ final class ShopTestFixture {
 
     static void reset(JdbcTemplate jdbc) {
         /*
-         * 先清售后（A1 / B1），再清订单（A0）：
-         * shop_aftersale_return / quota / event / decision 都有外键指向订单与订单行，
+         * 先清售后（A1 / B1 / B2），再清订单（A0）：
+         * shop_aftersale_return / quota / event / decision / receipt 都有外键指向订单与订单行，
          * 顺序反了会直接违反外键约束。
+         *
+         * shop_inventory_movement 有外键指向收货记录（B2），
+         * 所以它必须排在收货记录**之前**删除。
          */
         jdbc.update("DELETE FROM shop_aftersale_event");
         jdbc.update("DELETE FROM shop_aftersale_decision");
+        jdbc.update("DELETE FROM shop_inventory_movement");
+        jdbc.update("DELETE FROM shop_aftersale_receipt");
         jdbc.update("DELETE FROM shop_aftersale_return");
         jdbc.update("DELETE FROM shop_aftersale_quota");
         jdbc.update("DELETE FROM shop_aftersale_idempotency");
 
-        jdbc.update("DELETE FROM shop_inventory_movement");
         jdbc.update("DELETE FROM shop_order_item");
         jdbc.update("DELETE FROM shop_order");
 
@@ -272,5 +276,71 @@ final class ShopTestFixture {
                 """, Integer.class, orderNo);
         int want = expected == null ? 0 : expected;
         return occupied == want ? null : "occupied=" + occupied + " 但有效申请合计=" + want;
+    }
+
+    // ---------------------------------------------------------------
+    // B2 收货夹具
+    // ---------------------------------------------------------------
+
+    /** 某退货单的收货记录条数。 */
+    static int receiptCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的累计实收数量（没有收货记录时为 0）。 */
+    static int receivedQtyOf(JdbcTemplate jdbc, String returnNo) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(c.received_qty), 0)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某退货单的累计合格数量（= 应当回补到可售库存的数量）。 */
+    static int qualifiedQtyOf(JdbcTemplate jdbc, String returnNo) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(c.qualified_qty), 0)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某 SKU 上指定类型的流水条数（断言"只有一笔 +1 入库"时用）。 */
+    static int movementCountOfType(JdbcTemplate jdbc, String sku, String type) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM shop_inventory_movement
+                WHERE sku = ? AND movement_type = ?
+                """, Integer.class, sku, type);
+        return count == null ? 0 : count;
+    }
+
+    /** 某 SKU 上指定类型流水的数量合计（正负号原样相加）。 */
+    static int movementDeltaOfType(JdbcTemplate jdbc, String sku, String type) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(quantity_delta), 0) FROM shop_inventory_movement
+                WHERE sku = ? AND movement_type = ?
+                """, Integer.class, sku, type);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某张收货记录关联的流水条数（最多一条：整批损坏时没有流水）。 */
+    static int movementCountOfReceipt(JdbcTemplate jdbc, String receiptNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_inventory_movement m
+                JOIN shop_aftersale_receipt c ON c.id = m.receipt_id
+                WHERE c.receipt_no = ?
+                """, Integer.class, receiptNo);
+        return count == null ? 0 : count;
     }
 }

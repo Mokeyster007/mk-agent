@@ -54,6 +54,8 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
     refundText: '¥299.00',
     reason: '键盘按键失灵',
     createdAt: '2026-11-22T10:15:00',
+    progress: null,
+    receipts: null,
     decision: null,
     events: null,
     ...overrides,

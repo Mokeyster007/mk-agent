@@ -101,6 +101,25 @@ public class AfterSaleRepository {
                     rs.getString("decided_by"),
                     toLocal(rs.getTimestamp("decided_at")));
 
+    private static final String SELECT_RECEIPT = """
+            SELECT id, receipt_no, return_id, order_item_id, received_qty,
+                   qualified_qty, damaged_qty, note, operator_id, created_at
+            FROM shop_aftersale_receipt
+            """;
+
+    private static final RowMapper<AfterSaleReceipt> RECEIPT_MAPPER = (rs, rowNum) ->
+            new AfterSaleReceipt(
+                    rs.getLong("id"),
+                    rs.getString("receipt_no"),
+                    rs.getLong("return_id"),
+                    rs.getLong("order_item_id"),
+                    rs.getInt("received_qty"),
+                    rs.getInt("qualified_qty"),
+                    rs.getInt("damaged_qty"),
+                    rs.getString("note"),
+                    rs.getString("operator_id"),
+                    toLocal(rs.getTimestamp("created_at")));
+
     private final JdbcTemplate jdbcTemplate;
 
     public AfterSaleRepository(JdbcTemplate jdbcTemplate) {
@@ -402,6 +421,117 @@ public class AfterSaleRepository {
                     (return_id, event_type, actor_id, note, created_at)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, returnId, type, actorId, note);
+    }
+
+    // ---------------------------------------------------------------
+    // B2：收货 / 验货
+    // ---------------------------------------------------------------
+
+    /** 某退货单的全部收货记录（按写入顺序）。 */
+    public List<AfterSaleReceipt> findReceipts(long returnId) {
+        return jdbcTemplate.query(
+                SELECT_RECEIPT + " WHERE return_id = ? ORDER BY id",
+                RECEIPT_MAPPER,
+                returnId);
+    }
+
+    /**
+     * 累计实收数量。
+     *
+     * <p>必须在**持有订单行锁之后**读：锁之前读到的累计值可能已经被
+     * 另一批收货改掉，用它判断"还能收几件"会放过一次超收。
+     */
+    public int sumReceivedQty(long returnId) {
+        Integer sum = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(SUM(received_qty), 0) FROM shop_aftersale_receipt WHERE return_id = ?",
+                Integer.class,
+                returnId);
+        return sum == null ? 0 : sum;
+    }
+
+    /**
+     * 一批退货单的累计实收（列表页用，避免每行一次查询）。
+     *
+     * @return key = return_id；没有收货记录的退货单不出现在结果里
+     */
+    public java.util.Map<Long, Integer> receivedQtyByReturns(List<Long> returnIds) {
+        if (returnIds == null || returnIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(returnIds.size(), "?"));
+        java.util.Map<Long, Integer> result = new java.util.HashMap<>();
+        jdbcTemplate.query(
+                "SELECT return_id, SUM(received_qty) AS received"
+                        + " FROM shop_aftersale_receipt"
+                        + " WHERE return_id IN (" + placeholders + ")"
+                        + " GROUP BY return_id",
+                rs -> {
+                    result.put(rs.getLong("return_id"), rs.getInt("received"));
+                },
+                returnIds.toArray());
+        return result;
+    }
+
+    /** 按幂等键找收货记录（重放用）。 */
+    public Optional<StoredReceipt> findReceiptByRequestKey(String requestKey) {
+        return jdbcTemplate.query(
+                """
+                        SELECT id, receipt_no, return_id, order_item_id, received_qty,
+                               qualified_qty, damaged_qty, note, operator_id, created_at,
+                               request_hash
+                        FROM shop_aftersale_receipt
+                        WHERE request_key = ?
+                        """,
+                (rs, rowNum) -> new StoredReceipt(
+                        rs.getString("request_hash"),
+                        RECEIPT_MAPPER.mapRow(rs, rowNum)),
+                requestKey).stream().findFirst();
+    }
+
+    public Optional<AfterSaleReceipt> findReceiptById(long receiptId) {
+        return jdbcTemplate.query(
+                SELECT_RECEIPT + " WHERE id = ?",
+                RECEIPT_MAPPER,
+                receiptId).stream().findFirst();
+    }
+
+    /**
+     * 写一条收货记录，返回自增 id。
+     *
+     * <p>{@code uk(request_key)} 是"同一次收货动作只落一条"的数据库兜底；
+     * 正常路径由写入前的幂等预检 + 行锁挡住，**不靠撞唯一键**来处理重试。
+     */
+    public long insertReceipt(
+            String receiptNo,
+            long returnId,
+            long orderItemId,
+            int receivedQty,
+            int qualifiedQty,
+            int damagedQty,
+            String note,
+            String requestKey,
+            String requestHash,
+            String operatorId
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_receipt
+                    (receipt_no, return_id, order_item_id, received_qty, qualified_qty,
+                     damaged_qty, note, request_key, request_hash, operator_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                receiptNo, returnId, orderItemId, receivedQty, qualifiedQty,
+                damagedQty, note, requestKey, requestHash, operatorId);
+
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM shop_aftersale_receipt WHERE receipt_no = ?", Long.class, receiptNo);
+        if (id == null) {
+            throw new IllegalStateException("收货记录插入后取不到 id：" + receiptNo);
+        }
+        return id;
+    }
+
+    /** 幂等键命中时读到的"首次结果"。 */
+    public record StoredReceipt(String requestHash, AfterSaleReceipt receipt) {
     }
 
     // ---------------------------------------------------------------

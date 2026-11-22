@@ -65,7 +65,46 @@ export interface AfterSaleDecisionVO {
   decidedAt: string | null
 }
 
-/** 退货申请。列表接口 `events` / `decision` 为 null（未加载），详情接口才有值。 */
+/** 库存流水（退货入库那一条会带 receiptId）。 */
+export interface AfterSaleMovementVO {
+  id: number
+  sku: string
+  quantityDelta: number
+  type: string
+  typeLabel: string
+  orderId: number | null
+  orderItemId: number | null
+  receiptId: number | null
+  operatorId: string | null
+  createdAt: string | null
+}
+
+/**
+ * 收货进度：**算出来的**，不是退货单上的第四个状态。
+ *
+ * 未批准时为 null；批准后 code 只会是 NONE / PARTIAL / COMPLETE。
+ */
+export interface AfterSaleProgressVO {
+  code: string
+  label: string
+  approvedQty: number
+  receivedQty: number
+  remainingQty: number
+}
+
+/** 一批收货 / 验货记录；整批损坏时 `movement` 为 null（没有入库）。 */
+export interface AfterSaleReceiptVO {
+  receiptNo: string
+  receivedQty: number
+  qualifiedQty: number
+  damagedQty: number
+  note: string | null
+  operatorId: string
+  createdAt: string | null
+  movement: AfterSaleMovementVO | null
+}
+
+/** 退货申请。列表接口 `events` / `receipts` 为 null（未加载），详情接口才有值。 */
 export interface AfterSaleReturnVO {
   returnNo: string
   orderNo: string
@@ -83,6 +122,8 @@ export interface AfterSaleReturnVO {
   refundText: string
   reason: string
   createdAt: string | null
+  progress: AfterSaleProgressVO | null
+  receipts: AfterSaleReceiptVO[] | null
   decision: AfterSaleDecisionVO | null
   events: AfterSaleEventVO[] | null
 }
@@ -238,6 +279,43 @@ export function rejectAdminReturn(
   return requestJson<AfterSaleReturnVO>(
     `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}/reject`,
     { method: 'POST', body: { reason }, signal },
+  )
+}
+
+/**
+ * 收货 + 验货（B2）。
+ *
+ * 只有**已批准**的退货单能收；`qualifiedQty + damagedQty` 必须等于 `receivedQty`，
+ * 累计实收不得超过批准数量。合格数量增加可售库存，损坏数量只留记录。
+ *
+ * `clientRequestId` 是**这一批收货动作**的标识：重试沿用同一个值（返回原记录、
+ * 不重复加库存），用户改了数量或备注就是另一批，必须换新值。
+ * 请求体里没有操作人字段：收货人由服务端身份决定。
+ */
+export function receiveAdminReturn(
+  returnNo: string,
+  input: {
+    receivedQty: number
+    qualifiedQty: number
+    damagedQty: number
+    note?: string | null
+    clientRequestId: string
+  },
+  signal?: AbortSignal,
+): Promise<AfterSaleReturnVO> {
+  return requestJson<AfterSaleReturnVO>(
+    `/api/shop/admin/aftersale/returns/${encodeURIComponent(returnNo)}/receipts`,
+    {
+      method: 'POST',
+      body: {
+        receivedQty: input.receivedQty,
+        qualifiedQty: input.qualifiedQty,
+        damagedQty: input.damagedQty,
+        note: input.note ?? null,
+        clientRequestId: input.clientRequestId,
+      },
+      signal,
+    },
   )
 }
 

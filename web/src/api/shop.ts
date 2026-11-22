@@ -35,13 +35,23 @@ export interface ShopOrderItemVO {
   lineText: string
 }
 
+/**
+ * 库存流水（只增不改）。
+ *
+ * `typeLabel` 是服务端给的中文（发货出库 / 退货入库），界面不自己映射枚举；
+ * `receiptId` 只在退货入库时非空，指向收货记录——它让"这一批入了多少库"可追溯。
+ */
 export interface ShopMovementVO {
   id: number
   sku: string
   quantityDelta: number
   type: string
+  /** 发货出库 / 退货入库（未知类型原样返回） */
+  typeLabel: string
   orderId: number | null
   orderItemId: number | null
+  /** 退货入库对应的收货记录；出库为 null */
+  receiptId: number | null
   operatorId: string | null
   createdAt: string | null
 }

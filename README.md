@@ -73,13 +73,13 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
 - **价格与归属由服务端决定**：下单请求体只有 `productId` + `quantity`，
   没有价格、没有 buyerId 字段可绑
 - **不依赖大模型**：模型不可用或没配凭据时，商城闭环照常运行
-- **两种数据库都验过**：H2（全量 841 项）+ 真实 PostgreSQL 16.15（专项 13 项，
+- **两种数据库都验过**：H2（全量套件，当前 931 项）+ 真实 PostgreSQL 16.15（专项 13 项，
   `./mvnw -Ppg test "-Dtest=ShopPostgres*"`）
 - 详见 [`docs/shop-a0.md`](docs/shop-a0.md) 与 [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)
 
 > 演示付款：`payment_mode = 'DEMO'`，没有真实资金交易、没有退款、没有物流。
-> 售后 A1（退货申请）与 B1（客服批准 / 驳回）已实施，见 1.3、1.4；
-> B2（仓库验收 / 退货入库 / 退款）仍未实施。
+> 售后 A1（退货申请）、B1（客服批准 / 驳回）、B2（仓库收货验货 / 库存回补）已实施，见 1.3、1.4、1.5；
+> 退款仍未实施。
 
 ### 1.3 售后（A1：退货申请 + 售后 Agent）
 
@@ -134,7 +134,36 @@ BaseAgent          Agent Loop 骨架：循环控制、步数/工具预算、超�
   真实 PostgreSQL 16（专项 5 项，`./mvnw -Ppg test "-Dtest=AfterSaleDecisionPostgresTest"`）
 - 详见 [`docs/shop-b1.md`](docs/shop-b1.md)
 
-> B2（仓库验收 / 退货入库 / 退款）未实施，设计建议见 `docs/shop-b1.md` 第 11 节。
+> B2（收货验货 / 可售库存回补）见 1.5；退款仍未实施。
+
+### 1.5 售后（B2：仓库收货、验货与可售库存回补）
+
+仓库对**已批准**的退货单收货：一张单可以**分多批**收，每批登记实收 / 合格 / 损坏。
+**只有合格数量回补可售库存**，损坏只留记录、不建残次库存。闭环到"货进来了、库存回来了"，
+**仍然不退款**。
+
+- **入口**：`/shop/admin/aftersale` 列表行上，已批准的单多一个「收货」按钮
+  （显示批准数量 / 累计实收 / 本批可收上限，三个数量框联动，实收被夹在本批上限内）
+- **进度是算出来的**：`未收货 / 部分收货 / 全部收货` + `receivedQty / approvedQty`，
+  不给退货单加第四个状态（主状态仍表达客服结论）
+- **收货不释放额度**：`reserved_qty` 不变。收进来的件数已经把这份退货资格用掉了，
+  放回去等于允许同一件被退第二次；额度只在驳回时释放
+- **一个事务**：锁订单行 → 重读状态与累计实收 → 校验不超收 → 写收货记录 →
+  （合格 > 0）加可售库存 + 写一条 `RETURN_INBOUND` 流水；任一步失败整笔回滚
+- **不超收**：与 A1 / B1 **同一把订单行锁**（`SELECT … FOR UPDATE`），
+  拿锁后重读累计值；"累计 ≤ 批准数量"是跨行约束，靠串行化点而不是 `CHECK`
+- **幂等**：`clientRequestId` → 同键同参返回**原收货记录**（不重复加库存），
+  同键不同参 409 `RECEIPT_REQUEST_CONFLICT`；不同批次各自入库
+- **流水可追溯**：`shop_inventory_movement.receipt_id` 外键指向收货记录，
+  `dedupe_key` = `OUT:{订单行id}` / `IN:{收货记录id}`（旧的 `(order_item_id, movement_type)`
+  唯一索引会挡掉同一订单行的第二批入库，已换成 `uk(dedupe_key)`）
+- **买家可见、不可写**：买家列表 / 详情 / 售后 Agent 工具都能看进度与每批记录，
+  但**没有任何收货或改库存的工具**
+- **旧库不清库**：`ADD COLUMN IF NOT EXISTS` + 条件 `UPDATE` 回填 `dedupe_key`
+  （出库 `OUT:{order_item_id}`、其余 `LEGACY:{id}` 兜底）+ 换索引
+- **两种数据库都验过**：H2（B2 专项 13 项 + 旧库迁移 5 项）+
+  真实 PostgreSQL 16（专项 4 项：争最后一件 / 同键并发 / 双批并发 / 故障注入回滚）
+- 详见 [`docs/shop-b2.md`](docs/shop-b2.md)
 
 ### 2. 弹性与成本控制（resilience）
 
@@ -705,6 +734,37 @@ cd web && node tools/e2e-aftersale-shopbuyer.mjs
 > 额度规则：只有「已提交」的申请占额度；客服驳回、释放额度、仓库验收、
 > 退货入库与退款都在 B 阶段，本轮没有。
 
+### 2.7 售后 B2 闭环（收货验货 + 库存回补）
+
+```bash
+# 后端 / 前端同 2.5；不需要模型凭据（这条链路完全不调模型）
+cd web && node tools/e2e-aftersale-receipt.mjs
+```
+
+脚本自己走完整条链路，并在每一步核对**数字**（全新 H2 库、键盘可售 10 件起）：
+
+```
+库存 10 → 买 2 件 + 发货签收 → 8
+退 2 件（额度 2/0）→ 客服批准（额度仍 2/0）
+第一批：实收 1 / 合格 1 / 损坏 0 → 9        ← 1 条 RETURN_INBOUND +1
+第二批：实收 1 / 合格 0 / 损坏 1 → 9        ← 没有流水
+买家刷新：全部收货 2/2，还可收 0 件，额度仍 2/0
+```
+
+同时断言：全库只有一条 `RETURN_INBOUND`、用页面发出的同一份请求体原样重放不会再加库存。
+脚本第 0 步会先读库存，不足 2 件就直接给出结论（而不是让你对着超时猜原因）。
+
+浏览器里手动走一遍：
+
+1. `/shop/admin/aftersale` → 已批准的单右侧出现「收货」；
+2. 点开：显示批准数量 / 累计实收 / 本批可收上限，三个数量框联动（合格 + 损坏 = 实收）；
+3. 填实收 1 / 合格 1 → 确认 → 提示「合格 1 件已回补可售库存」，行内进度变「部分收货 1/2」；
+4. 再收一批实收 1 / 损坏 1 → 提示「全部损坏，未增加可售库存」，进度「全部收货 2/2」，
+   按钮变「已收满」；
+5. 抽屉里能看到两批记录，只有第一批挂着「退货入库 +1」的流水；
+6. 切回买家 → 售后页显示「仓库收货：全部收货 2/2 件，还可收 0 件」，额度仍是 `2/0`；
+7. 后台「商城后台」页：库存回到 9（只回补了合格的 1 件），流水里多一条 `RETURN_INBOUND`。
+
 ### 3. 接口文档
 
 启动后访问：`http://localhost:8123/api/doc.html`（Knife4j）
@@ -760,6 +820,7 @@ cd web && node tools/e2e-aftersale-shopbuyer.mjs
 | `GET /api/shop/admin/aftersale/returns/{returnNo}` | 客服售后详情（含决策记录与事件流，需 ADMIN） |
 | `POST /api/shop/admin/aftersale/returns/{returnNo}/approve` | 批准：保留原额度；重复/相反决策 409，零写入 |
 | `POST /api/shop/admin/aftersale/returns/{returnNo}/reject` | 驳回：body `{"reason": "..."}`，必填；同事务释放本单数量 |
+| `POST /api/shop/admin/aftersale/returns/{returnNo}/receipts` | 收货验货（B2）：body `{"receivedQty","qualifiedQty","damagedQty","note","clientRequestId"}`，201；只有合格数量回补库存；非已批准 409 / 超收 409 / 同键不同参 409 |
 
 Agent 任务 SSE 事件流示例：
 
@@ -818,7 +879,7 @@ event:done       [DONE]
 # 售后 B1：客服批准 / 驳回 / 权限 / 一单一决（H2，13 个用例）
 ./mvnw test "-Dtest=AfterSaleDecisionIntegrationTest"
 
-# 售后 B1：旧库迁移（把 schema 退回 A1 形状再迁移，4 个用例）
+# 售后 B1：旧库迁移（把 schema 退回 A1 形状再迁移，5 个用例；含 B2 流水表升级）
 ./mvnw test "-Dtest=AfterSaleOldSchemaMigrationTest"
 
 # 售后 B1：老库会话领域回填（5 个用例，先证缺陷再证修复）
@@ -826,6 +887,12 @@ event:done       [DONE]
 
 # 售后 B1 的真实 PostgreSQL 专项（并发驳回 / 批准+驳回 / 驳回+新申请 / 故障注入回滚，5 个用例）
 ./mvnw -Ppg test "-Dtest=AfterSaleDecisionPostgresTest"
+
+# 售后 B2：收货验货 / 进度 / 幂等 / 权限（H2，13 个用例）
+./mvnw test "-Dtest=AfterSaleReceiptIntegrationTest"
+
+# 售后 B2 的真实 PostgreSQL 专项（争最后一件 / 同键并发 / 双批并发 / 库存已加后回滚，4 个用例）
+./mvnw -Ppg test "-Dtest=AfterSaleReceiptPostgresTest"
 
 # live 测试：显式打开分组才会真实调用模型 / 搜索 API / 数据库
 ./mvnw -Plive test "-Dtest=MkManusTest"
@@ -851,7 +918,8 @@ event:done       [DONE]
 - [`docs/shop-a0.md`](docs/shop-a0.md)：商城 A0——模块关系、六张表、状态机、接口与权限矩阵、并发与幂等设计、实跑测试结果、限制，以及 A1 售后 Agent 的最小接入设计（只设计）
 - [`docs/shop-a0-pg.md`](docs/shop-a0-pg.md)：A0 的真实 PostgreSQL 16 回归——一次性容器接线、A/B/C/D/E 五场景实测证据（含受控锁等待与事务回滚注入）、Testcontainers 与 Docker 29 不兼容的根因与替代方案
 - [`docs/shop-a1.md`](docs/shop-a1.md)：售后 A1——模块与四张表、额度算法、五个接口与权限、确认→建单的调用链与事务边界、两套幂等身份、实跑结果（H2 / 真实 PG / 浏览器 / 模型）、限制与 B 阶段边界
-- [`docs/shop-b1.md`](docs/shop-b1.md)：售后 B1——状态机、客服四个接口与权限、锁顺序与事务边界、决策表与两个 CHECK 的迁移、会话领域回填、重复/并发决策口径、实跑结果与未验证项、B2 设计建议
+- [`docs/shop-b1.md`](docs/shop-b1.md)：售后 B1——状态机、客服四个接口与权限、锁顺序与事务边界、决策表与两个 CHECK 的迁移、会话领域回填、重复/并发决策口径、实跑结果与未验证项、B2 已实施对照
+- [`docs/shop-b2.md`](docs/shop-b2.md)：售后 B2——收货记录表与三态进度、`dedupe_key` 与旧唯一索引的替换、锁顺序与事务边界（含 `MANDATORY` 库存写入）、幂等与并发口径、旧库不清库的迁移与验证、页面联动、实跑数字与限制
 
 ---
 

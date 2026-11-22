@@ -2,6 +2,8 @@ package com.example.mkagent.shop.aftersale;
 
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopProperties;
+import com.example.mkagent.shop.inventory.InventoryMovement;
+import com.example.mkagent.shop.inventory.InventoryService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
@@ -9,7 +11,9 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -61,17 +65,25 @@ public class AfterSaleService {
 
     private final AfterSaleDecisionWriter decisionWriter;
 
+    private final AfterSaleReceiptWriter receiptWriter;
+
+    private final InventoryService inventoryService;
+
     private final ShopProperties properties;
 
     public AfterSaleService(
             AfterSaleRepository repository,
             AfterSaleWriter writer,
             AfterSaleDecisionWriter decisionWriter,
+            AfterSaleReceiptWriter receiptWriter,
+            InventoryService inventoryService,
             ShopProperties properties
     ) {
         this.repository = repository;
         this.writer = writer;
         this.decisionWriter = decisionWriter;
+        this.receiptWriter = receiptWriter;
+        this.inventoryService = inventoryService;
         this.properties = properties;
     }
 
@@ -424,5 +436,242 @@ public class AfterSaleService {
      */
     public AfterSaleReturn reject(String operatorId, String returnNo, String reason) {
         return decisionWriter.reject(operatorId, returnNo, reason);
+    }
+
+    // ---------------------------------------------------------------
+    // 仓库收货（B2）：读 + 写
+    // ---------------------------------------------------------------
+
+    /**
+     * 某退货单的收货记录（新的在后）。
+     *
+     * <p>买家与客服都能看：买家需要知道"我那件到仓库了没有"。
+     * 归属校验由调用方完成（买家侧走 {@link #myReturn}）。
+     */
+    public List<AfterSaleReceipt> receipts(long returnId) {
+        return repository.findReceipts(returnId);
+    }
+
+    /**
+     * 单张退货单的收货进度。
+     *
+     * <p>只有"已批准"才有进度可言：待审批还没同意退，已驳回根本不会收货。
+     * 其余状态返回 {@code null}，页面据此不显示进度条。
+     */
+    public AfterSaleReceiptProgress progress(AfterSaleReturn value) {
+        if (value.status() != AfterSaleStatus.APPROVED) {
+            return null;
+        }
+        return AfterSaleReceiptProgress.of(value.quantity(), repository.sumReceivedQty(value.id()));
+    }
+
+    /**
+     * 一批退货单的收货进度（列表页用，一次查询算完，不做 N+1）。
+     *
+     * @return key = return_id；只有已批准的单会出现
+     */
+    public Map<Long, AfterSaleReceiptProgress> progressOf(List<AfterSaleReturn> returns) {
+        List<Long> approvedIds = new ArrayList<>();
+        Map<Long, Integer> approvedQty = new HashMap<>();
+        for (AfterSaleReturn value : returns) {
+            if (value.status() == AfterSaleStatus.APPROVED) {
+                approvedIds.add(value.id());
+                approvedQty.put(value.id(), value.quantity());
+            }
+        }
+
+        Map<Long, Integer> received = repository.receivedQtyByReturns(approvedIds);
+        Map<Long, AfterSaleReceiptProgress> result = new HashMap<>();
+        for (Long id : approvedIds) {
+            result.put(id, AfterSaleReceiptProgress.of(
+                    approvedQty.getOrDefault(id, 0),
+                    received.getOrDefault(id, 0)));
+        }
+        return result;
+    }
+
+    /**
+     * 详情聚合：退货单 + 事件 + 决策 + 进度 + 每批收货（含它产生的库存流水）。
+     *
+     * <p>把"这一批入了多少库"直接挂在收货记录上，页面提交后不必再发一次请求；
+     * 流水来自 {@code shop_inventory_movement.receipt_id}，是强引用而不是推断。
+     */
+    public ReturnDetail detail(AfterSaleReturn value) {
+        List<ReceiptWithMovement> receipts = new ArrayList<>();
+        int receivedTotal = 0;
+        for (AfterSaleReceipt receipt : repository.findReceipts(value.id())) {
+            receivedTotal += receipt.receivedQty();
+            InventoryMovement movement = inventoryService.movementsOfReceipt(receipt.id())
+                    .stream().findFirst().orElse(null);
+            receipts.add(new ReceiptWithMovement(receipt, movement));
+        }
+
+        AfterSaleReceiptProgress progress = value.status() == AfterSaleStatus.APPROVED
+                ? AfterSaleReceiptProgress.of(value.quantity(), receivedTotal)
+                : null;
+
+        return new ReturnDetail(
+                value,
+                repository.findEvents(value.id()),
+                repository.findDecision(value.id()).orElse(null),
+                progress,
+                receipts);
+    }
+
+    /**
+     * 登记一批收货 / 验货（B2）。
+     *
+     * <h2>为什么参数校验与幂等预检放在事务外</h2>
+     *
+     * 同键并发时，输的那一方必须整体回滚，再换一个新事务去读赢家的结果。
+     * 读写混在一个事务方法里，回滚之后就没有干净的事务可用了
+     * （PostgreSQL 上"事务已中止"会连 SELECT 都拒绝）。
+     *
+     * <h2>幂等口径</h2>
+     *
+     * <ul>
+     *   <li>同键 + 同参数 → 返回原收货记录，**零写入**（不重复加库存）；</li>
+     *   <li>同键 + 不同参数 → 409 {@code RECEIPT_REQUEST_CONFLICT}；</li>
+     *   <li>不同键 → 各自入库（合法的分批收货）。</li>
+     * </ul>
+     *
+     * @param operatorId      收货人（服务端身份，不来自请求体）
+     * @param returnNo        退货单号
+     * @param receivedQty     本批实收
+     * @param qualifiedQty    本批合格
+     * @param damagedQty      本批损坏
+     * @param note            备注（可空）
+     * @param clientRequestId 前端生成的收货动作标识
+     */
+    public AfterSaleReceipt receive(
+            String operatorId,
+            String returnNo,
+            Integer receivedQty,
+            Integer qualifiedQty,
+            Integer damagedQty,
+            String note,
+            String clientRequestId
+    ) {
+        if (returnNo == null || returnNo.isBlank()) {
+            throw new BusinessException(400, "INVALID_RETURN_NO", "退货单号不能为空");
+        }
+
+        int received = receivedQty == null ? 0 : receivedQty;
+        int qualified = qualifiedQty == null ? 0 : qualifiedQty;
+        int damaged = damagedQty == null ? 0 : damagedQty;
+
+        if (received <= 0) {
+            throw new BusinessException(
+                    400, AfterSaleReceiptWriter.CODE_INVALID_QUANTITY,
+                    "本批实收数量必须大于 0");
+        }
+        if (qualified < 0 || damaged < 0) {
+            throw new BusinessException(
+                    400, AfterSaleReceiptWriter.CODE_INVALID_QUANTITY,
+                    "合格数量与损坏数量都不能为负数");
+        }
+        if (qualified + damaged != received) {
+            throw new BusinessException(
+                    400, AfterSaleReceiptWriter.CODE_INVALID_QUANTITY,
+                    "合格 " + qualified + " 件 + 损坏 " + damaged
+                            + " 件必须等于实收 " + received + " 件");
+        }
+
+        String normalizedNote = normalizeNote(note);
+        int maxNote = properties.getMaxReceiptNoteLength();
+        if (normalizedNote.codePointCount(0, normalizedNote.length()) > maxNote) {
+            throw new BusinessException(
+                    400, AfterSaleReceiptWriter.CODE_INVALID_NOTE,
+                    "验货备注最多 " + maxNote + " 个字");
+        }
+
+        String key;
+        try {
+            key = AfterSaleKeys.receiptKey(operatorId, clientRequestId);
+        } catch (IllegalArgumentException e) {
+            throw new BusinessException(400, "INVALID_REQUEST_ID", e.getMessage());
+        }
+
+        String requestHash = AfterSaleKeys.receiptRequestHash(
+                returnNo, received, qualified, damaged, normalizedNote);
+
+        // 1. 先查记录：命中就直接回放，不再判断"还能不能收"。
+        Optional<AfterSaleRepository.StoredReceipt> existing =
+                repository.findReceiptByRequestKey(key);
+        if (existing.isPresent()) {
+            return replay(existing.get(), requestHash);
+        }
+
+        // 2. 未命中：在一个事务里"收货 + 库存 + 流水"。
+        try {
+            return receiptWriter.receive(
+                    operatorId, returnNo, received, qualified, damaged,
+                    normalizedNote.isEmpty() ? null : normalizedNote,
+                    key, requestHash);
+        } catch (DuplicateKeyException e) {
+            /*
+             * 两种可能：并发同键（另一个请求刚插入成功），或收货单号重号。
+             * 按幂等键回查即可区分：查得到就是同键，查不到就是单号冲突。
+             */
+            Optional<AfterSaleRepository.StoredReceipt> winner =
+                    repository.findReceiptByRequestKey(key);
+            if (winner.isPresent()) {
+                log.info("收货命中并发幂等键，回放首次结果：returnNo={}", returnNo);
+                return replay(winner.get(), requestHash);
+            }
+            log.error("收货写入命中非幂等唯一键冲突：returnNo={}", returnNo, e);
+            throw new BusinessException(
+                    409,
+                    AfterSaleReceiptWriter.CODE_WRITE_CONFLICT,
+                    "收货记录写入冲突（非重复提交），本次收货未生效，请重新提交");
+        }
+    }
+
+    /**
+     * 回放首次收货结果。
+     *
+     * <p>哈希不一致说明同一个收货标识被用于不同参数（改了数量或备注），
+     * 必须明确拒绝：静默返回上一条会让操作员以为改动生效了。
+     */
+    private AfterSaleReceipt replay(
+            AfterSaleRepository.StoredReceipt stored,
+            String requestHash
+    ) {
+        if (!stored.requestHash().equals(requestHash)) {
+            throw new BusinessException(
+                    409,
+                    AfterSaleReceiptWriter.CODE_REQUEST_CONFLICT,
+                    "同一个收货标识被用于不同的验货参数，已拒绝执行");
+        }
+        return stored.receipt();
+    }
+
+    /**
+     * 备注归一化。
+     *
+     * <p>复用退货原因的归一化规则（去首尾空白、折叠连续空白、去控制字符），
+     * 保证"同一条备注"在重试时算出同一个哈希；备注可以为空。
+     */
+    private static String normalizeNote(String note) {
+        return AfterSaleEligibility.normalizeReason(note);
+    }
+
+    /**
+     * 详情聚合结果。
+     *
+     * @param progress 收货进度；非已批准状态为 {@code null}
+     * @param receipts 每批收货 + 它产生的库存流水（整批损坏时 movement 为 null）
+     */
+    public record ReturnDetail(
+            AfterSaleReturn value,
+            List<AfterSaleEvent> events,
+            AfterSaleDecision decision,
+            AfterSaleReceiptProgress progress,
+            List<ReceiptWithMovement> receipts
+    ) {
+    }
+
+    /** 一批收货与它的入库流水（没有入库时为 {@code null}）。 */
+    public record ReceiptWithMovement(AfterSaleReceipt receipt, InventoryMovement movement) {
     }
 }

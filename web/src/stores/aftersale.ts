@@ -81,6 +81,20 @@ export function describeAfterSaleError(error: unknown): string {
       return '额度与退货单不一致，本次操作已回滚（没有释放任何额度）。请联系管理员核对数据。'
     case 'INVALID_STATUS':
       return '状态筛选值不合法，请重新选择。'
+    case 'RETURN_NOT_APPROVED':
+      return '只有「已批准」的退货单才能收货：待审批的还没同意退，已驳回的实物应退回买家。'
+    case 'RECEIPT_OVER_APPROVED':
+      return '本批实收超过批准数量（累计实收不能超过批准件数）。请刷新后按最新剩余数量填写。'
+    case 'RECEIPT_QUANTITY_INVALID':
+      return '数量不合法：实收必须大于 0，且合格 + 损坏必须等于实收。'
+    case 'RECEIPT_REQUEST_CONFLICT':
+      return '同一个收货标识被用于不同的验货参数，已被拒绝。请刷新后重新填写这一批。'
+    case 'RECEIPT_WRITE_CONFLICT':
+      return '收货记录写入冲突（不是重复提交），本次收货没有生效。请重新提交；若反复出现请联系管理员。'
+    case 'INVALID_RECEIPT_NOTE':
+      return '验货备注最多 200 字。'
+    case 'INVENTORY_ROW_MISSING':
+      return '库存行不存在，本次收货已回滚（库存没有变化）。请联系管理员核对商品库存。'
     case 'NOT_ADMIN':
       return '当前身份不是商城后台人员，不能处理售后。演示可切换为 music-admin-1。'
     case 'ORDER_STATUS_CONFLICT':

@@ -66,14 +66,21 @@ public final class ShopViews {
     ) {
     }
 
-    /** 库存流水。 */
+    /**
+     * 库存流水。
+     *
+     * @param receiptId 退货入库对应的收货记录 id（出库为 {@code null}）
+     * @param typeLabel 业务类型中文（出库 / 退货入库），避免前端自己翻译
+     */
     public record MovementVO(
             long id,
             String sku,
             int quantityDelta,
             String type,
+            String typeLabel,
             Long orderId,
             Long orderItemId,
+            Long receiptId,
             String operatorId,
             LocalDateTime createdAt
     ) {
@@ -172,10 +179,21 @@ public final class ShopViews {
                 movement.sku(),
                 movement.quantityDelta(),
                 movement.movementType(),
+                movementLabel(movement.movementType()),
                 movement.orderId(),
                 movement.orderItemId(),
+                movement.receiptId(),
                 movement.operatorId(),
                 movement.createdAt());
+    }
+
+    /** 流水类型中文。未知类型原样返回：不认识的类型应当看得见，而不是被藏起来。 */
+    public static String movementLabel(String type) {
+        return switch (type == null ? "" : type) {
+            case InventoryMovement.TYPE_OUTBOUND_SHIPMENT -> "发货出库";
+            case InventoryMovement.TYPE_RETURN_INBOUND -> "退货入库";
+            default -> type;
+        };
     }
 
     /**

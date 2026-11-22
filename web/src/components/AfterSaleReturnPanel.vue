@@ -5,10 +5,11 @@
  * 只显示服务端返回的事实：
  * - 退货单号、状态、来源（普通表单 / 售后 Agent）、数量、金额、原因；
  * - 客服决策（谁在什么时候、批准还是驳回、驳回原因）——B1 起有；
+ * - 收货进度与每一批的验货结果——B2 起有；
  * - 处理记录（提交 → 决策，一个动作一条）。
  *
- * 不显示、也不推断"已退款 / 已入库"：B1 只做到批准与驳回，
- * 实物仍在买家手里，退款要等仓库验收之后。
+ * 不显示、也不推断"已退款"：B2 只做到收货验货与可售库存回补。
+ * 收货**不释放**额度，所以"已收满"不等于"能再退一次"。
  */
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
@@ -21,6 +22,15 @@ const props = defineProps<{ value: AfterSaleReturnVO }>()
 const emit = defineEmits<{ (e: 'close'): void }>()
 
 const tone = computed(() => afterSaleStatusTone(props.value.status))
+
+/** 进度条宽度；没有进度时为 0。 */
+const progressPercent = computed(() => {
+  const progress = props.value.progress
+  if (!progress || progress.approvedQty <= 0) {
+    return 0
+  }
+  return Math.min(100, Math.round((progress.receivedQty / progress.approvedQty) * 100))
+})
 </script>
 
 <template>
@@ -72,6 +82,45 @@ const tone = computed(() => afterSaleStatusTone(props.value.status))
       </div>
     </dl>
 
+    <section v-if="value.progress" class="progress" data-receipt-progress>
+      <h3 class="events__title">收货进度</h3>
+      <div class="progress__bar" role="img" :aria-label="value.progress.label">
+        <span class="progress__fill" :style="{ width: `${progressPercent}%` }" />
+      </div>
+      <p class="progress__text">
+        <span class="progress__label">{{ value.progress.label }}</span>
+        批准 <strong class="mono">{{ value.progress.approvedQty }}</strong> 件 · 已收
+        <strong class="mono">{{ value.progress.receivedQty }}</strong> 件 · 还可收
+        <strong class="mono">{{ value.progress.remainingQty }}</strong> 件
+      </p>
+    </section>
+
+    <section v-if="value.receipts && value.receipts.length" class="receipts" data-receipts>
+      <h3 class="events__title">仓库收货记录</h3>
+      <ol class="receipts__list">
+        <li
+          v-for="receipt in value.receipts"
+          :key="receipt.receiptNo"
+          class="receipt"
+          :data-receipt-no="receipt.receiptNo"
+        >
+          <p class="receipt__head">
+            <span class="mono">{{ receipt.receiptNo }}</span>
+            <span class="receipt__when">{{ formatDateTime(receipt.createdAt) }}</span>
+          </p>
+          <p class="receipt__qty">
+            实收 <strong class="mono">{{ receipt.receivedQty }}</strong> 件 · 合格
+            <strong class="mono receipt__ok">{{ receipt.qualifiedQty }}</strong> 件 · 损坏
+            <strong class="mono" :class="{ receipt__warn: receipt.damagedQty > 0 }">
+              {{ receipt.damagedQty }}
+            </strong>
+            件
+          </p>
+          <p v-if="receipt.note" class="receipt__note">仓库备注：{{ receipt.note }}</p>
+        </li>
+      </ol>
+    </section>
+
     <section v-if="value.decision" class="decision" data-decision>
       <h3 class="events__title">客服处理结果</h3>
       <p class="decision__line">
@@ -84,7 +133,8 @@ const tone = computed(() => afterSaleStatusTone(props.value.status))
         驳回原因：{{ value.decision.reason }}
       </p>
       <p v-else class="decision__reason decision__reason--muted">
-        已批准：这 {{ value.quantity }} 件仍计入已占用额度，等仓库验收（不在本轮范围）。
+        已批准：这 {{ value.quantity }} 件仍计入已占用额度。把实物寄回后，仓库会分批收货验货，
+        只有合格数量回补可售库存；收货不释放额度。
       </p>
     </section>
 
@@ -107,8 +157,8 @@ const tone = computed(() => afterSaleStatusTone(props.value.status))
     </section>
 
     <p class="foot">
-      批准只代表"同意退"，实物仍在买家手里；驳回会在同一事务里释放本单占用的额度。
-      可售库存与出库流水在两种情况下都没有变化。仓库验收、退货入库与退款不在本轮范围。
+      批准只代表"同意退"；驳回会在同一事务里释放本单占用的额度。仓库收货后只有合格数量回补可售库存，
+      损坏只留记录、不建残次库存，额度也不会因为收货而释放。退款不在本轮范围。
     </p>
   </aside>
 </template>
@@ -227,6 +277,92 @@ const tone = computed(() => afterSaleStatusTone(props.value.status))
   border: 1px solid var(--c-line-soft);
   border-radius: var(--r-md);
   background: var(--c-bg-soft);
+}
+
+.progress {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.progress__bar {
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--c-surface-2);
+  overflow: hidden;
+}
+
+.progress__fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--c-ok);
+  transition: width 0.2s ease;
+}
+
+.progress__text {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  line-height: var(--lh-base);
+}
+
+.progress__label {
+  margin-right: var(--s-2);
+  color: var(--c-text);
+}
+
+.receipts {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.receipts__list {
+  display: grid;
+  gap: var(--s-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.receipt {
+  display: grid;
+  gap: 2px;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--c-line-soft);
+  border-radius: var(--r-sm);
+  background: var(--c-bg-soft);
+}
+
+.receipt__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  overflow-wrap: anywhere;
+}
+
+.receipt__when {
+  flex: none;
+}
+
+.receipt__qty {
+  font-size: var(--fs-sm);
+  color: var(--c-text);
+}
+
+.receipt__ok {
+  color: var(--c-ok);
+}
+
+.receipt__warn {
+  color: var(--c-warn);
+}
+
+.receipt__note {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+  overflow-wrap: anywhere;
 }
 
 .decision__line {

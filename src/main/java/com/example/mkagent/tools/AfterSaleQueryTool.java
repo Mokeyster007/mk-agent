@@ -2,6 +2,7 @@ package com.example.mkagent.tools;
 
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.aftersale.ReturnSubject;
@@ -11,6 +12,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -104,7 +106,7 @@ public class AfterSaleQueryTool {
 
                     返回：订单状态、签收时间、商品快照、成交单价、
                     已购 / 已占用 / 剩余可退数量、退货窗口天数与截止时间，
-                    以及该订单已有的退货申请列表。
+                    以及该订单已有的退货申请列表（含已批准单的收货进度）。
 
                     订单号必须来自 list_my_signed_orders 或用户明确提供的订单号；
                     不要编造订单号。
@@ -125,16 +127,10 @@ public class AfterSaleQueryTool {
         int windowDays = afterSaleService.returnWindowDays();
 
         List<Object> returns = new ArrayList<>();
-        for (AfterSaleReturn existing : afterSaleService.returnsOfOrderItem(value.orderItemId())) {
-            returns.add(new ReturnRow(
-                    existing.returnNo(),
-                    existing.orderNo(),
-                    existing.productName(),
-                    existing.quantity(),
-                    existing.status().name(),
-                    existing.status().label(),
-                    existing.source().name(),
-                    existing.createdAt() == null ? null : existing.createdAt().toString()));
+        List<AfterSaleReturn> existingReturns = afterSaleService.returnsOfOrderItem(value.orderItemId());
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(existingReturns);
+        for (AfterSaleReturn existing : existingReturns) {
+            returns.add(toReturnRow(existing, progress.get(existing.id())));
         }
 
         return ToolResponseEnvelope.okSingle(new OrderDetailRow(
@@ -198,8 +194,13 @@ public class AfterSaleQueryTool {
                     用途：回答"我上次那单退得怎么样了"，以及**在提交前确认是否已经退过**，
                     避免同一订单行重复申请。
 
-                    A1 阶段所有申请的状态都是「已提交」（等待客服处理）；
-                    没有客服批准、没有退款、没有退货入库。
+                    状态含义：SUBMITTED 等客服处理；APPROVED 客服已同意退（等仓库收货）；
+                    REJECTED 已驳回。已批准的单会带收货进度字段：
+                    receivedQty（仓库累计实收）、remainingQty（还没收到的数量）、
+                    receiptProgress / receiptProgressLabel（NONE/PARTIAL/COMPLETE，
+                    未收货 / 部分收货 / 全部收货）；未批准时这些字段为 null。
+
+                    本轮没有退款：不要回答"已退款"。
                     """
     )
     public String listMyReturnRequests(
@@ -211,25 +212,41 @@ public class AfterSaleQueryTool {
         String filter = orderNo == null ? "" : orderNo.trim();
 
         List<Object> rows = new ArrayList<>();
-        for (AfterSaleReturn value : afterSaleService.myReturns(userId)) {
+        List<AfterSaleReturn> values = afterSaleService.myReturns(userId);
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        for (AfterSaleReturn value : values) {
             if (!filter.isEmpty() && !filter.equals(value.orderNo())) {
                 continue;
             }
-            rows.add(new ReturnRow(
-                    value.returnNo(),
-                    value.orderNo(),
-                    value.productName(),
-                    value.quantity(),
-                    value.status().name(),
-                    value.status().label(),
-                    value.source().name(),
-                    value.createdAt() == null ? null : value.createdAt().toString()));
+            rows.add(toReturnRow(value, progress.get(value.id())));
         }
 
         if (rows.isEmpty()) {
             return ToolResponseEnvelope.okList(List.of());
         }
         return ToolResponseEnvelope.okList(rows);
+    }
+
+    /**
+     * 退货申请 → 工具行。
+     *
+     * <p>收货进度对模型是**只读事实**：{@code receiptProgress} 为空表示这单还没批准，
+     * 模型应当据此说明"还在等客服处理"，而不是编造"已入库"。
+     */
+    private static ReturnRow toReturnRow(AfterSaleReturn value, AfterSaleReceiptProgress progress) {
+        return new ReturnRow(
+                value.returnNo(),
+                value.orderNo(),
+                value.productName(),
+                value.quantity(),
+                value.status().name(),
+                value.status().label(),
+                value.source().name(),
+                value.createdAt() == null ? null : value.createdAt().toString(),
+                progress == null ? null : progress.receivedQty(),
+                progress == null ? null : progress.remainingQty(),
+                progress == null ? null : progress.code(),
+                progress == null ? null : progress.label());
     }
 
     @Tool(
@@ -313,7 +330,11 @@ public class AfterSaleQueryTool {
             String status,
             String statusLabel,
             String source,
-            String createdAt
+            String createdAt,
+            Integer receivedQty,
+            Integer remainingQty,
+            String receiptProgress,
+            String receiptProgressLabel
     ) {
     }
 
