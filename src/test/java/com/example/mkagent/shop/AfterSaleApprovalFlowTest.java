@@ -12,6 +12,7 @@ import com.example.mkagent.approval.ApprovalSummaryBuilder;
 import com.example.mkagent.approval.ApprovalToolPolicy;
 import com.example.mkagent.approval.RunHandoffLocks;
 import com.example.mkagent.context.UserContextHolder;
+import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
@@ -53,6 +54,7 @@ import java.util.function.Supplier;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -224,6 +226,15 @@ class AfterSaleApprovalFlowTest {
         assertEquals(1, ShopTestFixture.eventCount(jdbcTemplate, returnNo));
         assertEquals(1, ShopTestFixture.returnQty(jdbcTemplate, returnNo));
 
+        /*
+         * 执行用的必须是**确认卡快照**里的参数，而不是恢复时重新问模型得到的参数。
+         * 数量与原因都对照快照值，任何一处被"重新推导"都会在这里露出来。
+         */
+        String storedReason = jdbcTemplate.queryForObject(
+                "SELECT reason FROM shop_aftersale_return WHERE return_no = ?",
+                String.class, returnNo);
+        assertEquals(REASON, storedReason, "建单必须使用确认卡快照里的原因");
+
         Map<String, Object> run = runRow(paused.runId());
         assertEquals("SUCCEEDED", run.get("state"), "实际：" + run);
         assertEquals(1, ((Number) run.get("tool_call_count")).intValue(), "实际：" + run);
@@ -265,7 +276,7 @@ class AfterSaleApprovalFlowTest {
     // ==================== 4. 他人不能操作 ====================
 
     @Test
-    @DisplayName("他人批准/拒绝：404，审批仍 PENDING，业务零变更")
+    @DisplayName("他人批准/拒绝/恢复：404，审批仍 PENDING，业务零变更")
     void otherUserCannotDecide() {
         ScriptedModel model = new ScriptedModel()
                 .toolCall("call-as4", TOOL, args(1, REASON))
@@ -275,6 +286,14 @@ class AfterSaleApprovalFlowTest {
 
         assertEquals(404, decide(paused, true, OTHER).httpStatus(), "他人批准必须 404");
         assertEquals(404, decide(paused, false, OTHER).httpStatus(), "他人拒绝必须 404");
+
+        /*
+         * 恢复同样要校验归属：approvalId 只是"哪一张卡"，
+         * 不代表"谁能推进它"。这里直接调服务层，绕开 SSE 的包装。
+         */
+        BusinessException resumeError = assertThrows(
+                BusinessException.class, () -> resume(paused, OTHER), "他人恢复必须被拒绝");
+        assertEquals(404, resumeError.getHttpStatus(), resumeError.getMessage());
 
         assertEquals("PENDING", approvalRow(paused.approvalId()).get("status"));
         assertEquals(0, ShopTestFixture.totalReturns(jdbcTemplate));
@@ -327,6 +346,21 @@ class AfterSaleApprovalFlowTest {
         resume(paused);
         assertEquals(1, ShopTestFixture.totalReturns(jdbcTemplate));
 
+        /*
+         * 客户端"没收到结果"时最需要的东西：**原单**。
+         * 重复提交会被明确拒绝（ALREADY_APPROVED），而原单仍然可以从
+         * 「我的售后」查到——不需要、也不允许再建一单。
+         */
+        String originalReturnNo = jdbcTemplate.queryForObject("""
+                SELECT r.return_no
+                FROM shop_aftersale_return r
+                JOIN shop_order o ON o.id = r.order_id
+                WHERE o.order_no = ?
+                """, String.class, ORDER_NO);
+        var mine = afterSaleService.myReturns(BUYER);
+        assertEquals(1, mine.size(), "只应有一笔申请");
+        assertEquals(originalReturnNo, mine.get(0).returnNo(), "重复确认后仍能拿到原单号");
+
         ApprovalDecisionService.DecisionResult second = decide(paused, true);
         assertNotEquals(200, second.httpStatus(), "重复批准必须冲突");
         assertEquals("ALREADY_APPROVED", second.code(),
@@ -334,6 +368,7 @@ class AfterSaleApprovalFlowTest {
 
         assertEquals(1, ShopTestFixture.totalReturns(jdbcTemplate), "重复确认不得建第二单");
         assertEquals(1, ShopTestFixture.occupiedQty(jdbcTemplate, ORDER_NO));
+        assertEquals(1, afterSaleService.myReturns(BUYER).size(), "重复确认不得新增申请");
     }
 
     // ==================== 辅助 ====================
@@ -403,9 +438,13 @@ class AfterSaleApprovalFlowTest {
     }
 
     private SseEmitter resume(Paused paused) {
+        return resume(paused, BUYER);
+    }
+
+    private SseEmitter resume(Paused paused, String userId) {
         return new ApprovalResumeService(
                 claimService, approvalProperties, List.of(paused.agent()))
-                .resume(paused.approvalId(), BUYER);
+                .resume(paused.approvalId(), userId);
     }
 
     private Map<String, Object> runRow(String runId) {

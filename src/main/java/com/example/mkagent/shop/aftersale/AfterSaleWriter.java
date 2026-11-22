@@ -4,6 +4,7 @@ import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -75,7 +76,12 @@ public class AfterSaleWriter {
      * 建单失败（额度不足、参数非法）时整个事务回滚，
      * 占位行随之消失——失败不会被记成"已经成功过"。
      *
-     * @throws org.springframework.dao.DuplicateKeyException 同一幂等键已存在
+     * <p><b>只有占位行的唯一键冲突才是"同一提交并发"</b>：
+     * 退货单号、事件 {@code (return_id, event_type)} 的唯一键冲突是**另一回事**
+     * （数据异常 / 重号），必须原样抛出，不能被上层当成"同键回放"处理——
+     * 那会把一次真实的写入失败伪装成"你刚才已经提交过了"。
+     *
+     * @throws IdempotencyKeyConflictException 同一幂等键已存在（并发同键）
      */
     @Transactional
     public AfterSaleReturn createWithIdempotency(
@@ -89,7 +95,19 @@ public class AfterSaleWriter {
             String requestHash
     ) {
         String returnNo = newReturnNo();
-        repository.insertIdempotency(idempotencyKey, requestHash, returnNo);
+
+        try {
+            repository.insertIdempotency(idempotencyKey, requestHash, returnNo);
+        } catch (DuplicateKeyException e) {
+            /*
+             * 在这里就把"占位行冲突"翻译成专用异常。
+             *
+             * 为什么不交给上层 catch DuplicateKeyException：
+             * 那样会把后续 insertReturn / insertEvent 的唯一键冲突一起吞进去，
+             * 上层无法区分"同一次提交已经在跑"和"退货单号撞了"。
+             */
+            throw new IdempotencyKeyConflictException(idempotencyKey, e);
+        }
 
         return doCreate(buyerId, orderNo, quantity, reason, source, actorId, returnNo);
     }
@@ -173,21 +191,26 @@ public class AfterSaleWriter {
             throw toException(decision);
         }
 
-        // 4. 原子占用额度：条件更新，0 行即额度不足（理论上已被上一步挡住，这里是兜底）。
+        // 4. 金额：整数分，溢出即拒绝（不接受一个算错的金额）。
+        //    放在占用额度**之前**：金额都算不出来的请求没必要去抢行锁、改额度。
+        //    与预览共用 AfterSaleMoney，避免"预览一个数、提交另一个数"。
+        long refundCents;
+        try {
+            refundCents = AfterSaleMoney.refundCents(subject.unitPriceCents(), quantity);
+        } catch (ArithmeticException e) {
+            throw new BusinessException(
+                    400,
+                    AfterSaleEligibility.CODE_REFUND_AMOUNT_OUT_OF_RANGE,
+                    "退款金额超出可表示范围，请减少退货数量");
+        }
+
+        // 5. 原子占用额度：条件更新，0 行即额度不足（理论上已被上一步挡住，这里是兜底）。
         int reserved = repository.reserveQuota(locked.id(), quantity);
         if (reserved == 0) {
             throw new BusinessException(
                     409,
                     AfterSaleEligibility.CODE_RETURN_QUOTA_EXCEEDED,
                     "可退额度不足，请刷新后按最新额度重新申请");
-        }
-
-        // 5. 金额：整数分，溢出即拒绝（不接受一个算错的金额）。
-        long refundCents;
-        try {
-            refundCents = Math.multiplyExact(subject.unitPriceCents(), (long) quantity);
-        } catch (ArithmeticException e) {
-            throw new BusinessException(400, "AMOUNT_OVERFLOW", "退款金额超出可表示范围");
         }
 
         long returnId = repository.insertReturn(
@@ -241,5 +264,26 @@ public class AfterSaleWriter {
     static String newReturnNo() {
         String stamp = LocalDateTime.now().format(NO_FORMAT);
         return "RT" + stamp + "-" + String.format("%04X", RANDOM.nextInt(0x10000));
+    }
+
+    /**
+     * 幂等占位行的唯一键冲突：**同一次提交**已经（或正在）由另一个请求处理。
+     *
+     * <p>它是唯一可以触发"回放首次结果"的异常。其它唯一键冲突
+     * （退货单号重号、事件 {@code (return_id, event_type)} 重复）
+     * 说明的是数据异常，不是幂等命中，必须原样暴露。
+     */
+    public static class IdempotencyKeyConflictException extends RuntimeException {
+
+        private final String idempotencyKey;
+
+        public IdempotencyKeyConflictException(String idempotencyKey, Throwable cause) {
+            super("幂等键已存在：" + idempotencyKey, cause);
+            this.idempotencyKey = idempotencyKey;
+        }
+
+        public String idempotencyKey() {
+            return idempotencyKey;
+        }
     }
 }

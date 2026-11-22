@@ -21,20 +21,39 @@ import { shop } from '@/stores/shop'
 import { afterSale } from '@/stores/aftersale'
 import { createAfterSaleChatStore } from '@/stores/aftersaleChat'
 import { runAfterSaleChat } from '@/api/aftersale'
-import { createConversation } from '@/api/conversations'
+import {
+  createAfterSaleConversation,
+  getAfterSaleConversation,
+} from '@/api/aftersale'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
 import { formatDateTime } from '@/utils/format'
 
 const navOpen = ref(false)
 
 /**
+ * 售后会话的持久化 key。
+ *
+ * 按**身份**分开：同一个浏览器换人之后，不能续上上一个人的会话。
+ * 会话本身在服务端也带领域（AFTER_SALES）与归属，这里的 key 只是前端便利。
+ */
+function conversationStorageKey(): string {
+  return `mkagent.aftersaleConversation.${session.userId.value ?? 'anonymous'}`
+}
+
+/**
  * 对话 store 在页面里建，是为了把"批准之后刷新业务数据"接上：
  * 批准只代表同意执行，是否真的建单要看「我的售后」——
  * 所以执行完必须重新读一次列表与额度，而不是相信对话里的措辞。
+ *
+ * 会话用**售后自己的**接口（`/api/shop/aftersale/conversations`），
+ * 不用 `/api/ai/conversations`：后者要求 music_user，
+ * 只有商城身份的合法买家会被 403，追问就退化成单轮了。
  */
 const chat = createAfterSaleChatStore({
   chat: runAfterSaleChat,
-  conversation: createConversation,
+  conversation: createAfterSaleConversation,
+  conversationDetail: getAfterSaleConversation,
+  storageKey: conversationStorageKey,
   approval: getApproval,
   decide: decideApproval,
   resume: resumeApproval,
@@ -75,7 +94,7 @@ function quotaText(occupied: number, remaining: number): string {
 }
 
 async function onSwitchIdentity(userId: string): Promise<void> {
-  if (!session.updateUserId(userId)) {
+  if (!session.updateUserId(userId, { probeMusicCapabilities: false })) {
     return
   }
   // 换人就是换数据：先清空，再按新身份重新读
@@ -84,6 +103,8 @@ async function onSwitchIdentity(userId: string): Promise<void> {
   chat.reset()
   await shop.loadSession()
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
+  // 新身份可能有自己的售后会话，尝试恢复（没有就是空对话）
+  await chat.restore()
 }
 
 async function reloadAll(): Promise<void> {
@@ -94,6 +115,11 @@ async function reloadAll(): Promise<void> {
 onMounted(async () => {
   await shop.loadSession()
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
+  /*
+   * 刷新后恢复会话：对话记录与"待确认"的卡都从服务端重建。
+   * 恢复失败不影响页面其余部分（订单、表单、我的售后各自独立读取）。
+   */
+  await chat.restore()
 })
 </script>
 

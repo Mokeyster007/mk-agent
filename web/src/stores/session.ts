@@ -72,12 +72,23 @@ export const session = {
     }
   },
 
-  updateUserId(next: string): boolean {
+  /**
+   * 切换联调身份。
+   *
+   * @param options.probeMusicCapabilities 是否顺带重探音乐能力。
+   *   默认 true（音乐工作台需要）。商城页面传 false：
+   *   那里的身份可能根本没有音乐服务，探测只会拿到 403，
+   *   在控制台留下一条与当前页面无关的报错，还会让人误以为出了故障。
+   *   这只是"少问一个用不上的接口"，**没有放宽任何服务端守卫**。
+   */
+  updateUserId(next: string, options: { probeMusicCapabilities?: boolean } = {}): boolean {
     const ok = setDevUserId(next)
     if (ok) {
       userId.value = getUserId()
-      // 换了身份就是换了一个人的歌单与任务，能力也要按新身份重探
-      void session.loadCapabilities()
+      if (options.probeMusicCapabilities !== false) {
+        // 换了身份就是换了一个人的歌单与任务，能力也要按新身份重探
+        void session.loadCapabilities()
+      }
     }
     return ok
   },

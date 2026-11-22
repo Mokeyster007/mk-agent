@@ -124,6 +124,22 @@ class ShopIdentityDisabledIntegrationTest {
         assertEquals(403, chat.status(), chat.raw());
         assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", chat.text("code"));
 
+        /*
+         * 售后会话入口（A1 收尾新增）：它是"纯商城买家也能建会话"的落点，
+         * 因此更必须在身份不可信时先拒绝——否则就成了绕过守卫的旁路。
+         */
+        ShopApiClient.Reply conversations = api.get("/shop/aftersale/conversations", ADMIN);
+        assertEquals(403, conversations.status(), conversations.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", conversations.text("code"));
+
+        assertEquals(403, api.post("/shop/aftersale/conversations", ADMIN, null).status());
+        assertEquals(403, api.get("/shop/aftersale/conversations/any-id", ADMIN).status());
+
+        Integer conversationsWritten = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agent_conversation WHERE agent_type = 'AFTER_SALES'",
+                Integer.class);
+        assertEquals(0, conversationsWritten, "被拒绝的请求不得留下售后会话");
+
         assertEquals(0, ShopTestFixture.totalReturns(jdbcTemplate), "拒绝的请求不得建单");
         Integer runs = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM agent_run WHERE agent_type = 'AFTER_SALES'",

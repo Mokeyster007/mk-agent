@@ -15,7 +15,7 @@
 import { requestJson } from './client'
 import { streamEvents } from './sse'
 import { parseEvent } from './music'
-import type { AgentEvent } from './types'
+import type { AgentEvent, ConversationDetailVO, ConversationVO } from './types'
 
 /** 额度三个数：已购 / 已占用 / 剩余。A1 里只有"已提交"的申请占额度。 */
 export interface AfterSaleQuotaVO {
@@ -153,6 +153,39 @@ export interface AfterSaleChatOptions {
   conversationId?: string | null
   signal: AbortSignal
   onEvent: (event: AgentEvent) => void
+}
+
+/**
+ * 售后会话接口。
+ *
+ * **不要用 `/api/ai/conversations`**：那个入口的守卫要求 `music_user`，
+ * 合法的商城买家可能没有开通音乐服务，用它会 403 → 建不出会话 → 追问退化成单轮。
+ * 这里是售后自己的入口：守卫是买家身份，会话领域钉死为 AFTER_SALES，
+ * 与音乐会话互不可见（拿错领域的 id 一律 404）。
+ */
+export function createAfterSaleConversation(
+  signal?: AbortSignal,
+): Promise<{ conversationId: string }> {
+  return requestJson<{ conversationId: string }>('/api/shop/aftersale/conversations', {
+    method: 'POST',
+    signal,
+  })
+}
+
+/** 售后会话详情；不是本人或不是售后领域 → 404（同一句文案）。 */
+export function getAfterSaleConversation(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<ConversationDetailVO> {
+  return requestJson<ConversationDetailVO>(
+    `/api/shop/aftersale/conversations/${encodeURIComponent(conversationId)}`,
+    { signal },
+  )
+}
+
+/** 我的售后会话列表（最近活动在前）。 */
+export function listAfterSaleConversations(signal?: AbortSignal): Promise<ConversationVO[]> {
+  return requestJson<ConversationVO[]>('/api/shop/aftersale/conversations', { signal })
 }
 
 /**

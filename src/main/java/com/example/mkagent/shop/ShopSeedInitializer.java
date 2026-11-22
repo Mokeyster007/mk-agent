@@ -71,6 +71,18 @@ public class ShopSeedInitializer implements ApplicationRunner {
 
     public static final String BUYER_TWO = "music-user-2";
 
+    /**
+     * **只有商城身份、没有音乐身份**的买家。
+     *
+     * <p>为什么演示数据里需要这样一个人：前两个演示买家同时也是 music_user，
+     * 于是"售后页建不出会话"这类问题会被掩盖——前端建会话走的是音乐守卫的接口，
+     * 他们恰好能过。只有这个身份能把"纯商城买家"的真实路径走通。
+     *
+     * <p>它不在 {@code music_user} 里，因此 {@code /ai/music/*} 与
+     * {@code /ai/conversations} 对它一律 403；这正是要证明的边界。
+     */
+    public static final String BUYER_SHOP_ONLY = "shop-user-1";
+
     public static final String ADMIN = "music-admin-1";
 
     private record SeedProduct(long id, String sku, String name, String subtitle, long priceCents) {
@@ -93,6 +105,16 @@ public class ShopSeedInitializer implements ApplicationRunner {
     @Override
     @Transactional
     public void run(ApplicationArguments args) {
+        /*
+         * 用户先补齐：这一条**每次启动都跑**（幂等插入）。
+         *
+         * 为什么不能放在 alreadyInitialized() 之后：商品种子只写一次，
+         * 但"新增一个演示买家"是后来才加的需求——已经初始化过的库
+         * 如果被那个判断挡住，就永远拿不到这个身份，
+         * 于是"纯商城买家"的验收只能在全新库上复现。
+         */
+        ensureUsers();
+
         if (alreadyInitialized()) {
             log.debug("商城种子数据已存在，跳过初始化");
             return;
@@ -113,18 +135,38 @@ public class ShopSeedInitializer implements ApplicationRunner {
                     """, product.sku(), product.id(), stockOf(product.sku()));
         }
 
-        jdbcTemplate.update(
-                "INSERT INTO shop_user (user_id, role, created_at) VALUES (?, 'BUYER', CURRENT_TIMESTAMP)",
-                BUYER_ONE);
-        jdbcTemplate.update(
-                "INSERT INTO shop_user (user_id, role, created_at) VALUES (?, 'BUYER', CURRENT_TIMESTAMP)",
-                BUYER_TWO);
-        jdbcTemplate.update(
-                "INSERT INTO shop_user (user_id, role, created_at) VALUES (?, 'ADMIN', CURRENT_TIMESTAMP)",
-                ADMIN);
+        /*
+         * 身份不在这里插入：ensureUsers() 已经在最前面做过幂等补齐。
+         * 这里再插一次会撞 shop_user 主键（种子初始化在一个事务里）。
+         */
 
-        log.info("商城种子数据已写入：{} 个商品，键盘库存 {}，演示买家 {} / {}，后台 {}",
-                PRODUCTS.size(), KEYBOARD_STOCK, BUYER_ONE, BUYER_TWO, ADMIN);
+        log.info("商城种子数据已写入：{} 个商品，键盘库存 {}，演示买家 {} / {} / {}，后台 {}",
+                PRODUCTS.size(), KEYBOARD_STOCK, BUYER_ONE, BUYER_TWO, BUYER_SHOP_ONLY, ADMIN);
+    }
+
+    /**
+     * 补齐演示身份（幂等）。
+     *
+     * <p>{@code shop-user-1} 刻意**不**写进 {@code music_user}：
+     * 它就是用来验证"合法商城买家、但不是音乐用户"这条路径的。
+     */
+    private void ensureUsers() {
+        ensureUser(BUYER_ONE, "BUYER");
+        ensureUser(BUYER_TWO, "BUYER");
+        ensureUser(BUYER_SHOP_ONLY, "BUYER");
+        ensureUser(ADMIN, "ADMIN");
+    }
+
+    private void ensureUser(String userId, String role) {
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_user WHERE user_id = ?", Integer.class, userId);
+        if (count != null && count > 0) {
+            return;
+        }
+        jdbcTemplate.update(
+                "INSERT INTO shop_user (user_id, role, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                userId, role);
+        log.info("商城演示身份已补齐：{}（{}）", userId, role);
     }
 
     private boolean alreadyInitialized() {

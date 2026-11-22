@@ -64,7 +64,7 @@ async function loadAll(): Promise<void> {
 }
 
 async function onSwitchIdentity(userId: string): Promise<void> {
-  if (!session.updateUserId(userId)) {
+  if (!session.updateUserId(userId, { probeMusicCapabilities: false })) {
     return
   }
   shop.reset()

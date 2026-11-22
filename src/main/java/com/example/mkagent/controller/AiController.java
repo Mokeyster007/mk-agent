@@ -10,6 +10,7 @@ import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.conversation.ConversationSeed;
 import com.example.mkagent.conversation.ConversationService;
 import com.example.mkagent.exception.BusinessException;
+import com.example.mkagent.model.AgentType;
 import com.example.mkagent.model.RunningAgentTask;
 import com.example.mkagent.music.MusicAccessGuard;
 import com.example.mkagent.shop.ShopAccessGuard;
@@ -359,7 +360,7 @@ public class AiController {
 
         UUID runId = UUID.randomUUID();
         ConversationSeed seed = conversationService.beginTurn(
-                userId, conversationId, message, runId);
+                userId, conversationId, message, runId, AgentType.AFTER_SALES);
 
         try {
             return afterSaleAgent.runStream(message, seed);

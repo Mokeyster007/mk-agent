@@ -46,6 +46,15 @@ public class AfterSaleService {
     /** 同一个键被复用于不同参数。 */
     public static final String CODE_KEY_REUSED = "IDEMPOTENCY_KEY_REUSED";
 
+    /**
+     * 退货单或事件的唯一键冲突（**不是**幂等命中）。
+     *
+     * <p>与 {@code SUBMIT_CONFLICT}（同一提交正在处理中）刻意分开：
+     * 前者是数据异常，需要重新提交或排查；后者是正常的并发同键，
+     * 换个新事务读赢家结果即可。混成一个码会让用户以为"再等等就好了"。
+     */
+    public static final String CODE_RETURN_WRITE_CONFLICT = "RETURN_WRITE_CONFLICT";
+
     private final AfterSaleRepository repository;
 
     private final AfterSaleWriter writer;
@@ -162,9 +171,29 @@ public class AfterSaleService {
                 properties.getMaxReturnReasonLength());
 
         int qty = quantity == null || quantity < 0 ? 0 : quantity;
-        long refundCents = decision.eligible()
-                ? subject.unitPriceCents() * (long) qty
-                : 0L;
+
+        /*
+         * 金额与提交共用 AfterSaleMoney（整数分 + multiplyExact）。
+         *
+         * 溢出时**不展示任何金额**（refundCents=0，前端把文案渲染成「—」），
+         * 并把结果降级为"不可提交"。绝不允许回绕成一个看起来正常的数字——
+         * 那比报错更糟：用户会照着错金额去申请。
+         */
+        long refundCents = 0L;
+        boolean eligible = decision.eligible();
+        String code = decision.code();
+        String message = decision.message();
+
+        if (eligible) {
+            try {
+                refundCents = AfterSaleMoney.refundCents(subject.unitPriceCents(), qty);
+            } catch (ArithmeticException e) {
+                eligible = false;
+                code = AfterSaleEligibility.CODE_REFUND_AMOUNT_OUT_OF_RANGE;
+                message = "退款金额超出可表示范围（单价 " + subject.unitPriceCents()
+                        + " 分 × " + qty + " 件），请减少退货数量";
+            }
+        }
 
         return new AfterSalePreview(
                 subject.orderNo(),
@@ -175,9 +204,9 @@ public class AfterSaleService {
                 qty,
                 refundCents,
                 subject.quota(),
-                decision.eligible(),
-                decision.code(),
-                decision.message());
+                eligible,
+                code,
+                message);
     }
 
     // ---------------------------------------------------------------
@@ -224,11 +253,13 @@ public class AfterSaleService {
             return writer.createWithIdempotency(
                     buyerId, orderNo, quantity, normalizedReason,
                     AfterSaleSource.FORM, buyerId, key, requestHash);
-        } catch (DuplicateKeyException e) {
+        } catch (AfterSaleWriter.IdempotencyKeyConflictException e) {
             /*
              * 并发同键：另一个请求先插入了占位行并提交。
              * 我们的事务已整体回滚（占位行、额度、退货单都没留下），
              * 现在换一个新事务读赢家结果原样返回。
+             *
+             * 只认这一个异常：它是"同一次提交"的唯一证据。
              */
             log.info("表单提交命中并发幂等键，回放首次结果：user={}", buyerId);
             AfterSaleRepository.StoredIdempotency winner = repository.findIdempotency(key)
@@ -237,6 +268,19 @@ public class AfterSaleService {
                             "SUBMIT_CONFLICT",
                             "同一提交正在处理中，请稍后重试"));
             return replay(winner, requestHash, buyerId);
+        } catch (DuplicateKeyException e) {
+            /*
+             * 退货单号或事件 (return_id, event_type) 的唯一键冲突。
+             *
+             * 这**不是**幂等命中：同一个幂等键并没有被用过，是写入本身撞了唯一键。
+             * 当成"同键提交中"处理会让用户以为"再等等就好"，而实际上必须重来。
+             * 事务已回滚，因此额度没占、单据没留、幂等占位行也没留。
+             */
+            log.error("退货单写入命中非幂等唯一键冲突：user={}, orderNo={}", buyerId, orderNo, e);
+            throw new BusinessException(
+                    409,
+                    CODE_RETURN_WRITE_CONFLICT,
+                    "退货单写入冲突（非重复提交），本次提交未生效，请重新提交");
         }
     }
 

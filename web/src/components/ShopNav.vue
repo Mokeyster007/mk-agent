@@ -18,13 +18,17 @@ import { session } from '@/stores/session'
 /**
  * 演示身份。
  *
- * 与后端 `ShopSeedInitializer` 里的三条 shop_user 记录一一对应；
+ * 与后端 `ShopSeedInitializer` 里的四条 shop_user 记录一一对应；
  * 这里写死是刻意的——商城没有"列出所有用户"的接口，
  * 也不该有（那是用户目录，不是商城功能）。
+ *
+ * `shop-user-1` 是**只有商城身份、没有音乐身份**的买家：
+ * 用它才能走通"纯商城买家"的真实路径（音乐入口对它一律 403）。
  */
 const DEMO_IDENTITIES = [
   { id: 'music-user-1', label: 'music-user-1（买家）' },
   { id: 'music-user-2', label: 'music-user-2（买家）' },
+  { id: 'shop-user-1', label: 'shop-user-1（仅商城买家）' },
   { id: 'music-admin-1', label: 'music-admin-1（后台）' },
 ] as const
 

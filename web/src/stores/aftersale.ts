@@ -64,6 +64,10 @@ export function describeAfterSaleError(error: unknown): string {
       return '这次提交的标识已经用于另一笔参数不同的申请，已被拒绝。请刷新后重新填写。'
     case 'SUBMIT_CONFLICT':
       return '同一笔提交还在处理中，请稍等片刻再刷新查看结果。'
+    case 'RETURN_WRITE_CONFLICT':
+      return '退货单写入冲突（不是重复提交），本次提交没有生效。请重新提交；若反复出现请联系管理员。'
+    case 'REFUND_AMOUNT_OUT_OF_RANGE':
+      return '退款金额超出可表示范围，请减少退货数量后重新提交。'
     case 'ORDER_STATUS_CONFLICT':
     case 'DATA_CONFLICT':
       return '数据状态已变化，请刷新后重试。'

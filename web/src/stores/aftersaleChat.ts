@@ -13,7 +13,12 @@
  *    界面明确提示"追问不会带上文"。
  */
 import { computed, reactive, ref } from 'vue'
-import type { AgentEvent, ApprovalRequiredPayload, ApprovalView } from '@/api/types'
+import type {
+  AgentEvent,
+  ApprovalRequiredPayload,
+  ApprovalView,
+  ConversationDetailVO,
+} from '@/api/types'
 import { ApiError } from '@/api/errors'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
 import { runAfterSaleChat } from '@/api/aftersale'
@@ -45,6 +50,19 @@ let turnSeq = 0
 export interface AfterSaleChatDeps {
   chat: typeof runAfterSaleChat
   conversation: () => Promise<{ conversationId: string }>
+  /**
+   * 会话详情（刷新后恢复用）。
+   *
+   * 不传就只是"不能恢复"——对话本身照常可用，不会假装恢复成功。
+   */
+  conversationDetail?: (conversationId: string) => Promise<ConversationDetailVO>
+  /**
+   * conversationId 的持久化位置。
+   *
+   * 由页面按**身份**给出不同的 key（例如 `mkagent.aftersaleConversation.<userId>`）：
+   * 同一个浏览器换人之后不能续上上一个人的会话。
+   */
+  storageKey?: () => string | null
   approval: typeof getApproval
   decide: typeof decideApproval
   resume: typeof resumeApproval
@@ -55,10 +73,48 @@ export interface AfterSaleChatDeps {
 export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
   const turns = ref<AfterSaleTurn[]>([])
   const submitting = ref(false)
-  const conversationId = ref<string | null>(null)
-  /** 会话建不出来（比如身份不是音乐用户）：退化单轮，并在界面上说清楚 */
+  const conversationId = ref<string | null>(readStoredId())
+  /** 会话建不出来（身份/后端不可用）：退化单轮，并在界面上说清楚 */
   const conversationUnavailable = ref(false)
+  /** 正在从服务端恢复上次的会话（刷新后） */
+  const restoring = ref(false)
   const panelError = ref<string | null>(null)
+
+  function storageKey(): string | null {
+    try {
+      return deps.storageKey?.() ?? null
+    } catch {
+      return null
+    }
+  }
+
+  function readStoredId(): string | null {
+    const key = storageKey()
+    if (!key) {
+      return null
+    }
+    try {
+      return window.localStorage.getItem(key)
+    } catch {
+      return null
+    }
+  }
+
+  function persistId(id: string | null): void {
+    const key = storageKey()
+    if (!key) {
+      return
+    }
+    try {
+      if (id) {
+        window.localStorage.setItem(key, id)
+      } else {
+        window.localStorage.removeItem(key)
+      }
+    } catch {
+      // 隐私模式 / 存储被禁用：会话仍然可用，只是刷新后要重新建一次
+    }
+  }
 
   let controller: AbortController | null = null
 
@@ -98,6 +154,7 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
     try {
       const created = await deps.conversation()
       conversationId.value = created.conversationId
+      persistId(conversationId.value)
       return conversationId.value
     } catch {
       conversationUnavailable.value = true
@@ -148,6 +205,149 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
       turn.approval = await deps.approval(approvalId)
     } catch (error) {
       turn.error = describeAfterSaleError(error)
+    }
+  }
+
+  /**
+   * 审批查询结果 → 确认卡载荷。
+   *
+   * <p>内容仍然**全部来自服务端**（`GET /ai/approvals/{id}` 的 summary），
+   * 前端只是换了个容器：不补字段、不拼文案、不自己算钱。
+   *
+   * <p>拿不到 summary 就返回 null：宁可不显示卡，也不显示一张内容不对的卡——
+   * 确认卡是"用户同意什么"的唯一凭据。
+   */
+  function payloadFromApproval(approval: ApprovalView): ApprovalRequiredPayload | null {
+    const summary = approval.summary
+    if (!summary) {
+      return null
+    }
+    return {
+      approvalId: approval.approvalId,
+      expiresAt: approval.expiresAt ?? '',
+      summary: {
+        tool: summary.tool,
+        toolLabel: summary.toolLabel,
+        playlistName: summary.playlistName ?? null,
+        songCount: summary.songCount ?? null,
+        songs: summary.songs ?? [],
+        roundToolCount: summary.roundToolCount ?? 0,
+        text: summary.text ?? '',
+        details: summary.details ?? [],
+      },
+    }
+  }
+
+  /**
+   * 把会话详情还原成一轮轮对话。
+   *
+   * <p>只还原服务端真正存下来的两样东西：用户输入与助手回答的**文本**，
+   * 以及"这一轮还有没有待审批"。工具进度不还原（历史进度不是当前进度，
+   * 显示出来只会让人以为还在跑）。
+   *
+   * <p>待审批的那一轮会重新查一次审批，用服务端摘要重建确认卡——
+   * 这正是"刷新之后还能接着确认"的落点。
+   */
+  async function rebuildTurns(detail: ConversationDetailVO): Promise<AfterSaleTurn[]> {
+    interface Draft {
+      prompt: string
+      answer: string
+      approvalId: string | null
+    }
+
+    const drafts = new Map<string, Draft>()
+    const order: string[] = []
+
+    for (const message of detail.messages ?? []) {
+      const runId = message.runId
+      if (!runId) {
+        continue
+      }
+      let draft = drafts.get(runId)
+      if (!draft) {
+        draft = { prompt: '', answer: '', approvalId: null }
+        drafts.set(runId, draft)
+        order.push(runId)
+      }
+      if (message.role === 'USER') {
+        draft.prompt = message.content ?? ''
+      } else if (message.role === 'ASSISTANT') {
+        draft.answer = message.content ?? ''
+      }
+      if (message.approvalId) {
+        draft.approvalId = message.approvalId
+      }
+    }
+
+    const restored: AfterSaleTurn[] = []
+
+    for (const runId of order) {
+      const draft = drafts.get(runId)
+      if (!draft) {
+        continue
+      }
+      const turn = newTurn(draft.prompt)
+      turn.runId = runId
+      turn.answer = draft.answer
+      turn.transport = 'closed'
+
+      if (draft.approvalId) {
+        try {
+          const approval = await deps.approval(draft.approvalId)
+          turn.approval = approval
+          turn.approvalPayload = payloadFromApproval(approval)
+          if (!turn.approvalPayload) {
+            turn.error = '这一轮的确认信息已不可读取，请重新发起申请。'
+          }
+        } catch {
+          /*
+           * 审批查不到（过期被清理 / 不是本人）：不构造一张没有依据的卡。
+           * 如实说明，用户重新发起即可。
+           */
+          turn.error = '这一轮的确认信息已不可读取（可能已过期），请重新发起申请。'
+        }
+      }
+
+      restored.push(turn)
+    }
+
+    return restored
+  }
+
+  /**
+   * 刷新后恢复上次的会话。
+   *
+   * @return true 表示恢复出了内容；false 表示没有可恢复的会话（不影响继续使用）
+   */
+  async function restore(): Promise<boolean> {
+    const id = conversationId.value
+    if (!id || restoring.value) {
+      return false
+    }
+    if (!deps.conversationDetail) {
+      return false
+    }
+
+    restoring.value = true
+    try {
+      const detail = await deps.conversationDetail(id)
+      const restored = await rebuildTurns(detail)
+      turns.value = restored
+      return restored.length > 0
+    } catch (error) {
+      /*
+       * 404 = 这个 id 不属于当前身份，或不是售后领域的会话（换人、清库、旧版本遗留）。
+       * 丢掉它，下次发送时新建一个；不要把它当成错误弹给用户。
+       */
+      if (error instanceof ApiError && error.kind === 'not_found') {
+        conversationId.value = null
+        persistId(null)
+        return false
+      }
+      panelError.value = describeAfterSaleError(error)
+      return false
+    } finally {
+      restoring.value = false
     }
   }
 
@@ -302,14 +502,18 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
     controller = null
     turns.value = []
     submitting.value = false
+    restoring.value = false
     panelError.value = null
     conversationId.value = null
     conversationUnavailable.value = false
+    // 换人 / 清空时把持久化的会话 id 一起丢掉，否则刷新后会去续上一个人的会话
+    persistId(null)
   }
 
   return {
     turns,
     submitting,
+    restoring,
     busy,
     conversationId,
     conversationUnavailable,
@@ -318,6 +522,7 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
     decide,
     resume,
     refreshApproval,
+    restore,
     abortWaiting,
     reset,
   }

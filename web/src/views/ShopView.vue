@@ -65,7 +65,7 @@ function toneOf(status: ShopOrderStatus | 'UNKNOWN'): Tone {
 }
 
 async function onSwitchIdentity(userId: string): Promise<void> {
-  if (!session.updateUserId(userId)) {
+  if (!session.updateUserId(userId, { probeMusicCapabilities: false })) {
     return
   }
   // 换了身份就是换了一个人：先清空，再按新身份重新读

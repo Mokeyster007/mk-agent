@@ -1,5 +1,6 @@
 package com.example.mkagent.shop.api;
 
+import com.example.mkagent.shop.aftersale.AfterSaleEligibility;
 import com.example.mkagent.shop.aftersale.AfterSaleEvent;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
 import com.example.mkagent.shop.aftersale.AfterSaleQuota;
@@ -160,6 +161,15 @@ public final class AfterSaleViews {
     }
 
     public static PreviewVO preview(AfterSalePreview preview) {
+        /*
+         * 金额溢出时不下发数字：refundCents 是 0，但文案必须是「—」而不是「¥0.00」。
+         * 「¥0.00」会被理解成"这单不值钱"，而真实情况是"算不出来，请减少数量"。
+         */
+        String refundText = AfterSaleEligibility.CODE_REFUND_AMOUNT_OUT_OF_RANGE
+                .equals(preview.code())
+                ? "—"
+                : ShopViews.money(preview.refundCents());
+
         return new PreviewVO(
                 preview.orderNo(),
                 preview.sku(),
@@ -168,7 +178,7 @@ public final class AfterSaleViews {
                 ShopViews.money(preview.unitPriceCents()),
                 preview.requestedQty(),
                 preview.refundCents(),
-                ShopViews.money(preview.refundCents()),
+                refundText,
                 quota(preview.quota()),
                 preview.eligible(),
                 preview.code(),

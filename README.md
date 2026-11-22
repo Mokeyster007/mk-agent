@@ -638,8 +638,9 @@ cd web && node tools/e2e-shop.mjs
 
 种子数据：键盘 `SKU-KEYBOARD-K87` ¥299 库存 10、鼠标 `SKU-MOUSE-M2` ¥129 库存 5、
 数据线 `SKU-CABLE-C1` ¥19 库存 0（演示"库存不足"）。
-演示身份：`music-user-1` / `music-user-2`（BUYER）、`music-admin-1`（ADMIN），
+演示身份：`music-user-1` / `music-user-2` / `shop-user-1`（BUYER）、`music-admin-1`（ADMIN），
 角色只存在 `shop_user` 表，与 `music_user` 互不推导。
+其中 `shop-user-1` **只有商城身份、没有音乐身份**，用来验证"纯商城买家"的真实路径。
 
 > 共享部署请保持 `mkagent.shop.demo-identity-enabled=false`（默认）：
 > 此时下单/发货/签收一律 403，商品浏览仍可用。
@@ -655,6 +656,9 @@ cd web && node tools/e2e-aftersale.mjs
 
 # 第二段：拒绝零写入 + 普通表单提交（模型不可用也能走这条路）
 cd web && node tools/e2e-aftersale-form.mjs
+
+# 第三段：纯商城买家（shop-user-1）多轮追问 → 刷新恢复会话 → 确认卡提交
+cd web && node tools/e2e-aftersale-shopbuyer.mjs
 ```
 
 浏览器里走一遍（约 3 分钟）：

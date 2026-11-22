@@ -342,6 +342,7 @@ CREATE TABLE IF NOT EXISTS agent_conversation
     id              BIGINT       NOT NULL,
     conversation_id VARCHAR(64)  NOT NULL,
     user_id         VARCHAR(64)  NOT NULL,
+    agent_type      VARCHAR(32)  NOT NULL DEFAULT 'MUSIC_USER',
     title           VARCHAR(200),
     refs_json       TEXT,
     last_run_id     VARCHAR(64),
@@ -350,11 +351,29 @@ CREATE TABLE IF NOT EXISTS agent_conversation
     CONSTRAINT pk_agent_conversation PRIMARY KEY (id)
 );
 
+-- 存量库增量升级：会话的业务领域（幂等，可重复执行）。
+--
+-- 为什么需要这一列：会话原先只按 user_id 归属，同一个人的音乐会话与售后会话
+-- 会互相可见、可以互相串用。演示身份恰好同时是 music_user 与 shop_user，
+-- 所以这个问题在演示里看不出来；一旦换成"只有商城身份"的买家就立刻暴露
+-- （建不出会话 → 追问退化成单轮）。
+--
+-- 默认值 MUSIC_USER 是对历史数据的正确解释：这一列出现之前，
+-- 唯一支持会话的入口就是 /ai/music/chat。
+ALTER TABLE agent_conversation
+    ADD COLUMN IF NOT EXISTS agent_type VARCHAR(32) NOT NULL DEFAULT 'MUSIC_USER';
+
+UPDATE agent_conversation SET agent_type = 'MUSIC_USER' WHERE agent_type IS NULL;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uk_agent_conversation_id
     ON agent_conversation (conversation_id);
 
 CREATE INDEX IF NOT EXISTS idx_agent_conversation_user
     ON agent_conversation (user_id, updated_at);
+
+-- 列表按 (user_id, agent_type) 过滤，索引跟着查询走。
+CREATE INDEX IF NOT EXISTS idx_agent_conversation_user_type
+    ON agent_conversation (user_id, agent_type, updated_at);
 
 -- 会话消息：只存用户输入与模型最终回答的**文本**。
 --

@@ -1,6 +1,10 @@
 package com.example.mkagent.controller;
 
 import com.example.mkagent.conversation.ConversationService;
+import com.example.mkagent.conversation.ConversationViews;
+import com.example.mkagent.conversation.ConversationViews.ConversationDetailVO;
+import com.example.mkagent.conversation.ConversationViews.ConversationVO;
+import com.example.mkagent.model.AgentType;
 import com.example.mkagent.music.MusicAccessGuard;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -8,19 +12,21 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 会话（同一窗口连续聊天）的只读接口 + 新建。
+ * 音乐会话（同一窗口连续聊天）的只读接口 + 新建。
  *
  * <p>**这里没有"继续上一轮"的接口**：续聊不是"复活旧 run"，
  * 而是带着 conversationId 再发一条 /ai/music/chat——
  * 后端会新建 runId，把历史文本与业务引用注入给模型。
  *
- * <p>归属校验放在 {@link ConversationService}：不存在与不是本人共用同一句
- * 404 文案，外部无法据此枚举他人的会话。
+ * <p>归属与领域校验都在 {@link ConversationService}：本入口只认
+ * {@link AgentType#MUSIC_USER} 的会话，售后会话在这里同样是 404。
+ * 售后入口在 {@code AfterSaleConversationController}，守卫与领域都不同。
+ *
+ * <p>不存在与不是本人共用同一句 404 文案，外部无法据此枚举他人的会话。
  */
 @RestController
 @RequestMapping("/ai/conversations")
@@ -47,14 +53,9 @@ public class ConversationController {
     public List<ConversationVO> list() {
         String userId = musicAccessGuard.requireUser();
 
-        return conversationService.list(userId).stream()
+        return conversationService.list(userId, AgentType.MUSIC_USER).stream()
                 .filter(item -> item.messageCount() > 0)
-                .map(item -> new ConversationVO(
-                        item.conversationId(),
-                        item.title(),
-                        item.messageCount(),
-                        item.lastState(),
-                        item.updatedAt()))
+                .map(ConversationViews::summary)
                 .toList();
     }
 
@@ -67,7 +68,7 @@ public class ConversationController {
     @PostMapping
     public Map<String, Object> create() {
         String userId = musicAccessGuard.requireUser();
-        String conversationId = conversationService.create(userId);
+        String conversationId = conversationService.create(userId, AgentType.MUSIC_USER);
 
         return Map.of(
                 "conversationId", conversationId,
@@ -85,49 +86,7 @@ public class ConversationController {
     @GetMapping("/{conversationId}")
     public ConversationDetailVO detail(@PathVariable String conversationId) {
         String userId = musicAccessGuard.requireUser();
-        ConversationService.ConversationDetail detail =
-                conversationService.detail(userId, conversationId);
-
-        return new ConversationDetailVO(
-                detail.conversationId(),
-                detail.title(),
-                detail.messages().stream()
-                        .map(m -> new MessageVO(
-                                m.runId(), m.role(), m.content(), m.state(),
-                                m.createdAt(), m.approvalId()))
-                        .toList(),
-                detail.updatedAt()
-        );
-    }
-
-    /** 列表项。 */
-    public record ConversationVO(
-            String conversationId,
-            String title,
-            int messageCount,
-            String lastState,
-            LocalDateTime updatedAt
-    ) {
-    }
-
-    /** 一条消息。role 只有 USER / ASSISTANT 两种。 */
-    public record MessageVO(
-            String runId,
-            String role,
-            String content,
-            String state,
-            LocalDateTime createdAt,
-            /** 该轮仍有待审批时为 approvalId，否则 null（用于刷新后重建审批卡）。 */
-            String approvalId
-    ) {
-    }
-
-    /** 会话详情。 */
-    public record ConversationDetailVO(
-            String conversationId,
-            String title,
-            List<MessageVO> messages,
-            LocalDateTime updatedAt
-    ) {
+        return ConversationViews.detail(
+                conversationService.detail(userId, conversationId, AgentType.MUSIC_USER));
     }
 }
