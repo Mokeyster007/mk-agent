@@ -58,6 +58,15 @@ public class AfterSaleRefundWriter {
     /** 还没收满，不能退款。 */
     public static final String CODE_NOT_RECEIVED = "REFUND_NOT_RECEIVED";
 
+    /**
+     * 累计实收**超过**批准数量（数据不一致），不能退款。
+     *
+     * <p>正常写入路径不可能产生这种数据：{@code AfterSaleReceiptWriter} 在锁内校验
+     * "累计实收 + 本批 ≤ 批准数量"。出现超量只可能是绕过业务路径改了库，
+     * 这时按实收金额退款会**多退钱**，所以独立成一个错误码并拒绝。
+     */
+    public static final String CODE_RECEIPT_MISMATCH = "REFUND_RECEIPT_QUANTITY_MISMATCH";
+
     /** 这张退货单已经退过款（一张单最多一笔）。 */
     public static final String CODE_ALREADY_REFUNDED = "REFUND_ALREADY_EXISTS";
 
@@ -114,6 +123,21 @@ public class AfterSaleRefundWriter {
                     CODE_NOT_RECEIVED,
                     "还没收满，不能退款：批准 " + fresh.quantity() + " 件，已收 " + received
                             + " 件，还差 " + (fresh.quantity() - received) + " 件");
+        }
+
+        /*
+         * 累计实收 > 批准数量：数据不一致，拒绝。
+         *
+         * 不能"按实收金额退"——那会多退钱；也不能"按批准数量退"——那是在
+         * 用一笔来源不明的记录决定金额。两者都是猜，所以直接拒绝并让人核对数据。
+         * 正常情况下这条分支走不到（收货写入时已锁内校验不超收）。
+         */
+        if (received > fresh.quantity()) {
+            throw new BusinessException(
+                    409,
+                    CODE_RECEIPT_MISMATCH,
+                    "收货记录与批准数量不一致（批准 " + fresh.quantity() + " 件，累计实收 "
+                            + received + " 件），已拒绝模拟退款，请联系管理员核对数据");
         }
 
         /*

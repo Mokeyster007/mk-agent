@@ -99,7 +99,7 @@ async function loadAll(): Promise<void> {
 }
 
 async function onSwitchIdentity(userId: string): Promise<void> {
-  if (!session.updateUserId(userId, { probeMusicCapabilities: false })) {
+  if (!session.updateUserId(userId)) {
     return
   }
   shop.reset()
@@ -359,29 +359,32 @@ onMounted(async () => {
                 </div>
 
                 <div class="row__actions">
-                  <button
-                    type="button"
-                    class="mk-btn mk-btn--sm mk-btn--primary"
-                    data-action="approve"
-                    :disabled="item.status !== 'SUBMITTED' || afterSaleAdmin.state.busyReturnNo !== null"
-                    @click="onApprove(item.returnNo)"
-                  >
-                    {{
-                      afterSaleAdmin.state.busyReturnNo === item.returnNo &&
-                      afterSaleAdmin.state.busyAction === 'approve'
-                        ? '处理中…'
-                        : '批准'
-                    }}
-                  </button>
-                  <button
-                    type="button"
-                    class="mk-btn mk-btn--sm"
-                    data-action="reject"
-                    :disabled="item.status !== 'SUBMITTED' || afterSaleAdmin.state.busyReturnNo !== null"
-                    @click="startReject(item.returnNo)"
-                  >
-                    驳回
-                  </button>
+                  <!-- F-05：已决策单不再展示再次批准/驳回按钮；后端状态机 409 校验继续保留 -->
+                  <template v-if="item.status === 'SUBMITTED'">
+                    <button
+                      type="button"
+                      class="mk-btn mk-btn--sm mk-btn--primary"
+                      data-action="approve"
+                      :disabled="afterSaleAdmin.state.busyReturnNo !== null"
+                      @click="onApprove(item.returnNo)"
+                    >
+                      {{
+                        afterSaleAdmin.state.busyReturnNo === item.returnNo &&
+                        afterSaleAdmin.state.busyAction === 'approve'
+                          ? '处理中…'
+                          : '批准'
+                      }}
+                    </button>
+                    <button
+                      type="button"
+                      class="mk-btn mk-btn--sm"
+                      data-action="reject"
+                      :disabled="afterSaleAdmin.state.busyReturnNo !== null"
+                      @click="startReject(item.returnNo)"
+                    >
+                      驳回
+                    </button>
+                  </template>
                   <button
                     v-if="item.status === 'APPROVED'"
                     type="button"

@@ -4,85 +4,69 @@ import com.example.mkagent.model.AgentRunContext;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 业务引用抽取的规则测试。
- *
- * <p>这一层最容易出的不是崩溃，而是**语义漂移**：
- * 引用被悄悄换成另一批对象，模型照样能答，只是答错了。
- * 所以每条断言都锁一个"什么算同一批对象"的决定。
+ * 业务引用抽取的规则测试（电商商品候选、签收订单、预览上下文 + 历史记录反序列化兼容）。
  */
 class BusinessRefCollectorTest {
 
-    private static final String SEARCH_RESULT = """
-            {"ok":true,"data":[
-              {"id":1001,"title":"城市霓虹","artist":"夜航星"},
-              {"id":1005,"title":"失眠频率","artist":"夜航星"},
-              {"id":1003,"title":"末班地铁","artist":"夜航星"}
-            ],"meta":{"count":3}}
+    private static final String PRODUCT_SEARCH_RESULT = """
+            {"ok":true,"data":{
+              "items":[
+                {"id":2004,"sku":"SKU-KEYBOARD-A75","name":"无线轻音机械键盘 Air75","priceCents":36900,"available":8},
+                {"id":2005,"sku":"SKU-KEYBOARD-B68","name":"紧凑蓝牙键盘 B68","priceCents":25900,"available":6}
+              ]
+            }}
             """;
 
-    private static final String PLAYLIST_SONGS = """
+    private static final String SIGNED_ORDERS_RESULT = """
             {"ok":true,"data":[
-              {"id":1001,"title":"城市霓虹","artist":"夜航星"},
-              {"id":1005,"title":"失眠频率","artist":"夜航星"}
-            ],"meta":{"count":2}}
-            """;
-
-    private static final String PLAYLISTS = """
-            {"ok":true,"data":[
-              {"id":97,"name":"夜航星精选","songCount":2}
+              {"orderNo":"SO-2026-0001","productName":"机械键盘 K87","sku":"SKU-KEYBOARD-K87","quantity":2}
             ],"meta":{"count":1}}
             """;
 
-    private static final String CREATED = """
-            {"ok":true,"data":{"playlistId":97,"name":"夜航星精选","songCount":2}}
+    private static final String RETURN_PREVIEW_RESULT = """
+            {"ok":true,"data":{
+              "orderNo":"SO-2026-0001","productName":"机械键盘 K87",
+              "quantity":1,"reason":"按键回弹偏硬","eligible":true
+            }}
             """;
 
     @Test
-    @DisplayName("搜索结果按返回顺序进入引用")
-    void searchResultKeepsOrder() {
+    @DisplayName("商品检索结果按顺序进入候选商品引用，支持“第二款加一把”指代绑定")
+    void productSearchKeepsOrder() {
         AgentRunContext ctx = new AgentRunContext();
 
-        assertTrue(BusinessRefCollector.collect(ctx, "search_songs", SEARCH_RESULT));
+        assertTrue(BusinessRefCollector.collect(ctx, "search_products", PRODUCT_SEARCH_RESULT));
 
         ConversationRefs refs = ctx.getConversationRefs();
-        assertEquals(3, refs.songs().size());
-        assertEquals(1001, refs.songs().get(0).id());
-        assertEquals(1003, refs.songs().get(2).id());
-        assertTrue(refs.renderBlock().contains("1. 城市霓虹"));
+        assertEquals(2, refs.products().size());
+        assertEquals(2004L, refs.products().get(0).id());
+        assertEquals("SKU-KEYBOARD-B68", refs.products().get(1).sku());
+        String block = refs.renderBlock();
+        assertTrue(block.contains("1. 无线轻音机械键盘 Air75"), block);
+        assertTrue(block.contains("2. 紧凑蓝牙键盘 B68"), block);
     }
 
     @Test
-    @DisplayName("查看歌单曲目不会顶掉「刚才搜到的那几首」")
-    void playlistViewDoesNotClobberSearchRefs() {
+    @DisplayName("签收订单列表与退货预览都正确沉淀到会话引用")
+    void afterSaleOrdersAndPreviewCollected() {
         AgentRunContext ctx = new AgentRunContext();
-        BusinessRefCollector.collect(ctx, "search_songs", SEARCH_RESULT);
 
-        // 中途查了一次歌单曲目（只有 2 首）
-        BusinessRefCollector.collect(ctx, "get_playlist_songs", PLAYLIST_SONGS);
+        assertTrue(BusinessRefCollector.collect(ctx, "list_my_signed_orders", SIGNED_ORDERS_RESULT));
+        assertTrue(BusinessRefCollector.collect(ctx, "preview_return", RETURN_PREVIEW_RESULT));
 
         ConversationRefs refs = ctx.getConversationRefs();
-        assertEquals(3, refs.songs().size(),
-                "歌单曲目不应覆盖搜索引用，否则「第三首」会凭空消失");
-        assertEquals(1003, refs.songs().get(2).id());
-    }
-
-    @Test
-    @DisplayName("新建歌单记成「最近确认的歌单」，同时保留已有歌单列表")
-    void createdPlaylistBecomesLast() {
-        AgentRunContext ctx = new AgentRunContext();
-        BusinessRefCollector.collect(ctx, "get_user_playlists", PLAYLISTS);
-        BusinessRefCollector.collect(ctx, "create_playlist", CREATED);
-
-        ConversationRefs refs = ctx.getConversationRefs();
-        assertEquals(97, refs.lastPlaylist().id());
-        assertEquals(1, refs.playlists().size(), "已有歌单列表不该被挤掉");
-        assertTrue(refs.renderBlock().contains("最近一次创建/确认的歌单"));
+        assertEquals(1, refs.orders().size());
+        assertEquals("SO-2026-0001", refs.orders().get(0).orderNo());
+        assertEquals("SO-2026-0001", refs.lastReturnPreview().orderNo());
+        assertEquals(1, refs.lastReturnPreview().quantity());
     }
 
     @Test
@@ -90,7 +74,7 @@ class BusinessRefCollectorTest {
     void failureProducesNoRefs() {
         AgentRunContext ctx = new AgentRunContext();
 
-        assertFalse(BusinessRefCollector.collect(ctx, "search_songs",
+        assertFalse(BusinessRefCollector.collect(ctx, "search_products",
                 "{\"ok\":false,\"data\":null,\"meta\":{\"hint\":\"没找到\"}}"));
 
         assertTrue(ctx.getConversationRefs().isEmpty());
@@ -98,29 +82,33 @@ class BusinessRefCollectorTest {
     }
 
     @Test
-    @DisplayName("二次编码的信封也能解析（框架有时会把结果再套一层字符串）")
+    @DisplayName("二次编码的信封也能解析")
     void doubleEncodedEnvelopeIsUnwrapped() {
         AgentRunContext ctx = new AgentRunContext();
 
-        String doubleEncoded = "\"" + SEARCH_RESULT.trim()
+        String doubleEncoded = "\"" + PRODUCT_SEARCH_RESULT.trim()
                 .replace("\\", "\\\\")
                 .replace("\"", "\\\"")
                 .replace("\n", "\\n") + "\"";
 
-        assertTrue(BusinessRefCollector.collect(ctx, "search_songs", doubleEncoded));
-        assertEquals(3, ctx.getConversationRefs().songs().size());
+        assertTrue(BusinessRefCollector.collect(ctx, "search_products", doubleEncoded));
+        assertEquals(2, ctx.getConversationRefs().products().size());
     }
 
     @Test
-    @DisplayName("引用能原样 JSON 往返，坏数据退化成空引用")
-    void jsonRoundTrip() {
+    @DisplayName("引用能原样 JSON 往返，且兼容历史库里残留的旧字段")
+    void jsonRoundTripAndLegacyCompat() {
         ConversationRefs refs = ConversationRefs.EMPTY
-                .withSongs(java.util.List.of(new ConversationRefs.SongRef(1001, "城市霓虹")))
-                .withLastPlaylist(new ConversationRefs.PlaylistRef(97, "夜航星精选"));
+                .withProducts(List.of(new ConversationRefs.ProductRef(
+                        2004L, "SKU-KEYBOARD-A75", "无线轻音机械键盘 Air75", 36900L, 8)));
 
         ConversationRefs restored = ConversationRefs.fromJson(refs.toJson());
-
         assertEquals(refs, restored);
+
+        // 旧库历史记录里若仍有 songs/playlists 字段，不得反序列化报错，优雅退化为空电商引用
+        ConversationRefs legacy = ConversationRefs.fromJson(
+                "{\"songs\":[{\"id\":1001,\"title\":\"旧歌\"}],\"playlists\":[]}");
+        assertTrue(legacy.isEmpty());
         assertTrue(ConversationRefs.fromJson("{不是 JSON").isEmpty());
         assertTrue(ConversationRefs.fromJson(null).isEmpty());
     }

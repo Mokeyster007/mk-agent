@@ -1,35 +1,20 @@
 <script setup lang="ts">
 /**
- * 商城侧栏。
+ * 电商平台侧栏导航。
  *
- * 只承担导航与身份显示，不承担状态：
- * 商品数量、订单状态一律来自 store，侧栏不重复判断。
- *
- * 为什么这里有一个身份切换：
- * 本项目没有真实登录，联调身份来自 X-User-Id。
- * 商城要演示"买家下单 → 后台发货"就必须能换人，
- * 而换人这件事只能发生在**开发模式**（ALLOW_DEV_IDENTITY），
- * 正式构建里连下拉框都不渲染。
+ * 音乐模块退场后，电商为默认体验：
+ * 提供导购与商城、购物车、我的订单、售后与退货、商城后台、售后处理六个清晰入口。
  */
 import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
 import { session } from '@/stores/session'
 
-/**
- * 演示身份。
- *
- * 与后端 `ShopSeedInitializer` 里的四条 shop_user 记录一一对应；
- * 这里写死是刻意的——商城没有"列出所有用户"的接口，
- * 也不该有（那是用户目录，不是商城功能）。
- *
- * `shop-user-1` 是**只有商城身份、没有音乐身份**的买家：
- * 用它才能走通"纯商城买家"的真实路径（音乐入口对它一律 403）。
- */
 const DEMO_IDENTITIES = [
-  { id: 'music-user-1', label: 'music-user-1（买家）' },
-  { id: 'music-user-2', label: 'music-user-2（买家）' },
-  { id: 'shop-user-1', label: 'shop-user-1（仅商城买家）' },
-  { id: 'music-admin-1', label: 'music-admin-1（后台）' },
+  { id: 'shop-user-1', label: 'shop-user-1（买家）' },
+  { id: 'shop-admin-1', label: 'shop-admin-1（后台）' },
+  { id: 'music-user-1', label: 'music-user-1（兼容买家）' },
+  { id: 'music-user-2', label: 'music-user-2（兼容买家 2）' },
+  { id: 'music-admin-1', label: 'music-admin-1（兼容后台）' },
 ] as const
 
 const emit = defineEmits<{
@@ -37,7 +22,6 @@ const emit = defineEmits<{
 }>()
 
 const currentUserId = computed(() => session.userId.value)
-
 const canSwitch = session.allowDevIdentity
 
 function onChange(event: Event): void {
@@ -54,19 +38,23 @@ function onChange(event: Event): void {
       <span class="shop-nav__mark" aria-hidden="true">
         <AppIcon name="folder" :size="16" />
       </span>
-      <span class="shop-nav__title">商城</span>
-      <span class="shop-nav__tag">A0</span>
+      <span class="shop-nav__title">MkAgent 电商</span>
+      <span class="shop-nav__tag">Demo</span>
     </div>
 
-    <nav class="shop-nav__links" aria-label="商城导航">
-      <a class="shop-nav__link" href="#products">
+    <nav class="shop-nav__links" aria-label="电商导航">
+      <RouterLink class="shop-nav__link" to="/shop#guide">
         <AppIcon name="list" :size="14" />
-        商品与下单
-      </a>
-      <a class="shop-nav__link" href="#orders">
+        导购与选品
+      </RouterLink>
+      <RouterLink class="shop-nav__link" to="/shop#cart">
+        <AppIcon name="folder" :size="14" />
+        购物车
+      </RouterLink>
+      <RouterLink class="shop-nav__link" to="/shop#orders">
         <AppIcon name="clock" :size="14" />
         我的订单
-      </a>
+      </RouterLink>
       <RouterLink class="shop-nav__link" to="/shop/aftersale">
         <AppIcon name="refresh" :size="14" />
         售后与退货
@@ -78,10 +66,6 @@ function onChange(event: Event): void {
       <RouterLink class="shop-nav__link" to="/shop/admin/aftersale">
         <AppIcon name="check" :size="14" />
         售后处理
-      </RouterLink>
-      <RouterLink class="shop-nav__link" to="/">
-        <AppIcon name="wave" :size="14" />
-        音乐工作台
       </RouterLink>
     </nav>
 
@@ -103,7 +87,7 @@ function onChange(event: Event): void {
       <p v-else class="shop-nav__static">{{ currentUserId }}</p>
 
       <p class="shop-nav__hint">
-        不是真实登录。商城角色来自 shop_user 表，与音乐角色互不推导。
+        演示联调身份（非真实登录）。角色由服务端 shop_user 表判定。
       </p>
     </div>
   </aside>
@@ -176,7 +160,7 @@ function onChange(event: Event): void {
   color: var(--c-text);
 }
 
-.shop-nav__link.router-link-active {
+.shop-nav__link.router-link-exact-active {
   background: var(--c-accent-weak);
   color: var(--c-accent-ink);
 }

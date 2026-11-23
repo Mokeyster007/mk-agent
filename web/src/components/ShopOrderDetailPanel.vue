@@ -161,6 +161,20 @@ const movements = computed(() => props.order.movements ?? [])
         该订单已签收，没有可执行的操作。
       </p>
     </footer>
+
+    <footer v-else class="panel__foot">
+      <RouterLink
+        v-if="order.status === 'SIGNED'"
+        class="mk-btn mk-btn--primary"
+        data-go-aftersale
+        :to="{ path: '/shop/aftersale', query: { orderNo: order.orderNo } }"
+      >
+        申请退货 / 售后
+      </RouterLink>
+      <p v-else class="panel__muted panel__muted--foot">
+        订单签收后可从此入口带入明细申请退货（当前状态：{{ order.statusLabel }}）。
+      </p>
+    </footer>
   </div>
 </template>
 

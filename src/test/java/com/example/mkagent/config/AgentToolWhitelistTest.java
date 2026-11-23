@@ -2,14 +2,12 @@ package com.example.mkagent.config;
 
 import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.ToolRetryWrapper;
-import com.example.mkagent.tools.AdminAnalyticsTool;
 import com.example.mkagent.tools.AfterSaleQueryTool;
 import com.example.mkagent.tools.FileOperationTool;
-import com.example.mkagent.tools.MusicPlaylistQueryTool;
-import com.example.mkagent.tools.MusicQueryTool;
-import com.example.mkagent.tools.PlaybackTool;
 import com.example.mkagent.tools.PDFGenerationTool;
 import com.example.mkagent.tools.ResourceDownloadTool;
+import com.example.mkagent.tools.ShopAssistantQueryTool;
+import com.example.mkagent.tools.ShopCartTool;
 import com.example.mkagent.tools.TerminateTool;
 import com.example.mkagent.tools.WebScrapingTool;
 import com.example.mkagent.tools.WebSearchTool;
@@ -22,13 +20,13 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * AgentToolProvider 工具白名单单元测试。
  *
- * 不启动 Spring 上下文、不调用任何真实模型或外部 API：
- * 直接 new 工具实例，验证每种 Agent 类型拿到的
- * 工具集合严格等于白名单（最小权限原则）。
+ * 验证每种 Agent 类型拿到的工具集合严格等于白名单（最小权限原则），
+ * 且音乐 Agent 类型不再注册任何工具能力。
  */
 class AgentToolWhitelistTest {
 
@@ -39,22 +37,11 @@ class AgentToolWhitelistTest {
             new FileOperationTool(),
             new ResourceDownloadTool(),
             new PDFGenerationTool(),
-            // 音乐工具只用到方法签名，构造时依赖传 null 即可。
-            new MusicQueryTool(null),
-            new MusicPlaylistQueryTool(null),
-            // 播放工具同样只用到方法签名
-            new PlaybackTool(null),
-            new AdminAnalyticsTool(null, null),
-            // 售后只读工具同样只用到方法签名；服务为 null 不影响工具名。
             new AfterSaleQueryTool(null),
-            /*
-             * 售后写工具在真实装配里是"已幂等包装的回调数组"。
-             * 本测试只验证白名单，不验证包装，因此传空数组；
-             * "submit_return 必须带审批"由 WriteToolGuardTest 覆盖。
-             */
             new ToolCallback[0],
-            // 重试包装器使用与生产一致的默认配置；
-            // 包装不改变工具名，白名单断言不受影响。
+            new ShopAssistantQueryTool(null, null, null, null),
+            new ShopCartTool(null, null),
+            new ToolCallback[0],
             new ToolRetryWrapper(
                     true,
                     3,
@@ -70,8 +57,6 @@ class AgentToolWhitelistTest {
         Set<String> names = toolNames(provider.getTools(AgentType.CHAT));
 
         assertEquals(Set.of("web_search"), names);
-
-        // CHAT Agent 获取不到任何文件类高风险工具。
         assertFalse(names.contains("read_file"));
         assertFalse(names.contains("write_file"));
         assertFalse(names.contains("download_resource"));
@@ -86,9 +71,6 @@ class AgentToolWhitelistTest {
                 Set.of("web_search", "web_scrape", "terminate_task"),
                 names
         );
-
-        // MkManus 获取不到不需要的高风险工具：
-        // 文件读写、资源下载、PDF 生成都在 FILE 白名单内。
         assertFalse(names.contains("read_file"));
         assertFalse(names.contains("write_file"));
         assertFalse(names.contains("download_resource"));
@@ -103,8 +85,6 @@ class AgentToolWhitelistTest {
                 Set.of("read_file", "write_file", "download_resource", "generate_pdf"),
                 names
         );
-
-        // FILE 类型不包含联网类工具。
         assertFalse(names.contains("web_search"));
         assertFalse(names.contains("web_scrape"));
     }
@@ -117,8 +97,6 @@ class AgentToolWhitelistTest {
                 Set.of("web_search", "web_scrape", "terminate_task"),
                 names
         );
-
-        // 评测类型同样不能获得文件类高风险工具。
         assertFalse(names.contains("read_file"));
         assertFalse(names.contains("write_file"));
         assertFalse(names.contains("download_resource"));
@@ -126,40 +104,31 @@ class AgentToolWhitelistTest {
     }
 
     @Test
-    void musicUserHasReadOnlyCatalogAndPlaylistTools() {
-        Set<String> names = toolNames(provider.getTools(AgentType.MUSIC_USER));
-
-        assertEquals(
-                Set.of("search_songs", "get_song_detail",
-                        "get_user_playlists", "get_playlist_songs",
-                        "check_playback", "get_now_playing",
-                        "terminate_task"),
-                names
-        );
-
-        // 普通用户拿不到管理员统计，也拿不到任何写工具。
-        assertFalse(names.contains("get_play_stats"));
-        assertFalse(names.contains("get_top_songs"));
-        assertFalse(names.contains("create_playlist"));
-        assertFalse(names.contains("add_songs_to_playlist"));
+    @SuppressWarnings("deprecation")
+    void musicAgentsHaveNoRegisteredToolsAfterRetirement() {
+        assertThrows(IllegalArgumentException.class,
+                () -> provider.getTools(AgentType.MUSIC_USER));
+        assertThrows(IllegalArgumentException.class,
+                () -> provider.getTools(AgentType.MUSIC_ADMIN));
     }
 
     @Test
-    void musicAdminHasStatsButNoPlaylistTools() {
-        Set<String> names = toolNames(provider.getTools(AgentType.MUSIC_ADMIN));
+    void shopAssistantHasCatalogCartPreviewAndOrderReadToolsOnly() {
+        Set<String> names = toolNames(provider.getTools(AgentType.SHOP_ASSISTANT));
 
         assertEquals(
-                Set.of("search_songs", "get_song_detail",
-                        "get_play_stats", "get_top_songs",
+                Set.of("search_products", "compare_products",
+                        "preview_checkout", "get_my_recent_orders",
+                        "get_my_cart", "add_to_cart", "update_cart_item", "remove_cart_item",
                         "terminate_task"),
                 names
         );
 
-        // 管理员不得读取他人歌单。
-        assertFalse(names.contains("get_user_playlists"));
-        assertFalse(names.contains("get_playlist_songs"));
+        assertFalse(names.contains("submit_return"));
+        assertFalse(names.contains("search_songs"));
         assertFalse(names.contains("create_playlist"));
-        assertFalse(names.contains("add_songs_to_playlist"));
+        assertFalse(names.contains("read_file"));
+        assertFalse(names.contains("web_search"));
     }
 
     @Test
@@ -173,7 +142,9 @@ class AgentToolWhitelistTest {
                 names
         );
 
-        // 售后 Agent 拿不到音乐、文件、联网工具。
+        assertFalse(names.contains("search_products"));
+        assertFalse(names.contains("add_to_cart"));
+        assertFalse(names.contains("submit_checkout_order"));
         assertFalse(names.contains("search_songs"));
         assertFalse(names.contains("create_playlist"));
         assertFalse(names.contains("read_file"));

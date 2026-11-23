@@ -24,6 +24,11 @@ function returnOf(overrides: Partial<AfterSaleReturnVO> = {}): AfterSaleReturnVO
     progress: null,
     receipts: null,
     refund: null,
+    stage: {
+      code: 'WAITING_DECISION',
+      label: '待客服处理',
+      hint: '客服还没有给出结论；批准或驳回之后这里会显示下一步。',
+    },
     decision: null,
     events: null,
     ...overrides,

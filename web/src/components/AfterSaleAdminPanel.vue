@@ -109,6 +109,9 @@ function signed(value: number): string {
         <strong class="mono">{{ value.progress.receivedQty }}</strong> 件 · 还可收
         <strong class="mono">{{ value.progress.remainingQty }}</strong> 件
       </p>
+      <p v-if="value.progress.code === 'PARTIAL'" class="muted" style="margin-top: 6px; font-size: 12px;">
+        当前版本暂不支持提前结束部分收货并释放未收件额度（下一阶段支持）；请在剩余 {{ value.progress.remainingQty }} 件到齐后继续登记收货。
+      </p>
     </section>
 
     <section v-if="value.receipts && value.receipts.length" class="receipts" data-receipts>

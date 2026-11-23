@@ -64,13 +64,17 @@ class WriteToolGuardTest {
     /**
      * 允许写工具进入白名单的登记表（唯一合法来源）。
      *
-     * <p>当前只有售后：{@code submit_return} 必须对模型可见，
-     * 否则"预览 → 确认 → 建单"这条链路根本走不通。
-     * 音乐写工具**不在**这里——它们仍然对模型不可见。
+     * <p>当前仅允许电商业务已接入审批的写工具：
+     * <ul>
+     *   <li>{@code AFTER_SALES} → {@code submit_return}</li>
+     *   <li>{@code SHOP_ASSISTANT} → {@code submit_checkout_order}</li>
+     * </ul>
+     * 音乐写工具已彻底退场，不得出现在任何白名单或审批策略中。
      */
     private static final java.util.Map<AgentType, Set<String>> APPROVAL_WHITELISTED =
             java.util.Map.of(
-                    AgentType.AFTER_SALES, Set.of("submit_return")
+                    AgentType.AFTER_SALES, Set.of("submit_return"),
+                    AgentType.SHOP_ASSISTANT, Set.of("submit_checkout_order")
             );
 
     @Autowired
@@ -83,40 +87,33 @@ class WriteToolGuardTest {
     private ApprovalToolPolicy approvalToolPolicy;
 
     @Test
-    @DisplayName("扫描能发现写工具（防止扫描本身失效导致的假绿）")
+    @DisplayName("扫描能发现电商写工具且不再存在音乐写工具")
     void scanFindsWriteTools() {
         Set<String> writeTools = scanWriteToolNames();
 
         assertFalse(writeTools.isEmpty(), "扫描结果为空说明守卫失效");
-        assertTrue(writeTools.contains("create_playlist"), writeTools.toString());
-        assertTrue(writeTools.contains("add_songs_to_playlist"), writeTools.toString());
         assertTrue(writeTools.contains("submit_return"), writeTools.toString());
+        assertTrue(writeTools.contains("submit_checkout_order"), writeTools.toString());
+        assertFalse(writeTools.contains("create_playlist"), "音乐写工具应已移除");
+        assertFalse(writeTools.contains("add_songs_to_playlist"), "音乐写工具应已移除");
     }
 
-    /**
-     * 审批策略必须看见所有写工具。
-     *
-     * 与上面的反射扫描是**两条独立链路**：
-     * 反射扫描只证明"注解写对了"，策略扫描才决定运行时会不会暂停。
-     * 只断言其中一条，另一条坏了照样是失败放行（写工具会被当普通工具执行）。
-     *
-     * 断言用"包含"而不是"相等"：以后新增写工具不需要改这里，
-     * 但少了一个已知写工具必须立刻失败。
-     */
     @Test
-    @DisplayName("审批策略扫到了全部写工具（不能是空集合）")
+    @DisplayName("审批策略扫到了全部电商写工具（不能是空集合）")
     void approvalPolicySeesWriteTools() {
         assertTrue(approvalToolPolicy.isReady(), "容器刷新后必须已完成扫描");
 
         Set<String> approvalTools = approvalToolPolicy.requiredToolNames();
 
         assertFalse(approvalTools.isEmpty(), "审批工具集合为空说明策略扫描失效");
-        assertTrue(approvalTools.contains("create_playlist"),
-                "策略必须识别 create_playlist，实际：" + approvalTools);
-        assertTrue(approvalTools.contains("add_songs_to_playlist"),
-                "策略必须识别 add_songs_to_playlist，实际：" + approvalTools);
         assertTrue(approvalTools.contains("submit_return"),
                 "策略必须识别 submit_return，实际：" + approvalTools);
+        assertTrue(approvalTools.contains("submit_checkout_order"),
+                "策略必须识别 submit_checkout_order，实际：" + approvalTools);
+        assertFalse(approvalTools.contains("create_playlist"),
+                "音乐写工具不应再注册到审批策略：" + approvalTools);
+        assertFalse(approvalTools.contains("add_songs_to_playlist"),
+                "音乐写工具不应再注册到审批策略：" + approvalTools);
     }
 
     /**

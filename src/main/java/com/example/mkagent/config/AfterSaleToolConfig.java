@@ -1,7 +1,7 @@
 package com.example.mkagent.config;
 
-import com.example.mkagent.music.IdempotencyReplayService;
-import com.example.mkagent.music.IdempotentWriteExecutor;
+import com.example.mkagent.idempotency.IdempotencyReplayService;
+import com.example.mkagent.idempotency.IdempotentWriteExecutor;
 import com.example.mkagent.tools.AfterSaleWriteTool;
 import com.example.mkagent.tools.IdempotentToolCallback;
 import org.springframework.ai.support.ToolCallbacks;

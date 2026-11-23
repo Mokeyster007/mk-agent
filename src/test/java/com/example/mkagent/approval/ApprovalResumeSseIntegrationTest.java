@@ -2,9 +2,9 @@ package com.example.mkagent.approval;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import com.example.mkagent.agent.AgentTaskRegistry;
-import com.example.mkagent.music.MusicSeedInitializer;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
+import com.example.mkagent.shop.ShopSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -68,9 +68,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Timeout(120)
 class ApprovalResumeSseIntegrationTest {
 
-    private static final String USER = MusicSeedInitializer.USER_ALICE;
+    private static final String USER = ShopSeedInitializer.BUYER_SHOP_ONLY;
 
-    private static final String OTHER = MusicSeedInitializer.USER_BOB;
+    private static final String OTHER = ShopSeedInitializer.BUYER_TWO;
 
     @LocalServerPort
     private int port;
@@ -100,11 +100,11 @@ class ApprovalResumeSseIntegrationTest {
         scriptedChatModel.reset();
 
         Mockito.when(approvalToolPolicy.isEnabled()).thenReturn(true);
-        Mockito.when(approvalToolPolicy.requiresApproval("search_songs")).thenReturn(true);
+        Mockito.when(approvalToolPolicy.requiresApproval("search_products")).thenReturn(true);
         Mockito.when(approvalToolPolicy.anyRequiresApproval(Mockito.anyList()))
                 .thenReturn(true);
         Mockito.when(approvalToolPolicy.requiredToolNames())
-                .thenReturn(Set.of("search_songs"));
+                .thenReturn(Set.of("search_products"));
     }
 
     @org.junit.jupiter.api.AfterEach
@@ -306,8 +306,8 @@ class ApprovalResumeSseIntegrationTest {
      * 通过真实入口制造一次暂停，返回 runId。
      */
     private String pauseViaHttp() throws Exception {
-        String url = "http://localhost:" + port + "/api/ai/music/chat"
-                + "?message=" + URLEncoder.encode("帮我找几首和夜有关的歌",
+        String url = "http://localhost:" + port + "/api/ai/shop/chat"
+                + "?message=" + URLEncoder.encode("帮我找几款无线键盘",
                 StandardCharsets.UTF_8);
 
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
@@ -458,8 +458,8 @@ class ApprovalResumeSseIntegrationTest {
                                 "",
                                 Map.of(),
                                 List.of(new AssistantMessage.ToolCall(
-                                        "call-1", "function", "search_songs",
-                                        "{\"q\":\"夜\"}"))))),
+                                        "call-1", "function", "search_products",
+                                        "{\"keyword\":\"键盘\"}"))))),
                         ChatResponseMetadata.builder()
                                 .model("stub-model")
                                 .usage(new StubUsage(10, 5))

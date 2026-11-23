@@ -14,7 +14,7 @@
 import { requestJson } from './client'
 import { streamEvents } from './sse'
 import type { AgentEvent, ApprovalView } from './types'
-import { parseEvent } from './music'
+import { parseEvent } from './agentEvents'
 
 export function getApproval(approvalId: string, signal?: AbortSignal): Promise<ApprovalView> {
   return requestJson<ApprovalView>(`/api/ai/approvals/${encodeURIComponent(approvalId)}`, { signal })

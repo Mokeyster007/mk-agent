@@ -57,15 +57,15 @@ class ApprovalToolScanIntegrationTest {
     private ProxiedTool proxiedTool;
 
     @Test
-    @DisplayName("真实扫描能识别两个写工具的审批注解")
+    @DisplayName("真实扫描能识别电商写工具的审批注解")
     void realScanFindsWriteTools() {
         assertTrue(policy.isReady(), "容器刷新后必须已完成扫描");
 
         Set<String> approvalTools = policy.requiredToolNames();
-        assertTrue(approvalTools.contains("create_playlist"),
-                "create_playlist 必须被识别为需审批，实际：" + approvalTools);
-        assertTrue(approvalTools.contains("add_songs_to_playlist"),
-                "add_songs_to_playlist 必须被识别为需审批，实际：" + approvalTools);
+        assertTrue(approvalTools.contains("submit_return"),
+                "submit_return 必须被识别为需审批，实际：" + approvalTools);
+        assertTrue(approvalTools.contains("submit_checkout_order"),
+                "submit_checkout_order 必须被识别为需审批，实际：" + approvalTools);
 
         /*
          * 不只断言"非空"：空集合会让 contains 之外的检查全部假通过，
@@ -92,10 +92,10 @@ class ApprovalToolScanIntegrationTest {
     }
 
     @Test
-    @DisplayName("Agent 实际白名单里的工具全部可确定审批元数据")
-    void everyExposedMusicToolIsKnown() {
+    @DisplayName("Agent 实际白名单里的电商工具全部可确定审批元数据")
+    void everyExposedShopToolIsKnown() {
         for (AgentType type : new AgentType[]{
-                AgentType.MUSIC_USER, AgentType.MUSIC_ADMIN}) {
+                AgentType.SHOP_ASSISTANT, AgentType.AFTER_SALES}) {
 
             ToolCallback[] callbacks = agentToolProvider.getTools(type);
             Set<String> exposed = new LinkedHashSet<>();

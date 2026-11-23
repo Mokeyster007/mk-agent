@@ -2,9 +2,13 @@ package com.example.mkagent.shop.api;
 
 import com.example.mkagent.shop.ShopAccessGuard;
 import com.example.mkagent.shop.ShopRole;
+import com.example.mkagent.shop.cart.ShopCartItem;
+import com.example.mkagent.shop.cart.ShopCartService;
+import com.example.mkagent.shop.catalog.ShopCatalogService;
 import com.example.mkagent.shop.catalog.ShopProduct;
 import com.example.mkagent.shop.inventory.InventoryBalanceView;
 import com.example.mkagent.shop.inventory.InventoryMovement;
+import com.example.mkagent.shop.order.ShopCheckoutService;
 import com.example.mkagent.shop.order.ShopOrder;
 import com.example.mkagent.shop.order.ShopOrderDetail;
 import com.example.mkagent.shop.order.ShopOrderItem;
@@ -14,33 +18,16 @@ import com.example.mkagent.shop.order.ShopOrderSummary;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 
 /**
- * 商城接口的响应对象与映射。
- *
- * <p>为什么不直接把领域 record 返回给前端：
- * <ol>
- *   <li>领域对象的字段会随内部实现变（例如以后给订单加内部备注），
- *       直接暴露等于把内部结构变成对外契约；</li>
- *   <li>界面需要的派生信息（金额文案、能不能发货、状态中文）应该在服务端算一次，
- *       而不是让三个页面各写一份判断——三份判断迟早会不一致。</li>
- * </ol>
- *
- * <p>时间字段用 {@link LocalDateTime}：Jackson 会序列化成
- * {@code 2026-11-22T00:16:11}，与前端 {@code formatDateTime} 的既有约定一致。
+ * 商城接口的响应对象与映射（商品规格、比较、共享购物车、结算预览/确认、订单、库存）。
  */
 public final class ShopViews {
 
     private ShopViews() {
     }
 
-    /**
-     * 商品。
-     *
-     * @param purchasable 是否可下单：只由上架状态决定，**不看库存**。
-     *                    下单不预占库存，所以"暂时无货"仍可下单；
-     *                    库存是否够用由发货时判定，页面只提示风险。
-     */
     public record ProductVO(
             long id,
             String sku,
@@ -49,11 +36,94 @@ public final class ShopViews {
             long priceCents,
             String priceText,
             int available,
-            boolean purchasable
+            boolean purchasable,
+            String status,
+            String category,
+            String categoryLabel,
+            String connectivity,
+            String connectivityLabel,
+            boolean wireless,
+            Boolean macCompatible,
+            String macCompatibleLabel,
+            Boolean silentFeature,
+            String silentLabel,
+            String switchType,
+            String batteryInfo,
+            Integer weightGrams,
+            Map<String, String> specs
     ) {
     }
 
-    /** 订单明细（成交快照）。 */
+    public record CatalogSearchVO(
+            List<ProductVO> items,
+            Map<String, Object> appliedHardFilters,
+            List<String> softPreferences,
+            List<String> relaxSuggestions
+    ) {
+    }
+
+    public record ComparisonDimensionVO(String label, List<String> values) {
+    }
+
+    public record ComparisonVO(
+            List<ProductVO> products,
+            List<ComparisonDimensionVO> dimensions
+    ) {
+    }
+
+    public record CartItemVO(
+            long id,
+            long productId,
+            String sku,
+            String productName,
+            String subtitle,
+            long currentUnitPriceCents,
+            String currentUnitPriceText,
+            int quantity,
+            long lineCents,
+            String lineText,
+            int available,
+            boolean active,
+            boolean checkoutReady
+    ) {
+    }
+
+    public record CartVO(
+            List<CartItemVO> items,
+            int totalQuantity,
+            long totalCents,
+            String totalText,
+            String singleSkuNotice,
+            String stockNotice
+    ) {
+    }
+
+    public record CheckoutPreviewVO(
+            long productId,
+            String sku,
+            String productName,
+            String subtitle,
+            int quantity,
+            long unitPriceCents,
+            String unitPriceText,
+            long totalCents,
+            String totalText,
+            int available,
+            boolean active,
+            boolean eligible,
+            String code,
+            String message,
+            String stockNotice,
+            String singleSkuNotice
+    ) {
+    }
+
+    public record CheckoutConfirmVO(
+            boolean replayed,
+            OrderVO order
+    ) {
+    }
+
     public record OrderItemVO(
             long productId,
             String sku,
@@ -66,12 +136,6 @@ public final class ShopViews {
     ) {
     }
 
-    /**
-     * 库存流水。
-     *
-     * @param receiptId 退货入库对应的收货记录 id（出库为 {@code null}）
-     * @param typeLabel 业务类型中文（出库 / 退货入库），避免前端自己翻译
-     */
     public record MovementVO(
             long id,
             String sku,
@@ -86,13 +150,6 @@ public final class ShopViews {
     ) {
     }
 
-    /**
-     * 订单。
-     *
-     * @param canShip     当前是否允许发货（服务端状态机判定，前端不重复实现）
-     * @param canSign     当前是否允许签收
-     * @param movements   库存流水；列表接口为 null（未加载），详情接口为数组
-     */
     public record OrderVO(
             String orderNo,
             String status,
@@ -113,11 +170,9 @@ public final class ShopViews {
     ) {
     }
 
-    /** 发货 / 签收的结果。 */
     public record ActionResultVO(boolean applied, String message, OrderVO order) {
     }
 
-    /** 当前会话：身份、角色、能做什么。 */
     public record SessionVO(
             String userId,
             String role,
@@ -127,24 +182,15 @@ public final class ShopViews {
     ) {
     }
 
-    /** 库存余额行。 */
     public record BalanceVO(String sku, long productId, String productName, int available) {
     }
 
-    /** 后台库存核对视图。 */
     public record InventoryVO(List<BalanceVO> balances, List<MovementVO> movements) {
     }
 
-    /** 分页结果。 */
     public record PageVO<T>(List<T> items, int page, int size, long total) {
     }
 
-    /**
-     * 金额（分）→ {@code ¥299.00}。
-     *
-     * <p>用 {@link BigDecimal} 而不是 {@code cents / 100.0}：
-     * 后者会引入二进制浮点误差，299.00 可能显示成 298.99999999999994。
-     */
     public static String money(long cents) {
         return "¥" + BigDecimal.valueOf(cents, 2).toPlainString();
     }
@@ -158,7 +204,88 @@ public final class ShopViews {
                 product.priceCents(),
                 money(product.priceCents()),
                 product.available(),
-                product.purchasable());
+                product.purchasable(),
+                product.status(),
+                product.category(),
+                product.categoryLabel(),
+                product.connectivity(),
+                product.connectivityLabel(),
+                product.isWireless(),
+                product.macCompatible(),
+                product.macCompatibleLabel(),
+                product.silentFeature(),
+                product.silentLabel(),
+                product.switchTypeLabel(),
+                product.batteryLabel(),
+                product.weightGrams(),
+                product.verifiableSpecs());
+    }
+
+    public static CatalogSearchVO catalogSearch(ShopCatalogService.SearchResult result) {
+        return new CatalogSearchVO(
+                result.items().stream().map(ShopViews::product).toList(),
+                result.appliedHardFilters(),
+                result.softPreferences(),
+                result.relaxSuggestions());
+    }
+
+    public static ComparisonVO comparison(ShopCatalogService.ComparisonResult result) {
+        return new ComparisonVO(
+                result.products().stream().map(ShopViews::product).toList(),
+                result.dimensions().stream()
+                        .map(d -> new ComparisonDimensionVO(d.label(), d.values()))
+                        .toList());
+    }
+
+    public static CartItemVO cartItem(ShopCartItem item) {
+        return new CartItemVO(
+                item.id(),
+                item.productId(),
+                item.sku(),
+                item.productName(),
+                item.subtitle(),
+                item.currentUnitPriceCents(),
+                money(item.currentUnitPriceCents()),
+                item.quantity(),
+                item.lineCents(),
+                money(item.lineCents()),
+                item.available(),
+                item.active(),
+                item.checkoutReady());
+    }
+
+    public static CartVO cart(ShopCartService.CartSummary summary) {
+        return new CartVO(
+                summary.items().stream().map(ShopViews::cartItem).toList(),
+                summary.totalQuantity(),
+                summary.totalCents(),
+                money(summary.totalCents()),
+                "当前订单模型支持单 SKU 结算：请从购物车选择一款商品进入结算预览与确认。",
+                "加购不等于下单，也不锁定库存；实际库存扣减发生在后台发货时。");
+    }
+
+    public static CheckoutPreviewVO checkoutPreview(ShopCheckoutService.CheckoutPreview preview) {
+        return new CheckoutPreviewVO(
+                preview.productId(),
+                preview.sku(),
+                preview.productName(),
+                preview.subtitle(),
+                preview.quantity(),
+                preview.unitPriceCents(),
+                money(preview.unitPriceCents()),
+                preview.totalCents(),
+                money(preview.totalCents()),
+                preview.available(),
+                preview.active(),
+                preview.eligible(),
+                preview.code(),
+                preview.message(),
+                preview.stockNotice(),
+                preview.singleSkuNotice());
+    }
+
+    public static CheckoutConfirmVO checkoutConfirm(ShopCheckoutService.CheckoutConfirmResult result) {
+        return new CheckoutConfirmVO(result.replayed(), detail(result.order()));
     }
 
     public static OrderItemVO item(ShopOrderItem item) {
@@ -187,7 +314,6 @@ public final class ShopViews {
                 movement.createdAt());
     }
 
-    /** 流水类型中文。未知类型原样返回：不认识的类型应当看得见，而不是被藏起来。 */
     public static String movementLabel(String type) {
         return switch (type == null ? "" : type) {
             case InventoryMovement.TYPE_OUTBOUND_SHIPMENT -> "发货出库";
@@ -196,13 +322,6 @@ public final class ShopViews {
         };
     }
 
-    /**
-     * 订单摘要（列表用，不含流水）。
-     *
-     * <p>{@code movements} 显式给 null 而不是空数组：
-     * 空数组的意思是"这个订单没有任何流水"，而列表接口根本没查，
-     * 两者混同会让页面显示"未出库"——那是一个错误的事实。
-     */
     public static OrderVO summary(ShopOrderSummary summary) {
         return order(summary.order(), summary.item(), null);
     }

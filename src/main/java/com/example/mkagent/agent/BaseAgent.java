@@ -801,7 +801,7 @@ public abstract class BaseAgent {
      * 这里在"许可已释放、注册表已注销"之后释放，
      * 保证批准请求看到的永远是一个已经收尾干净的暂停态。
      */
-    private void releaseHandoffLock(AgentRunContext ctx) {
+    protected void releaseHandoffLock(AgentRunContext ctx) {
         if (handoffLocks == null || !ctx.isHandoffLockHeld()) {
             return;
         }
@@ -1017,7 +1017,7 @@ public abstract class BaseAgent {
         return getAgentType();
     }
 
-    private void recordRunStart(AgentRunContext ctx, String userPrompt) {
+    protected void recordRunStart(AgentRunContext ctx, String userPrompt) {
         if (runRecorder != null) {
             runRecorder.recordStart(ctx, userPrompt);
         }

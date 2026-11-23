@@ -9,7 +9,7 @@
  * SSE 断流、超时、页面刷新之后，都以这里的 state 为准。
  */
 import { requestJson } from './client'
-import type { AgentRunVO, MusicEntry, PageResult } from './types'
+import type { AgentRunVO, PageResult } from './types'
 
 export function getRun(runId: string, signal?: AbortSignal): Promise<AgentRunVO> {
   return requestJson<AgentRunVO>(`/api/ai/runs/${encodeURIComponent(runId)}`, { signal })
@@ -18,7 +18,7 @@ export function getRun(runId: string, signal?: AbortSignal): Promise<AgentRunVO>
 export interface PageRunsOptions {
   pageNum?: number
   pageSize?: number
-  agentType?: MusicEntry | string
+  agentType?: string
   state?: string
   signal?: AbortSignal
 }

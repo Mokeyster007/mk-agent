@@ -21,12 +21,27 @@ import type {
 } from '@/api/types'
 import { ApiError } from '@/api/errors'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
-import { runAfterSaleChat } from '@/api/aftersale'
+import {
+  prepareAfterSaleApproval,
+  runAfterSaleChat,
+  type AfterSaleCandidateOrder,
+  type AfterSaleChatBusinessStatus,
+  type AfterSaleReturnDraft,
+  type AfterSaleStructuredStatus,
+} from '@/api/aftersale'
 import { parseApprovalPayload } from '@/api/approvalPayload'
 import { describeAfterSaleError } from '@/stores/aftersale'
 import type { Transport } from '@/utils/status'
 
-/** 单轮对话。一轮 = 一个 run = 最多一张确认卡 + 一条回答。 */
+export const AFTERSALE_STATUS_LABELS: Record<AfterSaleChatBusinessStatus, string> = {
+  NEEDS_INFO: '信息待补',
+  READY_FOR_CONFIRMATION: '已准备、待确认',
+  NOT_SUBMITTED: '尚未提交',
+  SUBMIT_FAILED: '提交失败',
+  SUBMITTED: '提交成功',
+}
+
+/** 单轮对话。一轮 = 一个 run = 最多一张确认卡 + 真实业务状态 + 一条回答。 */
 export interface AfterSaleTurn {
   id: string
   prompt: string
@@ -40,6 +55,15 @@ export interface AfterSaleTurn {
   approvalPayload: ApprovalRequiredPayload | null
   approval: ApprovalView | null
   deciding: boolean
+  /** 真实业务状态（区别于 Agent run SUCCEEDED） */
+  businessStatus: AfterSaleChatBusinessStatus | null
+  businessMessage: string | null
+  /** 只有业务写工具返回真实退货单号时才有值 */
+  returnNo: string | null
+  /** 预览通过但尚未确认/提交时的结构化草稿，可用于一键发起确认卡或回填表单 */
+  draft: AfterSaleReturnDraft | null
+  /** 独立聊天中多笔可退订单的候选项，供买家明确点选 */
+  candidates: AfterSaleCandidateOrder[]
   createdAt: number
 }
 
@@ -50,18 +74,8 @@ let turnSeq = 0
 export interface AfterSaleChatDeps {
   chat: typeof runAfterSaleChat
   conversation: () => Promise<{ conversationId: string }>
-  /**
-   * 会话详情（刷新后恢复用）。
-   *
-   * 不传就只是"不能恢复"——对话本身照常可用，不会假装恢复成功。
-   */
   conversationDetail?: (conversationId: string) => Promise<ConversationDetailVO>
-  /**
-   * conversationId 的持久化位置。
-   *
-   * 由页面按**身份**给出不同的 key（例如 `mkagent.aftersaleConversation.<userId>`）：
-   * 同一个浏览器换人之后不能续上上一个人的会话。
-   */
+  prepareApproval?: typeof prepareAfterSaleApproval
   storageKey?: () => string | null
   approval: typeof getApproval
   decide: typeof decideApproval
@@ -74,6 +88,8 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
   const turns = ref<AfterSaleTurn[]>([])
   const submitting = ref(false)
   const conversationId = ref<string | null>(readStoredId())
+  /** 当前页面绑定的订单号（从订单详情进入或点击签收订单卡时设置） */
+  const activeOrderNo = ref<string | null>(null)
   /** 会话建不出来（身份/后端不可用）：退化单轮，并在界面上说清楚 */
   const conversationUnavailable = ref(false)
   /** 正在从服务端恢复上次的会话（刷新后） */
@@ -139,6 +155,11 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
       approvalPayload: null,
       approval: null,
       deciding: false,
+      businessStatus: null,
+      businessMessage: null,
+      returnNo: null,
+      draft: null,
+      candidates: [],
       createdAt: Date.now(),
     })
   }
@@ -187,12 +208,46 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
         break
       case 'approval_required':
         turn.approvalPayload = parseApprovalPayload(event.message)
+        if (turn.approvalPayload) {
+          turn.businessStatus = 'READY_FOR_CONFIRMATION'
+          turn.businessMessage = '已准备好退货确认卡，确认前不会建单、不会占用可退额度。'
+        }
+        break
+      case 'structured_data':
+        applyStructuredData(turn, event.message)
         break
       case 'cancelled':
         turn.error = '服务端取消了这一轮执行。'
         break
       default:
         break
+    }
+  }
+
+  function applyStructuredData(turn: AfterSaleTurn, raw: string): void {
+    if (!raw) return
+    try {
+      const parsed = JSON.parse(raw) as Partial<AfterSaleStructuredStatus>
+      if (!parsed || parsed.kind !== 'aftersale_status') {
+        return
+      }
+      if (parsed.status) {
+        turn.businessStatus = parsed.status
+      }
+      if (typeof parsed.message === 'string') {
+        turn.businessMessage = parsed.message
+      }
+      if (typeof parsed.returnNo === 'string' && parsed.returnNo) {
+        turn.returnNo = parsed.returnNo
+      }
+      if (parsed.draft && typeof parsed.draft === 'object') {
+        turn.draft = parsed.draft
+      }
+      if (Array.isArray(parsed.candidates)) {
+        turn.candidates = parsed.candidates
+      }
+    } catch {
+      // 非结构化载荷忽略
     }
   }
 
@@ -372,6 +427,7 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
       await deps.chat({
         message: text,
         conversationId: id,
+        orderNo: activeOrderNo.value,
         signal: local.signal,
         onEvent: (event) => {
           if (turn.transport === 'submitting') {
@@ -383,11 +439,18 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
       turn.transport = 'closed'
       if (turn.approvalPayload) {
         await syncApproval(turn)
+      } else if (!turn.businessStatus && !turn.error && !turn.returnNo) {
+        // 没有产出确认卡且没有真实退货单号：绝不把 Agent run SUCCEEDED 当作业务提交成功
+        turn.businessStatus = 'NOT_SUBMITTED'
+        turn.businessMessage = '本次对话尚未生成确认卡，也没有创建退货申请。'
       }
     } catch (error) {
       const apiError = error instanceof ApiError ? error : null
       turn.transport = apiError?.kind === 'aborted' ? 'aborted' : 'closed'
       turn.error = describeAfterSaleError(error)
+      if (!turn.businessStatus) {
+        turn.businessStatus = 'SUBMIT_FAILED'
+      }
     } finally {
       submitting.value = false
       if (controller === local) {
@@ -396,6 +459,68 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
     }
 
     return true
+  }
+
+  /**
+   * 显式可执行的“准备退货确认卡”路径：不依赖模型是否恰好再选 submit_return，
+   * 直接经后端校验资格后创建真实 PENDING 确认卡（确认前零建单、零占额）。
+   */
+  async function prepareApprovalCard(draft: AfterSaleReturnDraft): Promise<boolean> {
+    if (!deps.prepareApproval || submitting.value || busy.value) {
+      return false
+    }
+    submitting.value = true
+    panelError.value = null
+    const turn = newTurn(`准备退货确认卡：订单 ${draft.orderNo} × ${draft.quantity} 件（${draft.reason}）`)
+    turn.draft = draft
+    turns.value = [...turns.value, turn]
+    turn.transport = 'submitting'
+
+    try {
+      const convId = await ensureConversation()
+      const res = await deps.prepareApproval({
+        orderNo: draft.orderNo,
+        quantity: draft.quantity,
+        reason: draft.reason,
+        conversationId: convId,
+      })
+      turn.runId = res.runId
+      const approvalView = await deps.approval(res.approvalId)
+      turn.approval = approvalView
+      turn.approvalPayload = res.payload ?? payloadFromApproval(approvalView) ?? {
+        approvalId: res.approvalId,
+        expiresAt: approvalView.expiresAt ?? '',
+        summary: {
+          tool: 'submit_return',
+          toolLabel: '提交退货申请',
+          playlistName: null,
+          songCount: null,
+          songs: [],
+          roundToolCount: 1,
+          text: approvalView.summaryText ?? '',
+          details: [
+            { label: '订单号', value: draft.orderNo },
+            { label: '退货数量', value: `${draft.quantity} 件` },
+            { label: '退货原因', value: draft.reason },
+          ],
+        },
+      }
+      turn.businessStatus = 'READY_FOR_CONFIRMATION'
+      turn.businessMessage = '已准备好退货确认卡，请核对后点击「批准并执行」；确认前不会创建退货单。'
+      turn.transport = 'closed'
+      return true
+    } catch (error) {
+      turn.transport = 'closed'
+      turn.businessStatus = 'SUBMIT_FAILED'
+      turn.error = describeAfterSaleError(error)
+      return false
+    } finally {
+      submitting.value = false
+    }
+  }
+
+  function setActiveOrder(orderNo: string | null): void {
+    activeOrderNo.value = orderNo && orderNo.trim() ? orderNo.trim() : null
   }
 
   /**
@@ -426,7 +551,14 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
       })
       turn.transport = 'closed'
       await syncApproval(turn)
-      if (approve) {
+      if (!approve) {
+        turn.businessStatus = 'NOT_SUBMITTED'
+        turn.businessMessage = '你已拒绝本次确认，未创建退货申请，也未占用可退额度。'
+      } else {
+        if (!turn.returnNo && turn.businessStatus !== 'SUBMIT_FAILED') {
+          // 批准完成但若无真实 returnNo（例如校验失败），绝不假装提交成功
+          turn.businessStatus = turn.error ? 'SUBMIT_FAILED' : 'NOT_SUBMITTED'
+        }
         await deps.onExecuted?.()
       }
     } catch (error) {
@@ -516,9 +648,12 @@ export function createAfterSaleChatStore(deps: AfterSaleChatDeps) {
     restoring,
     busy,
     conversationId,
+    activeOrderNo,
     conversationUnavailable,
     panelError,
     submit,
+    prepareApprovalCard,
+    setActiveOrder,
     decide,
     resume,
     refreshApproval,

@@ -206,6 +206,35 @@ class AfterSaleRefundIntegrationTest {
     }
 
     @Test
+    @DisplayName("累计实收超过批准数量（数据不一致）：拒绝退款（409 REFUND_RECEIPT_QUANTITY_MISMATCH），零写入")
+    void overReceivedRejected() {
+        String returnNo = approvedReturn(2);
+        assertEquals(201, receive(returnNo, 2, 2, 0, "rc-b3-over").status());
+
+        /*
+         * 正常路径写不出"收 3 件、批准 2 件"：收货写入在锁内校验"累计 + 本批 ≤ 批准数量"。
+         * 这里直接插一条收货记录，模拟"数据被绕过业务路径改过"——
+         * 此时按实收金额退款会多退钱，必须拒绝而不是猜一个金额。
+         */
+        jdbc.update("""
+                INSERT INTO shop_aftersale_receipt
+                    (receipt_no, return_id, order_item_id, received_qty, qualified_qty, damaged_qty,
+                     note, request_key, request_hash, operator_id)
+                SELECT 'RC-B3-OVER-0001', r.id, r.order_item_id, 1, 1, 0,
+                       NULL, 'rc-b3-over-injected', 'injected', 'music-admin-1'
+                FROM shop_aftersale_return r WHERE r.return_no = ?
+                """, returnNo);
+        assertEquals(3, ShopTestFixture.receivedQtyOf(jdbc, returnNo), "注入后累计实收 3 件");
+
+        ShopApiClient.Reply reply = refund(returnNo);
+
+        assertEquals(409, reply.status(), reply.raw());
+        assertEquals("REFUND_RECEIPT_QUANTITY_MISMATCH", reply.text("code"));
+        assertEquals(0, ShopTestFixture.refundCount(jdbc, returnNo),
+                "数据不一致时不得产生退款记录（既不按 3 件退，也不按 2 件猜）");
+    }
+
+    @Test
     @DisplayName("普通买家不能退款（403 NOT_ADMIN），且不留记录")
     void buyerCannotRefund() {
         String returnNo = approvedReturn(2);

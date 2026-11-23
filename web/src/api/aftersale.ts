@@ -14,7 +14,7 @@
  */
 import { requestJson } from './client'
 import { streamEvents } from './sse'
-import { parseEvent } from './music'
+import { parseEvent } from './agentEvents'
 import type { AgentEvent, ConversationDetailVO, ConversationVO } from './types'
 
 /** 额度三个数：已购 / 已占用 / 剩余。A1 里只有"已提交"的申请占额度。 */
@@ -123,7 +123,30 @@ export interface AfterSaleRefundVO {
   label: string
 }
 
-/** 退货申请。列表接口 `events` / `receipts` 为 null（未加载），详情接口才有值。 */
+/**
+ * 处理阶段（C1）：买家"看懂到哪一步"的唯一口径。
+ *
+ * 它是**派生值**（status + 收货进度 + 退款记录算出来），不是新的业务状态，
+ * 所以不要拿它做写操作的开关——那要看 `status` 与 `progress.code`。
+ *
+ * code 取值：
+ * - `WAITING_DECISION` 待客服处理
+ * - `REJECTED` 已驳回（终止：不会再收货，也不会有退款）
+ * - `WAITING_RECEIPT` 待收货
+ * - `PARTIAL_RECEIPT` 部分收货
+ * - `RECEIVED_NOT_REFUNDED` 已全部收货，尚未登记模拟退款
+ * - `REFUNDED` 已登记模拟退款
+ */
+export interface AfterSaleStageVO {
+  code: string
+  label: string
+  /** 只描述"接下来等什么"，不预测时间、不承诺到账 */
+  hint: string
+}
+
+/**
+ * 退货申请。列表接口 `events` / `receipts` 为 null（未加载），详情接口才有值。
+ */
 export interface AfterSaleReturnVO {
   returnNo: string
   orderNo: string
@@ -142,6 +165,8 @@ export interface AfterSaleReturnVO {
   refundText: string
   reason: string
   createdAt: string | null
+  /** 处理到哪一步（服务端派生，页面与售后 Agent 共用同一套措辞） */
+  stage: AfterSaleStageVO
   progress: AfterSaleProgressVO | null
   receipts: AfterSaleReceiptVO[] | null
   /** 已生成的模拟退款；没退过是 null */
@@ -361,21 +386,83 @@ export function refundAdminReturn(
   )
 }
 
+export type AfterSaleChatBusinessStatus =
+  | 'NEEDS_INFO'
+  | 'READY_FOR_CONFIRMATION'
+  | 'NOT_SUBMITTED'
+  | 'SUBMIT_FAILED'
+  | 'SUBMITTED'
+
+export interface AfterSaleReturnDraft {
+  orderNo: string
+  productName: string
+  sku?: string
+  quantity: number
+  reason: string
+  refundText?: string
+  refundCents?: number
+}
+
+export interface AfterSaleCandidateOrder {
+  orderNo: string
+  productName: string
+  sku: string
+  remainingQty: number
+  returnable: boolean
+}
+
+export interface AfterSaleStructuredStatus {
+  kind: 'aftersale_status'
+  status: AfterSaleChatBusinessStatus
+  statusLabel: string
+  message?: string | null
+  returnNo?: string | null
+  approvalId?: string | null
+  draft?: AfterSaleReturnDraft | null
+  candidates?: AfterSaleCandidateOrder[] | null
+}
+
 export interface AfterSaleChatOptions {
   message: string
   /** 同一会话的续聊；不传则本轮没有上下文（追问会失忆） */
   conversationId?: string | null
+  /** 从订单详情或签收订单卡带入的明确订单上下文 */
+  orderNo?: string | null
   signal: AbortSignal
   onEvent: (event: AgentEvent) => void
+}
+
+export interface PrepareAfterSaleApprovalInput {
+  orderNo: string
+  quantity: number
+  reason: string
+  conversationId?: string | null
+}
+
+export interface PrepareAfterSaleApprovalResponse {
+  runId: string
+  approvalId: string
+  payload?: import('./types').ApprovalRequiredPayload
+}
+
+export function prepareAfterSaleApproval(
+  input: PrepareAfterSaleApprovalInput,
+  signal?: AbortSignal,
+): Promise<PrepareAfterSaleApprovalResponse> {
+  return requestJson<PrepareAfterSaleApprovalResponse>(
+    '/api/shop/aftersale/conversations/prepare-approval',
+    {
+      method: 'POST',
+      body: input,
+      signal,
+    },
+  )
 }
 
 /**
  * 售后会话接口。
  *
- * **不要用 `/api/ai/conversations`**：那个入口的守卫要求 `music_user`，
- * 合法的商城买家可能没有开通音乐服务，用它会 403 → 建不出会话 → 追问退化成单轮。
- * 这里是售后自己的入口：守卫是买家身份，会话领域钉死为 AFTER_SALES，
- * 与音乐会话互不可见（拿错领域的 id 一律 404）。
+ * 守卫是买家身份，会话领域钉死为 AFTER_SALES。
  */
 export function createAfterSaleConversation(
   signal?: AbortSignal,
@@ -409,11 +496,19 @@ export function listAfterSaleConversations(signal?: AbortSignal): Promise<Conver
  * 身份不足（401/403）在 Agent 启动之前就判定，因此失败时拿到的是普通 JSON 错误体。
  */
 export async function runAfterSaleChat(options: AfterSaleChatOptions): Promise<void> {
-  const { message, conversationId, signal, onEvent } = options
+  const { message, conversationId, orderNo, signal, onEvent } = options
 
   await streamEvents(
     '/api/ai/aftersale/chat',
-    { method: 'GET', query: { message, conversationId: conversationId ?? undefined }, signal },
+    {
+      method: 'GET',
+      query: {
+        message,
+        conversationId: conversationId ?? undefined,
+        orderNo: orderNo ?? undefined,
+      },
+      signal,
+    },
     (frame) => {
       const event = parseEvent(frame.data)
       if (event) {

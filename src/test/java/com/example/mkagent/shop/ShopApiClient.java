@@ -42,6 +42,10 @@ final class ShopApiClient {
         return send("POST", path, userId, body);
     }
 
+    Reply patch(String path, String userId, Object body) {
+        return send("PATCH", path, userId, body);
+    }
+
     Reply delete(String path, String userId) {
         return send("DELETE", path, userId, null);
     }

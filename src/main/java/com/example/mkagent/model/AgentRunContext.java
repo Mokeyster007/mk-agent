@@ -314,6 +314,32 @@ public class AgentRunContext {
     private boolean handoffLockHeld;
 
     /**
+     * 本次运行的内存扩展属性（不落库，用于 Agent 子类记录真实工具结果驱动的业务状态，
+     * 例如最近一次合格预览、真实返回的退货单号/订单号等）。
+     */
+    private final java.util.Map<String, Object> attributes = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public void setAttribute(String key, Object value) {
+        if (key == null) {
+            return;
+        }
+        if (value == null) {
+            attributes.remove(key);
+        } else {
+            attributes.put(key, value);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> T getAttribute(String key, Class<T> type) {
+        Object value = attributes.get(key);
+        if (value == null || !type.isInstance(value)) {
+            return null;
+        }
+        return (T) value;
+    }
+
+    /**
      * 本次恢复所依据的检查点（批次 2）。
      *
      * 只存在于内存：暂停轮执行完就没用了，不参与任何序列化。

@@ -97,7 +97,7 @@ class ShopStartsWithoutModelCredentialTest {
     void shopWorksWithoutAnyCredential() {
         ShopApiClient.Reply products = api.get("/shop/products", BUYER);
         assertEquals(200, products.status(), products.raw());
-        assertEquals(3, products.body().size());
+        assertEquals(ShopSeedInitializer.SEED_PRODUCT_COUNT, products.body().size());
 
         ShopApiClient.Reply placed = api.post("/shop/orders", BUYER,
                 Map.of("productId", ShopSeedInitializer.PRODUCT_KEYBOARD, "quantity", 2));

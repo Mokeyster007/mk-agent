@@ -1,15 +1,14 @@
 package com.example.mkagent.approval;
 
 import com.example.mkagent.agent.AgentTaskRegistry;
-import com.example.mkagent.agent.MusicAgent;
-import com.example.mkagent.config.AgentToolProvider;
+import com.example.mkagent.agent.ShopAssistantAgent;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
-import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
+import com.example.mkagent.shop.ShopSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
-import com.example.mkagent.tools.PlaylistWriteTool;
+import com.example.mkagent.tools.ShopCheckoutWriteTool;
 import com.example.mkagent.tools.ToolEventMessageProvider;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -42,24 +41,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 真实扫描链路 → 真实写工具 → 暂停（批次 1 补充）。
- *
- * 与 SSE 测试的分工：
- * - SSE 测试用 {@link ApprovalToolPolicy} 替身，证明"暂停时流怎么收尾"；
- * - 这里用**真实** {@link ApprovalToolPolicy}（容器扫描）与**真实**
- *   {@link PlaylistWriteTool}（真实注解），证明"注解能被识别、写工具会被拦住"。
- *
- * 写工具仍然**不进入**生产白名单：本测试自己装配一个只含写工具的 Agent，
- * 不改 {@link AgentToolProvider} 的任何配置。
+ * 真实扫描链路 → 真实写工具（submit_checkout_order）→ 暂停且业务表零写入。
  */
 @HermeticSpringBootTest
 @Timeout(60)
 class ApprovalWriteToolPauseIntegrationTest {
 
-    private static final String USER = "u-pause-it";
-
     @Autowired
-    private PlaylistWriteTool playlistWriteTool;
+    private ShopCheckoutWriteTool checkoutWriteTool;
 
     @Autowired
     private ApprovalToolPolicy approvalToolPolicy;
@@ -95,61 +84,58 @@ class ApprovalWriteToolPauseIntegrationTest {
     }
 
     @Test
-    @DisplayName("真实写工具命中审批注解：暂停且业务表相对快照无变更")
+    @DisplayName("真实写工具命中审批注解：暂停且订单表相对快照无变更")
     void realWriteToolPausesWithoutBusinessChange() {
-        long playlistsBefore = count("music_playlist");
-        long playlistSongsBefore = count("music_playlist_song");
+        long ordersBefore = count("shop_order");
+        long orderItemsBefore = count("shop_order_item");
 
         ScriptedModel model = new ScriptedModel(
-                "call-w1", "create_playlist",
-                "{\"name\":\"夜曲\",\"songIds\":[1,2]}");
+                "call-w1", "submit_checkout_order",
+                "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}");
 
-        MusicAgent agent = newAgent(model);
+        ShopAssistantAgent agent = newAgent(model);
         AgentRunContext ctx = new AgentRunContext();
+        ctx.setUserId(ShopSeedInitializer.BUYER_SHOP_ONLY);
         String runId = ctx.getRunId().toString();
 
-        String answer = agent.run("帮我建一个叫夜曲的歌单，放前两首歌", ctx);
+        String answer = agent.run("请帮我按最新报价下单无线轻音机械键盘 Air75 一把", ctx);
 
         assertEquals("任务已暂停，等待人工确认。", answer);
 
-        // 1. 状态：暂停不是终态
         assertEquals(AgentState.WAITING_APPROVAL, ctx.getState());
         assertEquals(0, ctx.getToolCallCount(), "暂停轮不得执行任何工具");
         assertEquals(1, ctx.getCurrentStep(), "暂停发生在第 1 步");
         assertEquals(1, model.calls.get(), "暂停后不得再调用模型");
 
-        // 2. 业务数据：相对快照零变更
-        assertEquals(playlistsBefore, count("music_playlist"), "不得创建歌单");
-        assertEquals(playlistSongsBefore, count("music_playlist_song"), "不得写入歌单歌曲");
+        assertEquals(ordersBefore, count("shop_order"), "确认前不得创建订单");
+        assertEquals(orderItemsBefore, count("shop_order_item"), "确认前不得写订单明细");
 
-        // 3. 落库：WAITING_APPROVAL、finished_at 为空、审批计数 1
         Map<String, Object> run = jdbcTemplate.queryForMap(
                 "SELECT state, current_step, tool_call_count, approval_count, "
                         + "finished_at, config_version, active_elapsed_millis "
                         + "FROM agent_run WHERE run_id = ?", runId);
 
         assertEquals("WAITING_APPROVAL", run.get("state"));
-        assertNull(run.get("finished_at"), "暂停不是终态，finished_at 必须为空");
+        assertNull(run.get("finished_at"));
         assertEquals(0, ((Number) run.get("tool_call_count")).intValue());
         assertEquals(1, ((Number) run.get("approval_count")).intValue());
-        assertNotNull(run.get("config_version"), "必须记录配置指纹");
+        assertNotNull(run.get("config_version"));
 
-        // 4. 审批记录与检查点
         Map<String, Object> approval = jdbcTemplate.queryForMap(
                 "SELECT approval_id, primary_tool, tool_count, status, resume_state, "
                         + "summary_text, args_hash FROM agent_approval WHERE run_id = ?",
                 runId);
 
-        assertEquals("create_playlist", approval.get("primary_tool"));
+        assertEquals("submit_checkout_order", approval.get("primary_tool"));
         assertEquals(1, ((Number) approval.get("tool_count")).intValue());
         assertEquals("PENDING", approval.get("status"));
         assertEquals("PENDING_RESUME", approval.get("resume_state"));
         assertFalse(approval.get("args_hash").toString().isBlank());
 
         String summary = approval.get("summary_text").toString();
-        assertTrue(summary.contains("夜曲"), "摘要应包含歌单名，实际：" + summary);
-        assertTrue(summary.contains("2"), "摘要应包含歌曲数量，实际：" + summary);
-        assertFalse(summary.contains("songIds"),
+        assertTrue(summary.contains("Air75"), "摘要应包含商品名，实际：" + summary);
+        assertTrue(summary.contains("369"), "摘要应包含价格，实际：" + summary);
+        assertFalse(summary.contains("expectedUnitPriceCents"),
                 "摘要不得包含参数原文，实际：" + summary);
 
         String payload = jdbcTemplate.queryForObject(
@@ -158,20 +144,15 @@ class ApprovalWriteToolPauseIntegrationTest {
         ApprovalCheckpoint checkpoint = CheckpointCodec.decode(payload);
 
         assertEquals(1, checkpoint.pendingToolCalls().size());
-        assertEquals("create_playlist", checkpoint.pendingToolCalls().get(0).name());
-        assertEquals("call-w1", checkpoint.pendingToolCalls().get(0).id(),
-                "toolCallId 必须与模型返回一致");
-        assertEquals(2, checkpoint.messages().size(), "history 只含 system + user");
+        assertEquals("submit_checkout_order", checkpoint.pendingToolCalls().get(0).name());
+        assertEquals("call-w1", checkpoint.pendingToolCalls().get(0).id());
+        assertEquals(2, checkpoint.messages().size());
         assertNotNull(checkpoint.pendingAssistant());
 
-        // 5. 资源：注册表清空、许可归还
-        assertEquals(0, taskRegistry.size(), "暂停后注册表应清空");
-        assertEquals(concurrencyGuard.getMaxConcurrency(),
-                concurrencyGuard.availablePermits());
-        assertFalse(runHandoffLocks.exists(runId), "交接锁必须释放");
+        assertEquals(0, taskRegistry.size());
+        assertEquals(concurrencyGuard.getMaxConcurrency(), concurrencyGuard.availablePermits());
+        assertFalse(runHandoffLocks.exists(runId));
     }
-
-    // ==================== 辅助 ====================
 
     private long count(String table) {
         Long value = jdbcTemplate.queryForObject(
@@ -179,29 +160,23 @@ class ApprovalWriteToolPauseIntegrationTest {
         return value == null ? 0L : value;
     }
 
-    private MusicAgent newAgent(ChatModel model) {
-        ToolCallback[] callbacks = ToolCallbacks.from(playlistWriteTool);
+    private ShopAssistantAgent newAgent(ChatModel model) {
+        ToolCallback[] callbacks = ToolCallbacks.from(checkoutWriteTool);
 
-        MusicAgent agent = new MusicAgent(
+        ShopAssistantAgent agent = new ShopAssistantAgent(
                 model,
                 callbacks,
                 Runnable::run,
-                toolEventMessageProvider,
-                AgentType.MUSIC_USER,
-                "approval-write-tool-test",
-                MusicAgent.USER_SYSTEM_PROMPT
+                toolEventMessageProvider
         );
 
         agent.setTaskRegistry(taskRegistry);
         agent.setRunRecorder(runRecorder);
         agent.setConcurrencyGuard(concurrencyGuard);
-
-        // 真实策略：名单来自容器扫描，不是手工喂进去的
         agent.setApprovalToolPolicy(approvalToolPolicy);
         agent.setApprovalPauseGateway(approvalPauseGateway);
         agent.setApprovalSummaryBuilder(approvalSummaryBuilder);
         agent.setHandoffLocks(runHandoffLocks);
-
         agent.setMaxSteps(4);
         agent.setMaxToolCalls(10);
         agent.setTimeout(Duration.ofSeconds(30));
@@ -209,17 +184,10 @@ class ApprovalWriteToolPauseIntegrationTest {
         return agent;
     }
 
-    /**
-     * 桩模型：永远请求一次 create_playlist。
-     */
     static class ScriptedModel implements ChatModel {
-
         private final AtomicInteger calls = new AtomicInteger();
-
         private final String callId;
-
         private final String toolName;
-
         private final String arguments;
 
         ScriptedModel(String callId, String toolName, String arguments) {
@@ -246,26 +214,13 @@ class ApprovalWriteToolPauseIntegrationTest {
     }
 
     record StubUsage(int promptTokens, int completionTokens) implements Usage {
-
-        @Override
-        public Integer getPromptTokens() {
-            return promptTokens;
-        }
-
-        @Override
-        public Integer getCompletionTokens() {
-            return completionTokens;
-        }
-
-        @Override
-        public Object getNativeUsage() {
-            return null;
-        }
+        @Override public Integer getPromptTokens() { return promptTokens; }
+        @Override public Integer getCompletionTokens() { return completionTokens; }
+        @Override public Object getNativeUsage() { return null; }
     }
 
     @TestConfiguration(proxyBeanMethods = false)
     static class StubConfig {
-
         @Bean
         ToolCallbackProvider toolCallbackProvider() {
             return () -> new ToolCallback[0];

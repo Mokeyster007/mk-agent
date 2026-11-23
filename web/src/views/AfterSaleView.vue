@@ -9,7 +9,8 @@
  *
  * 页面不判断权限：能不能提交由服务端判定，页面只按 code 显示原因。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import AppShell from '@/components/AppShell.vue'
 import ShopNav from '@/components/ShopNav.vue'
 import AppIcon from '@/components/AppIcon.vue'
@@ -20,14 +21,17 @@ import { session } from '@/stores/session'
 import { shop } from '@/stores/shop'
 import { afterSale, afterSaleStatusTone } from '@/stores/aftersale'
 import { createAfterSaleChatStore } from '@/stores/aftersaleChat'
-import { runAfterSaleChat } from '@/api/aftersale'
 import {
   createAfterSaleConversation,
   getAfterSaleConversation,
+  prepareAfterSaleApproval,
+  runAfterSaleChat,
+  type AfterSaleReturnDraft,
 } from '@/api/aftersale'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
 import { formatDateTime } from '@/utils/format'
 
+const route = useRoute()
 const navOpen = ref(false)
 
 /**
@@ -53,6 +57,7 @@ const chat = createAfterSaleChatStore({
   chat: runAfterSaleChat,
   conversation: createAfterSaleConversation,
   conversationDetail: getAfterSaleConversation,
+  prepareApproval: prepareAfterSaleApproval,
   storageKey: conversationStorageKey,
   approval: getApproval,
   decide: decideApproval,
@@ -64,6 +69,23 @@ const chat = createAfterSaleChatStore({
 
 const detailOpen = computed(() => afterSale.state.detail !== null)
 const selected = computed(() => afterSale.quotaOf(afterSale.form.orderNo))
+const activeChatOrder = computed(() =>
+  chat.activeOrderNo.value ? afterSale.quotaOf(chat.activeOrderNo.value) : null,
+)
+
+function bindOrderContext(orderNo: string): void {
+  afterSale.selectOrder(orderNo)
+  chat.setActiveOrder(orderNo)
+}
+
+function applyDraftToForm(draft: AfterSaleReturnDraft): void {
+  afterSale.selectOrder(draft.orderNo)
+  afterSale.setQuantity(draft.quantity)
+  afterSale.setReason(draft.reason)
+  chat.setActiveOrder(draft.orderNo)
+  const formEl = document.getElementById('form')
+  formEl?.scrollIntoView({ behavior: 'smooth' })
+}
 const maxQuantity = computed(() => {
   const order = selected.value
   return order ? Math.max(1, order.quota.purchased) : 1
@@ -94,7 +116,7 @@ function quotaText(occupied: number, remaining: number): string {
 }
 
 async function onSwitchIdentity(userId: string): Promise<void> {
-  if (!session.updateUserId(userId, { probeMusicCapabilities: false })) {
+  if (!session.updateUserId(userId)) {
     return
   }
   // 换人就是换数据：先清空，再按新身份重新读
@@ -112,13 +134,19 @@ async function reloadAll(): Promise<void> {
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
 }
 
+function applyRouteOrder(): void {
+  const q = route.query.orderNo
+  if (typeof q === 'string' && q.trim()) {
+    bindOrderContext(q.trim())
+  }
+}
+
+watch(() => route.query.orderNo, () => applyRouteOrder())
+
 onMounted(async () => {
   await shop.loadSession()
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
-  /*
-   * 刷新后恢复会话：对话记录与"待确认"的卡都从服务端重建。
-   * 恢复失败不影响页面其余部分（订单、表单、我的售后各自独立读取）。
-   */
+  applyRouteOrder()
   await chat.restore()
 })
 </script>
@@ -164,7 +192,14 @@ onMounted(async () => {
           {{ afterSale.state.notice }}
         </p>
 
-        <AfterSaleChatPanel :chat="chat" />
+        <AfterSaleChatPanel
+          :chat="chat"
+          :active-order="activeChatOrder"
+          @clear-order="chat.setActiveOrder(null)"
+          @pick-order="bindOrderContext"
+          @fill-form="applyDraftToForm"
+          @open-return="afterSale.openReturn"
+        />
 
         <section id="orders" class="section">
           <header class="section__head">
@@ -214,7 +249,7 @@ onMounted(async () => {
                   type="button"
                   class="mk-btn mk-btn--sm"
                   :disabled="!order.returnable"
-                  @click="afterSale.selectOrder(order.orderNo)"
+                  @click="bindOrderContext(order.orderNo)"
                 >
                   申请退货
                 </button>
@@ -369,8 +404,18 @@ onMounted(async () => {
                   <span class="return__sku">{{ item.sku }}</span>
                 </p>
                 <p class="return__meta">
-                  原订单 {{ item.orderNo }} · 预计退款 {{ item.refundText }} · 提交
-                  {{ formatDateTime(item.createdAt) }}
+                  原订单 {{ item.orderNo }}
+                  <!-- F-04：已驳回单不再并列展示“预计退款”，避免给买家退款错觉 -->
+                  <template v-if="item.status !== 'REJECTED'"> · 预计退款 {{ item.refundText }}</template>
+                  · 提交 {{ formatDateTime(item.createdAt) }}
+                </p>
+                <!-- 当前阶段：服务端算好的措辞，与详情/售后 Agent 一致 -->
+                <p class="return__stage" :data-stage="item.stage.code">
+                  阶段：{{ item.stage.label }}
+                  <span v-if="item.progress" class="return__stage-counts">
+                    （已收 {{ item.progress.receivedQty }}/{{ item.progress.approvedQty }} 件，还差
+                    {{ item.progress.remainingQty }} 件）
+                  </span>
                 </p>
                 <p class="return__reason">原因：{{ item.reason }}</p>
                 <p
@@ -620,6 +665,15 @@ onMounted(async () => {
 }
 
 .return__refund-note {
+  color: var(--c-text-3);
+}
+
+.return__stage {
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+}
+
+.return__stage-counts {
   color: var(--c-text-3);
 }
 

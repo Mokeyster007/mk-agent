@@ -8,27 +8,15 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * 商品只读仓库。
- *
- * <p>为什么用 JdbcTemplate 而不是 MyBatis-Plus：
- * 商品列表需要 LEFT JOIN 库存余额（聚合视图），本项目的约定是
- * "按主键取单行用 MyBatis-Plus，联表/聚合用 JdbcTemplate"（见 MusicCatalogRepository）。
- * 商城写路径全是条件更新与行锁，也在 JdbcTemplate 上，保持一处风格。
- *
- * <p>下架（INACTIVE）商品对买家不可见，但仍然留在表里：
- * 历史订单行存的是快照，不依赖商品是否还在售。
+ * 商品仓库（商品主数据 + 结构化规格 + 库存余额聚合视图）。
  */
 @Repository
 public class ShopProductRepository {
 
-    /**
-     * 商品 + 可售库存。
-     *
-     * <p>{@code LEFT JOIN} + {@code COALESCE}：没有库存行时按 0 可售处理，
-     * 而不是让商品从列表里消失——"卖完了"和"不存在"必须能区分。
-     */
     private static final String SELECT_SELLABLE = """
             SELECT p.id, p.sku, p.name, p.subtitle, p.price_cents, p.status,
+                   p.category, p.connectivity, p.mac_compatible, p.silent_feature,
+                   p.switch_type, p.battery_info, p.weight_grams,
                    COALESCE(b.available, 0) AS available
             FROM shop_product p
             LEFT JOIN shop_inventory_balance b ON b.sku = p.sku
@@ -41,7 +29,15 @@ public class ShopProductRepository {
             rs.getString("subtitle"),
             rs.getLong("price_cents"),
             rs.getInt("available"),
-            rs.getString("status"));
+            rs.getString("status"),
+            rs.getString("category"),
+            rs.getString("connectivity"),
+            (Boolean) rs.getObject("mac_compatible"),
+            (Boolean) rs.getObject("silent_feature"),
+            rs.getString("switch_type"),
+            rs.getString("battery_info"),
+            rs.getObject("weight_grams") == null ? null : rs.getInt("weight_grams")
+    );
 
     private final JdbcTemplate jdbcTemplate;
 
@@ -49,28 +45,69 @@ public class ShopProductRepository {
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    /**
-     * 全部上架商品（含已售罄的，{@code available = 0}）。
-     *
-     * <p>不在这里过滤库存：页面需要显示"已售罄"，
-     * 直接筛掉会让用户以为商品被删了。
-     */
+    /** 全部上架商品（含已售罄的，available = 0）。 */
     public List<ShopProduct> findActive() {
         return jdbcTemplate.query(
                 SELECT_SELLABLE + " WHERE p.status = 'ACTIVE' ORDER BY p.id",
                 MAPPER);
     }
 
-    /**
-     * 按 id 取上架商品（下单时用）。
-     *
-     * <p>下架商品返回空：下单请求不能靠"客户端拿到了 id"就通过。
-     */
+    /** 后台管理查看全部商品（含下架商品）。 */
+    public List<ShopProduct> findAll() {
+        return jdbcTemplate.query(
+                SELECT_SELLABLE + " ORDER BY p.id",
+                MAPPER);
+    }
+
+    /** 按 id 取上架商品。 */
     public Optional<ShopProduct> findActiveById(long id) {
-        List<ShopProduct> rows = jdbcTemplate.query(
+        return jdbcTemplate.query(
                 SELECT_SELLABLE + " WHERE p.id = ? AND p.status = 'ACTIVE'",
                 MAPPER,
-                id);
-        return rows.stream().findFirst();
+                id).stream().findFirst();
+    }
+
+    /** 按 id 取商品（无论上架/下架，用于结算重查准确区分“不存在”与“已下架”）。 */
+    public Optional<ShopProduct> findById(long id) {
+        return jdbcTemplate.query(
+                SELECT_SELLABLE + " WHERE p.id = ?",
+                MAPPER,
+                id).stream().findFirst();
+    }
+
+    /** 按 SKU 取上架商品。 */
+    public Optional<ShopProduct> findActiveBySku(String sku) {
+        if (sku == null || sku.isBlank()) {
+            return Optional.empty();
+        }
+        return jdbcTemplate.query(
+                SELECT_SELLABLE + " WHERE UPPER(p.sku) = UPPER(?) AND p.status = 'ACTIVE'",
+                MAPPER,
+                sku.trim()).stream().findFirst();
+    }
+
+    /** 按 SKU 取商品（无论上架/下架）。 */
+    public Optional<ShopProduct> findBySku(String sku) {
+        if (sku == null || sku.isBlank()) {
+            return Optional.empty();
+        }
+        return jdbcTemplate.query(
+                SELECT_SELLABLE + " WHERE UPPER(p.sku) = UPPER(?)",
+                MAPPER,
+                sku.trim()).stream().findFirst();
+    }
+
+    /** 后台调价（用于演示价格变动后重新确认；历史订单行存快照不受影响）。 */
+    public int updatePriceCents(long id, long priceCents) {
+        return jdbcTemplate.update(
+                "UPDATE shop_product SET price_cents = ? WHERE id = ?",
+                priceCents, id);
+    }
+
+    /** 后台上下架（ACTIVE / INACTIVE）。 */
+    public int updateStatus(long id, String status) {
+        return jdbcTemplate.update(
+                "UPDATE shop_product SET status = ? WHERE id = ?",
+                status, id);
     }
 }

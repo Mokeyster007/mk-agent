@@ -10,6 +10,7 @@ import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
 import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
+import com.example.mkagent.shop.aftersale.AfterSaleStatus;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -136,9 +137,27 @@ public final class AfterSaleViews {
     }
 
     /**
+     * 买家能看懂的"处理到哪一步"（C1）。
+     *
+     * <p>它是**派生值**：由 {@code status} + 收货进度 + 退款记录算出来，
+     * 不落库、不新增状态、不改 {@code shop_aftersale_return.status}。
+     * 之所以放在服务端而不是让页面各算各的，是为了让**页面与售后 Agent 说同一句话**
+     * ——否则同一个事实会出现"待入库""待退款""已收满"三种叫法。
+     *
+     * <p>{@code hint} 只描述"接下来等什么"，不预测时间、不承诺到账。
+     */
+    public record StageVO(
+            String code,
+            String label,
+            String hint
+    ) {
+    }
+
+    /**
      * 退货申请。
      *
      * @param buyerId  买家身份（客服视角需要它定位是谁的单；对买家自己无隐私问题）
+     * @param stage    处理阶段（派生值，见 {@link StageVO}）
      * @param progress 收货进度；非「已批准」状态为 {@code null}
      * @param receipts 收货记录；列表接口为 {@code null}（未加载），详情接口为数组
      * @param refund   模拟退款；没退过款时为 {@code null}
@@ -162,6 +181,7 @@ public final class AfterSaleViews {
             String refundText,
             String reason,
             LocalDateTime createdAt,
+            StageVO stage,
             ProgressVO progress,
             List<ReceiptVO> receipts,
             RefundVO refund,
@@ -321,11 +341,78 @@ public final class AfterSaleViews {
                 ShopViews.money(value.refundCents()),
                 value.reason(),
                 value.createdAt(),
+                stage(value, progress, refund),
                 progress == null ? null : progress(progress),
                 receipts,
                 refund == null ? null : refund(refund),
                 decision,
                 events);
+    }
+
+    /**
+     * 阶段派生：客服结论 → 仓库进度 → 退款记录，三件事各有各的位置。
+     *
+     * <p>六个阶段覆盖买家能遇到的全部分支：
+     * <ol>
+     *   <li>待客服处理（还没结论）；</li>
+     *   <li>已驳回（终止分支，不展示"待收货 / 待退款"）；</li>
+     *   <li>待收货（已批准、一件没收到）；</li>
+     *   <li>部分收货（收到一部分，还剩几件）；</li>
+     *   <li>已全部收货、尚未登记模拟退款（**不是**"已退款"）；</li>
+     *   <li>已登记模拟退款（有单号才算）。</li>
+     * </ol>
+     *
+     * <p>损坏件计入累计实收：退款退的是"寄回来几件"，合格与否只影响能不能再卖。
+     */
+    public static StageVO stage(
+            AfterSaleReturn value,
+            AfterSaleReceiptProgress progress,
+            AfterSaleRefund refund
+    ) {
+        return switch (value.status()) {
+            case SUBMITTED -> new StageVO(
+                    "WAITING_DECISION",
+                    "待客服处理",
+                    "客服还没有给出结论；批准或驳回之后这里会显示下一步。");
+            case REJECTED -> new StageVO(
+                    "REJECTED",
+                    "已驳回",
+                    "处理已终止：不会再收货，也不会有模拟退款。驳回原因见下方处理结果。");
+            case APPROVED -> approvedStage(progress, refund);
+        };
+    }
+
+    private static StageVO approvedStage(
+            AfterSaleReceiptProgress progress,
+            AfterSaleRefund refund
+    ) {
+        // 已批准必然有进度；这里只做防御，不把它当成一种正常分支。
+        String code = progress == null ? AfterSaleReceiptProgress.CODE_NONE : progress.code();
+        int approved = progress == null ? 0 : progress.approvedQty();
+        int received = progress == null ? 0 : progress.receivedQty();
+        int remaining = progress == null ? 0 : progress.remainingQty();
+
+        return switch (code) {
+            case AfterSaleReceiptProgress.CODE_NONE -> new StageVO(
+                    "WAITING_RECEIPT",
+                    "待收货",
+                    "客服已批准 " + approved + " 件，仓库还没有收到任何一件。");
+            case AfterSaleReceiptProgress.CODE_PARTIAL -> new StageVO(
+                    "PARTIAL_RECEIPT",
+                    "部分收货",
+                    "已收 " + received + " 件，还差 " + remaining
+                            + " 件；损坏件也计入实收。");
+            default -> refund != null
+                    ? new StageVO(
+                            "REFUNDED",
+                            "已登记模拟退款",
+                            "已登记一笔模拟退款（" + refund.refundNo()
+                                    + "）；这是业务记录，没有真实资金流动。")
+                    : new StageVO(
+                            "RECEIVED_NOT_REFUNDED",
+                            "已全部收货，尚未登记模拟退款",
+                            "货已收齐；客服登记模拟退款后，这里会显示退款单号与金额。");
+        };
     }
 
     public static PreviewVO preview(AfterSalePreview preview) {

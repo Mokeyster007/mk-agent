@@ -38,6 +38,8 @@ final class ShopTestFixture {
         jdbc.update("DELETE FROM shop_aftersale_quota");
         jdbc.update("DELETE FROM shop_aftersale_idempotency");
 
+        jdbc.update("DELETE FROM shop_cart_item");
+        jdbc.update("DELETE FROM shop_order_idempotency");
         jdbc.update("DELETE FROM shop_order_item");
         jdbc.update("DELETE FROM shop_order");
 
@@ -47,7 +49,37 @@ final class ShopTestFixture {
                 ShopSeedInitializer.PRODUCT_MOUSE, ShopSeedInitializer.MOUSE_STOCK);
         setStock(jdbc, ShopSeedInitializer.SKU_CABLE,
                 ShopSeedInitializer.PRODUCT_CABLE, ShopSeedInitializer.CABLE_STOCK);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_AIR75,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75, 8);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_B68,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_B68, 6);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_G98,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_G98, 4);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_PRO1,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_PRO1, 5);
+        setStock(jdbc, ShopSeedInitializer.SKU_MOUSE_M5,
+                ShopSeedInitializer.PRODUCT_MOUSE_M5, 7);
 
+        // 恢复可能被价格/下架测试修改过的商品价格和状态
+        jdbc.update("UPDATE shop_product SET price_cents = 29900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD);
+        jdbc.update("UPDATE shop_product SET price_cents = 12900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_MOUSE);
+        jdbc.update("UPDATE shop_product SET price_cents = 1900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_CABLE);
+        jdbc.update("UPDATE shop_product SET price_cents = 36900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75);
+        jdbc.update("UPDATE shop_product SET price_cents = 25900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_B68);
+        jdbc.update("UPDATE shop_product SET price_cents = 38900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_G98);
+        jdbc.update("UPDATE shop_product SET price_cents = 59900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_PRO1);
+        jdbc.update("UPDATE shop_product SET price_cents = 19900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_MOUSE_M5);
+
+        ensureUser(jdbc, ShopSeedInitializer.BUYER_SHOP_ONLY, "BUYER");
+        ensureUser(jdbc, ShopSeedInitializer.ADMIN_SHOP_ONLY, "ADMIN");
         ensureUser(jdbc, ShopSeedInitializer.BUYER_ONE, "BUYER");
         ensureUser(jdbc, ShopSeedInitializer.BUYER_TWO, "BUYER");
         ensureUser(jdbc, ShopSeedInitializer.ADMIN, "ADMIN");

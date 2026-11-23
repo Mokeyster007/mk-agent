@@ -53,7 +53,7 @@ class ShopIdentityDisabledIntegrationTest {
         ShopApiClient.Reply reply = api.get("/shop/products", null);
 
         assertEquals(200, reply.status(), reply.raw());
-        assertEquals(3, reply.body().size(), "三个种子商品都应返回");
+        assertEquals(ShopSeedInitializer.SEED_PRODUCT_COUNT, reply.body().size(), "种子商品都应返回");
     }
 
     @Test

@@ -1,7 +1,7 @@
 package com.example.mkagent.approval;
 
 import com.example.mkagent.agent.AgentTaskRegistry;
-import com.example.mkagent.agent.MusicAgent;
+import com.example.mkagent.agent.ShopAssistantAgent;
 import com.example.mkagent.model.AgentEvent;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
@@ -9,7 +9,7 @@ import com.example.mkagent.model.AgentType;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
 import com.example.mkagent.support.HermeticSpringBootTest;
-import com.example.mkagent.tools.PlaylistWriteTool;
+import com.example.mkagent.tools.ShopCheckoutWriteTool;
 import com.example.mkagent.tools.ToolEventMessageProvider;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -73,7 +73,7 @@ class ApprovalPauseTransactionTest {
     private static final String SEED_APPROVAL_PREFIX = "ap-seed-";
 
     @Autowired
-    private PlaylistWriteTool playlistWriteTool;
+    private ShopCheckoutWriteTool checkoutWriteTool;
 
     @Autowired
     private ApprovalPauseGateway approvalPauseGateway;
@@ -116,9 +116,9 @@ class ApprovalPauseTransactionTest {
         AgentRunContext ctx = new AgentRunContext();
         String runId = ctx.getRunId().toString();
         ctx.setUserId(USER);
-        ctx.setAgentType(AgentType.MUSIC_USER);
+        ctx.setAgentType(AgentType.SHOP_ASSISTANT);
         ctx.transitionTo(AgentState.RUNNING);
-        runRecorder.recordStart(ctx, "帮我建个歌单");
+        runRecorder.recordStart(ctx, "帮我下单");
         ctx.nextStep();
 
         // 埋雷：同 (run_id, step) 的审批记录已存在 → 本次插入必然撞唯一索引
@@ -154,9 +154,10 @@ class ApprovalPauseTransactionTest {
     @DisplayName("Agent 同步路径：暂停落库失败 → 任务 FAILED，ctx 不残留 WAITING_APPROVAL")
     void agentDoesNotStayPausedWhenPersistFails() {
         ScriptedModel model = new ScriptedModel(
-                "call-tx", "create_playlist", "{\"name\":\"夜曲\",\"songIds\":[1]}");
+                "call-tx", "submit_checkout_order",
+                "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}");
 
-        MusicAgent agent = newAgent(model, approvalPauseGateway);
+        ShopAssistantAgent agent = newAgent(model, approvalPauseGateway);
 
         AgentRunContext ctx = new AgentRunContext();
         String runId = ctx.getRunId().toString();
@@ -198,7 +199,8 @@ class ApprovalPauseTransactionTest {
     @DisplayName("SSE 路径：暂停落库失败 → 不发 approval_required，客户端拿不到假 approvalId")
     void sseNeverEmitsApprovalIdWhenPersistFails() {
         ScriptedModel model = new ScriptedModel(
-                "call-sse", "create_playlist", "{\"name\":\"夜曲\",\"songIds\":[1]}");
+                "call-sse", "submit_checkout_order",
+                "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}");
 
         ApprovalPauseGateway failingGateway = new ApprovalPauseGateway() {
             @Override
@@ -213,9 +215,9 @@ class ApprovalPauseTransactionTest {
             }
         };
 
-        CapturingMusicAgent agent = newAgent(model, failingGateway);
+        CapturingShopAgent agent = newAgent(model, failingGateway);
 
-        agent.runStream("帮我建一个歌单");
+        agent.runStream("帮我下单");
 
         List<String> types = agent.events.stream().map(AgentEvent::getType).toList();
 
@@ -245,8 +247,8 @@ class ApprovalPauseTransactionTest {
                         + " status, resume_state, resume_attempts, expires_at) "
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
                         + " 'PENDING', 'PENDING_RESUME', 0, ?)",
-                SEED_APPROVAL_PREFIX + runId, runId, USER, "MUSIC_USER", step,
-                "create_playlist",
+                SEED_APPROVAL_PREFIX + runId, runId, USER, "SHOP_ASSISTANT", step,
+                "submit_checkout_order",
                 1, "seed-hash", "预埋冲突记录", null,
                 LocalDateTime.now().plusMinutes(10));
     }
@@ -257,25 +259,25 @@ class ApprovalPauseTransactionTest {
     }
 
     private ApprovalCheckpoint checkpoint(String runId) {
-        String arguments = "{\"name\":\"夜曲\",\"songIds\":[1]}";
+        String arguments = "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}";
 
         return new ApprovalCheckpoint(
                 ApprovalCheckpoint.CURRENT_SCHEMA_VERSION,
                 "cfg-test",
                 runId,
                 USER,
-                AgentType.MUSIC_USER.name(),
+                AgentType.SHOP_ASSISTANT.name(),
                 1,
                 0,
                 List.of(),
                 new ApprovalCheckpoint.CheckpointMessage(
                         "assistant", "",
                         List.of(new ApprovalCheckpoint.PendingToolCall(
-                                "call-tx", "function", "create_playlist",
+                                "call-tx", "function", "submit_checkout_order",
                                 arguments, ApprovalHashes.argsHash(arguments))),
                         null),
                 List.of(new ApprovalCheckpoint.PendingToolCall(
-                        "call-tx", "function", "create_playlist",
+                        "call-tx", "function", "submit_checkout_order",
                         arguments, ApprovalHashes.argsHash(arguments))),
                 new ApprovalCheckpoint.BudgetSnapshot(4, 10, 30),
                 new ApprovalCheckpoint.UsageSnapshot("stub", 1, 1, 2, 1, 5),
@@ -287,14 +289,14 @@ class ApprovalPauseTransactionTest {
 
     private ApprovalSummary summary() {
         return new ApprovalSummary(
-                "create_playlist", "创建歌单", "夜曲", 1,
-                List.of("城市霓虹"), 1, "创建歌单《夜曲》，共 1 首。");
+                "submit_checkout_order", "确认下单", null, null,
+                List.of(), 1, "确认下单 Air75 1 件。");
     }
 
-    private CapturingMusicAgent newAgent(ChatModel model, ApprovalPauseGateway gateway) {
-        ToolCallback[] callbacks = ToolCallbacks.from(playlistWriteTool);
+    private CapturingShopAgent newAgent(ChatModel model, ApprovalPauseGateway gateway) {
+        ToolCallback[] callbacks = ToolCallbacks.from(checkoutWriteTool);
 
-        CapturingMusicAgent agent = new CapturingMusicAgent(
+        CapturingShopAgent agent = new CapturingShopAgent(
                 model, callbacks, toolEventMessageProvider);
 
         agent.setTaskRegistry(taskRegistry);
@@ -313,22 +315,17 @@ class ApprovalPauseTransactionTest {
         return agent;
     }
 
-    /**
-     * 捕获 SSE 事件，不真的写连接（测试没有 HTTP 客户端）。
-     */
-    static class CapturingMusicAgent extends MusicAgent {
+    static class CapturingShopAgent extends ShopAssistantAgent {
 
         private final List<AgentEvent> events =
                 Collections.synchronizedList(new ArrayList<>());
 
-        CapturingMusicAgent(
+        CapturingShopAgent(
                 ChatModel model,
                 ToolCallback[] tools,
                 ToolEventMessageProvider provider
         ) {
-            super(model, tools, Runnable::run, provider,
-                    AgentType.MUSIC_USER, "approval-tx-test",
-                    MusicAgent.USER_SYSTEM_PROMPT);
+            super(model, tools, Runnable::run, provider);
         }
 
         @Override

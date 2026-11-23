@@ -90,6 +90,7 @@ CONSTRAINT uk_shop_aftersale_refund_return UNIQUE (return_id)
 | --- | --- | --- |
 | 409 | `REFUND_NOT_ALLOWED` | 不是已批准（待审批 / 已驳回） |
 | 409 | `REFUND_NOT_RECEIVED` | 还没收满批准数量 |
+| 409 | `REFUND_RECEIPT_QUANTITY_MISMATCH` | 累计实收**超过**批准数量（数据不一致，C1 补的，见 `docs/shop-c1.md` 第 6 节） |
 | 409 | `REFUND_ALREADY_EXISTS` | 这张单已经退过（消息带原单号） |
 | 409 | `REFUND_AMOUNT_MISMATCH` | 退货单单价快照与订单行不一致 |
 | 400 | `REFUND_AMOUNT_OUT_OF_RANGE` | 金额溢出 |
