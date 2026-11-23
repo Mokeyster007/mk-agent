@@ -16,7 +16,7 @@
  * 版面纪律：三块内容必须能被一眼扫到 —— 操作是什么 / 目标歌单 / 将写入的歌曲。
  * 每个状态都带文字，颜色只是辅助。
  */
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import AppIcon from './AppIcon.vue'
 import TaskStatusBadge from './TaskStatusBadge.vue'
 import type { ApprovalRequiredPayload, ApprovalView } from '@/api/types'
@@ -42,9 +42,6 @@ const emit = defineEmits<{
   (e: 'refresh'): void
 }>()
 
-/** 超过这个数量就先折叠，避免一屏全是歌名 */
-const COLLAPSE_AT = 8
-
 const isPreview = computed(() => props.mode === 'preview')
 
 /** 审批真实状态：以查询接口为准，查不到时不假装是 PENDING */
@@ -62,25 +59,20 @@ const canResume = computed(() => {
 })
 
 const summary = computed(() => props.payload.summary)
-const targetPlaylist = computed(() => summary.value.playlistName || '未指定歌单名')
 const actionLabel = computed(() => summary.value.toolLabel || toolLabel(summary.value.tool))
 
-/**
- * 业务扩展给出的结构化字段（当前只有售后：订单号 / 商品 / 数量 / 原因）。
- *
- * 有 details 就按"标签 值"逐条渲染，**不再**显示歌单那一块：
- * 售后卡上没有歌单，显示"未指定歌单名"会让用户以为批准的是别的东西。
- * 两者都来自服务端摘要，前端不拼接、不补字段。
- */
 const details = computed(() => summary.value.details ?? [])
 const hasDetails = computed(() => details.value.length > 0)
 
-/** 音乐卡的脚注指向歌单；有 details 的业务指向自己的列表，避免指错地方。 */
-const footnote = computed(() =>
-  hasDetails.value
-    ? '批准只表示同意执行；是否真的建单，以「我的售后」列表里的单号为准。'
-    : '批准只表示同意执行；是否真的执行成功，以任务状态和最终回答为准。写库结果可在顶栏「我的歌单」里刷新核对。',
-)
+const footnote = computed(() => {
+  if (summary.value.tool === 'submit_checkout_order') {
+    return '批准只表示同意按上述固定参数发起下单；执行时会重查实时价格与库存，是否真的建单以「我的订单」里的真实订单号为准。'
+  }
+  if (summary.value.tool === 'submit_return') {
+    return '批准只表示同意执行；是否真的建单，以「我的售后」列表里的真实退货单号为准。'
+  }
+  return '批准只表示同意执行；是否真的执行成功，以真实业务单据结果为准。'
+})
 
 const expiresText = computed(() => {
   const value = props.approval?.expiresAt || props.payload.expiresAt
@@ -88,16 +80,6 @@ const expiresText = computed(() => {
 })
 
 const disabled = computed(() => props.busy || isPreview.value || !isPending.value)
-
-/** 长列表折叠，但必须能展开核对 */
-const songsOpen = ref(false)
-const songs = computed(() => summary.value.songs)
-const hiddenCount = computed(() =>
-  songsOpen.value ? 0 : Math.max(0, songs.value.length - COLLAPSE_AT),
-)
-const visibleSongs = computed(() =>
-  songsOpen.value ? songs.value : songs.value.slice(0, COLLAPSE_AT),
-)
 </script>
 
 <template>
@@ -119,48 +101,12 @@ const visibleSongs = computed(() =>
       </div>
     </header>
 
-    <!-- 1. 操作是什么（标题）+ 2. 这次要固定的关键事实 -->
     <dl v-if="hasDetails" class="approval__facts">
       <div v-for="item in details" :key="item.label" class="approval__fact">
         <dt>{{ item.label }}</dt>
         <dd>{{ item.value }}</dd>
       </div>
     </dl>
-    <dl v-else class="approval__facts">
-      <div class="approval__fact">
-        <dt>目标歌单</dt>
-        <dd>{{ targetPlaylist }}</dd>
-      </div>
-    </dl>
-
-    <!-- 3. 将写入的歌曲（音乐链路；售后没有这一段） -->
-    <div v-if="songs.length || summary.songCount !== null" class="approval__songs">
-      <div class="approval__songs-head">
-        <span class="approval__songs-label">将写入的歌曲</span>
-        <span class="approval__songs-count">
-          {{ summary.songCount !== null ? summary.songCount : songs.length }} 首
-        </span>
-        <button
-          v-if="songs.length > COLLAPSE_AT"
-          type="button"
-          class="approval__songs-toggle"
-          @click="songsOpen = !songsOpen"
-        >
-          {{ songsOpen ? '收起' : '展开全部' }}
-        </button>
-      </div>
-
-      <ol v-if="visibleSongs.length" class="approval__song-list">
-        <li v-for="(song, index) in visibleSongs" :key="`${song}-${index}`" class="approval__song">
-          <span class="approval__song-index">{{ index + 1 }}</span>
-          <span class="approval__song-title">{{ song }}</span>
-        </li>
-      </ol>
-      <p v-if="hiddenCount > 0" class="approval__more">还有 {{ hiddenCount }} 首未展开</p>
-      <p v-else-if="!songs.length" class="approval__more">服务端摘要没有给出歌曲标题</p>
-
-      <p class="approval__note">摘要只提供歌曲标题，没有可靠的歌曲 ID 映射，因此这里不显示 ID。</p>
-    </div>
 
     <p v-if="summary.text" class="approval__text">{{ summary.text }}</p>
 

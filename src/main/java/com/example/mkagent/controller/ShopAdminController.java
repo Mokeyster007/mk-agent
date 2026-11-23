@@ -10,6 +10,8 @@ import com.example.mkagent.shop.api.ShopViews.InventoryVO;
 import com.example.mkagent.shop.api.ShopViews.MovementVO;
 import com.example.mkagent.shop.api.ShopViews.OrderVO;
 import com.example.mkagent.shop.api.ShopViews.PageVO;
+import com.example.mkagent.shop.api.ShopViews.ProductVO;
+import com.example.mkagent.shop.catalog.ShopProductRepository;
 import com.example.mkagent.shop.inventory.InventoryService;
 import com.example.mkagent.shop.order.OrderActionResult;
 import com.example.mkagent.shop.order.ShopOrderService;
@@ -17,6 +19,7 @@ import com.example.mkagent.shop.order.ShopOrderStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -49,18 +52,28 @@ public class ShopAdminController {
 
     private final InventoryService inventoryService;
 
+    private final ShopProductRepository productRepository;
+
     private final ShopProperties properties;
 
     public ShopAdminController(
             ShopAccessGuard accessGuard,
             ShopOrderService orderService,
             InventoryService inventoryService,
+            ShopProductRepository productRepository,
             ShopProperties properties
     ) {
         this.accessGuard = accessGuard;
         this.orderService = orderService;
         this.inventoryService = inventoryService;
+        this.productRepository = productRepository;
         this.properties = properties;
+    }
+
+    public record UpdateProductPriceRequest(Long priceCents) {
+    }
+
+    public record UpdateProductStatusRequest(String status) {
     }
 
     /**
@@ -155,6 +168,54 @@ public class ShopAdminController {
                 .toList();
 
         return new InventoryVO(balances, movements);
+    }
+
+    /** 后台商品列表（含下架商品）。 */
+    @GetMapping("/products")
+    public List<ProductVO> products() {
+        accessGuard.requireAdmin();
+        return productRepository.findAll().stream()
+                .map(ShopViews::product)
+                .toList();
+    }
+
+    /** 后台调价（历史订单快照不受影响；用于验证报价变动后需重新确认）。 */
+    @PostMapping("/products/{id}/price")
+    public ProductVO updateProductPrice(
+            @PathVariable long id,
+            @RequestBody(required = false) UpdateProductPriceRequest request
+    ) {
+        accessGuard.requireAdmin();
+        if (request == null || request.priceCents() == null || request.priceCents() < 0) {
+            throw new BusinessException(400, "INVALID_PRICE", "价格（分）必须为非负整数");
+        }
+        int rows = productRepository.updatePriceCents(id, request.priceCents());
+        if (rows == 0) {
+            throw new BusinessException(404, "PRODUCT_NOT_FOUND", "商品不存在：" + id);
+        }
+        return productRepository.findById(id)
+                .map(ShopViews::product)
+                .orElseThrow(() -> new BusinessException(404, "PRODUCT_NOT_FOUND", "商品不存在：" + id));
+    }
+
+    /** 后台上下架（ACTIVE / INACTIVE）。 */
+    @PostMapping("/products/{id}/status")
+    public ProductVO updateProductStatus(
+            @PathVariable long id,
+            @RequestBody(required = false) UpdateProductStatusRequest request
+    ) {
+        accessGuard.requireAdmin();
+        if (request == null || request.status() == null
+                || (!"ACTIVE".equals(request.status()) && !"INACTIVE".equals(request.status()))) {
+            throw new BusinessException(400, "INVALID_STATUS", "商品状态只允许 ACTIVE 或 INACTIVE");
+        }
+        int rows = productRepository.updateStatus(id, request.status());
+        if (rows == 0) {
+            throw new BusinessException(404, "PRODUCT_NOT_FOUND", "商品不存在：" + id);
+        }
+        return productRepository.findById(id)
+                .map(ShopViews::product)
+                .orElseThrow(() -> new BusinessException(404, "PRODUCT_NOT_FOUND", "商品不存在：" + id));
     }
 
     private static ActionResultVO toVO(OrderActionResult result) {

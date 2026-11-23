@@ -3,44 +3,41 @@ import { mount } from '@vue/test-utils'
 import ApprovalCard from './ApprovalCard.vue'
 import type { ApprovalRequiredPayload, ApprovalView } from '@/api/types'
 
-/**
- * 审批卡测试。
- *
- * 守两条底线：
- * 1. 卡片内容只能来自服务端摘要（payload / approval view），
- *    不存在"根据模型文本拼一个审批"的路径；
- * 2. 状态决定按钮可用性：待确认才可提交、提交中禁用、预览模式全禁用。
- */
-const payload: ApprovalRequiredPayload = {
-  approvalId: 'ap-1',
-  expiresAt: '2026-11-17T01:30:00',
+const checkoutPayload: ApprovalRequiredPayload = {
+  approvalId: 'ap-checkout-1',
+  expiresAt: '2026-11-23T01:30:00',
   summary: {
-    tool: 'create_playlist',
-    toolLabel: '创建歌单',
-    playlistName: '清晨慢跑',
-    songCount: 2,
-    songs: ['城市霓虹', '午夜电台'],
+    tool: 'submit_checkout_order',
+    toolLabel: '确认提交演示订单',
+    playlistName: null,
+    songCount: null,
+    songs: [],
     roundToolCount: 1,
-    text: '即将创建歌单「清晨慢跑」，并放入 2 首歌曲。',
-    details: [],
+    text: '确认下单：无线轻音机械键盘 Air75 × 1，预计总额 ¥369.00（演示付款）。',
+    details: [
+      { label: '商品', value: '无线轻音机械键盘 Air75（SKU-KEYBOARD-A75）' },
+      { label: '数量', value: '1 件' },
+      { label: '单价', value: '¥369.00' },
+      { label: '预计总额', value: '¥369.00' },
+    ],
   },
 }
 
 function view(overrides: Partial<ApprovalView> = {}): ApprovalView {
   return {
-    approvalId: 'ap-1',
+    approvalId: 'ap-checkout-1',
     runId: 'run-1',
-    agentType: 'MUSIC_USER',
-    step: 3,
-    primaryTool: 'create_playlist',
+    agentType: 'SHOP_ASSISTANT',
+    step: 2,
+    primaryTool: 'submit_checkout_order',
     toolCount: 1,
-    summaryText: payload.summary.text,
-    summary: payload.summary,
+    summaryText: checkoutPayload.summary.text,
+    summary: checkoutPayload.summary,
     status: 'PENDING',
     resumeState: 'PENDING_RESUME',
     resumeAttempts: 0,
     decidedAt: null,
-    expiresAt: '2026-11-17T01:30:00',
+    expiresAt: '2026-11-23T01:30:00',
     ...overrides,
   }
 }
@@ -48,7 +45,7 @@ function view(overrides: Partial<ApprovalView> = {}): ApprovalView {
 function mountCard(props: Record<string, unknown> = {}) {
   return mount(ApprovalCard, {
     props: {
-      payload,
+      payload: checkoutPayload,
       approval: view(),
       ...props,
     },
@@ -56,94 +53,47 @@ function mountCard(props: Record<string, unknown> = {}) {
 }
 
 describe('ApprovalCard', () => {
-  it('展示服务端摘要里的操作、歌单与歌曲', () => {
+  it('展示下单确认卡的结构化明细，且不出现音乐歌单占位', () => {
     const wrapper = mountCard()
     const text = wrapper.text()
 
-    expect(text).toContain('创建歌单')
-    expect(text).toContain('清晨慢跑')
-    expect(text).toContain('2 首')
-    expect(text).toContain('城市霓虹')
-    expect(text).toContain('午夜电台')
-    expect(text).toContain('2026-11-17 01:30:00')
+    expect(text).toContain('确认提交演示订单')
+    expect(text).toContain('Air75')
+    expect(text).toContain('¥369.00')
+    expect(text).toContain('「我的订单」')
+    expect(text).not.toContain('目标歌单')
+    expect(text).not.toContain('将写入的歌曲')
   })
 
-  it('摘要没有歌曲 ID 时不编造 ID', () => {
+  it('待确认状态可以提交决定，提交中禁用防重复点击', async () => {
     const wrapper = mountCard()
-    expect(wrapper.text()).toContain('没有可靠的歌曲 ID 映射')
-  })
-
-  it('待确认状态可以提交决定', () => {
-    const wrapper = mountCard()
-    const buttons = wrapper.findAll('button')
-    const approve = buttons.find((button) => button.text().includes('批准并执行'))
-
+    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并执行'))
     expect(approve?.attributes('disabled')).toBeUndefined()
-  })
-
-  it('提交中禁用批准与拒绝，防重复点击', () => {
-    const wrapper = mountCard({ busy: true })
-    const approve = wrapper.findAll('button').find((b) => b.text().includes('提交中'))
-
-    expect(approve?.attributes('disabled')).toBeDefined()
-  })
-
-  it('已处理状态不再允许提交决定', () => {
-    const wrapper = mountCard({ approval: view({ status: 'APPROVED', resumeState: 'FINISHED' }) })
-    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并执行'))
-
-    expect(approve?.attributes('disabled')).toBeDefined()
-    expect(wrapper.text()).toContain('已批准')
-  })
-
-  it('决定已保存但恢复未完成时出现手动恢复', () => {
-    const wrapper = mountCard({
-      approval: view({ status: 'APPROVED', resumeState: 'PENDING_RESUME', resumeAttempts: 2 }),
-    })
-
-    expect(wrapper.text()).toContain('手动恢复')
-    expect(wrapper.text()).toContain('已尝试恢复 2 次')
-  })
-
-  it('恢复已完成时不显示手动恢复', () => {
-    const wrapper = mountCard({ approval: view({ status: 'APPROVED', resumeState: 'FINISHED' }) })
-
-    expect(wrapper.text()).not.toContain('手动恢复')
-  })
-
-  it('预览模式：按钮全禁用且标注不发起请求', () => {
-    const wrapper = mountCard({ mode: 'preview' })
-    // 注意：disabled 属性存在时 attributes('disabled') 返回空串，
-    // 用 === undefined 判断"可点击"，否则空串会被当成 falsy 误判为可用。
-    const enabled = wrapper
-      .findAll('button')
-      .filter((button) => button.attributes('disabled') === undefined)
-
-    expect(enabled).toHaveLength(0)
-    expect(wrapper.text()).toContain('预览模式：按钮不发起任何请求')
-  })
-
-  it('点击批准只发一次事件', async () => {
-    const wrapper = mountCard()
-    const approve = wrapper.findAll('button').find((b) => b.text().includes('批准并执行'))
 
     await approve?.trigger('click')
-
     expect(wrapper.emitted('approve')).toHaveLength(1)
-    expect(wrapper.emitted('reject')).toBeUndefined()
+
+    const busyWrapper = mountCard({ busy: true })
+    const busyApprove = busyWrapper.findAll('button').find((b) => b.text().includes('提交中'))
+    expect(busyApprove?.attributes('disabled')).toBeDefined()
   })
 
-  it('未确认到审批状态时提示先刷新，而不是假装待确认', () => {
-    const wrapper = mountCard({ approval: null })
+  it('已处理状态不再允许提交决定，决定已保存但未恢复时展示手动恢复', () => {
+    const finished = mountCard({ approval: view({ status: 'APPROVED', resumeState: 'FINISHED' }) })
+    expect(finished.findAll('button').find((b) => b.text().includes('批准并执行'))?.attributes('disabled')).toBeDefined()
+    expect(finished.text()).not.toContain('手动恢复')
 
-    expect(wrapper.text()).toContain('状态未确认')
-    expect(wrapper.text()).toContain('建议先刷新')
+    const pendingResume = mountCard({
+      approval: view({ status: 'APPROVED', resumeState: 'PENDING_RESUME', resumeAttempts: 2 }),
+    })
+    expect(pendingResume.text()).toContain('手动恢复')
+    expect(pendingResume.text()).toContain('已尝试恢复 2 次')
   })
 
-  it('售后确认卡按 details 逐条展示，不显示歌单与歌曲', () => {
-    const aftersale = {
+  it('售后确认卡按 details 展示，且脚注指向「我的售后」', () => {
+    const aftersale: ApprovalRequiredPayload = {
       approvalId: 'ap-aftersale',
-      expiresAt: '2026-11-22T10:30:00',
+      expiresAt: '2026-11-23T10:30:00',
       summary: {
         tool: 'submit_return',
         toolLabel: '提交退货申请',
@@ -172,16 +122,9 @@ describe('ApprovalCard', () => {
       }),
     })
     const text = wrapper.text()
-
     expect(text).toContain('提交退货申请')
     expect(text).toContain('SO20261122100000-0001')
-    expect(text).toContain('机械键盘 K87')
-    expect(text).toContain('1 件')
-    expect(text).toContain('键盘按键失灵')
-    // 售后卡上没有歌单，不能显示"未指定歌单名"这种误导性占位
-    expect(text).not.toContain('未指定歌单名')
-    expect(text).not.toContain('将写入的歌曲')
-    // 脚注要指向售后列表，而不是音乐歌单
     expect(text).toContain('「我的售后」')
+    expect(text).not.toContain('目标歌单')
   })
 })

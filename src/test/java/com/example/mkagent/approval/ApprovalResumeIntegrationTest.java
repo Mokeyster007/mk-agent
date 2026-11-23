@@ -2,7 +2,7 @@ package com.example.mkagent.approval;
 
 import com.example.mkagent.agent.AgentTaskRegistry;
 import com.example.mkagent.agent.BaseAgent;
-import com.example.mkagent.agent.MusicAgent;
+import com.example.mkagent.agent.ShopAssistantAgent;
 import com.example.mkagent.context.UserContextHolder;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.AgentEvent;
@@ -10,11 +10,11 @@ import com.example.mkagent.model.AgentEventType;
 import com.example.mkagent.model.AgentRunContext;
 import com.example.mkagent.model.AgentState;
 import com.example.mkagent.model.AgentType;
-import com.example.mkagent.music.MusicSeedInitializer;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
 import com.example.mkagent.service.AgentRunRecorder;
+import com.example.mkagent.shop.ShopSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
-import com.example.mkagent.tools.PlaylistWriteTool;
+import com.example.mkagent.tools.ShopCheckoutWriteTool;
 import com.example.mkagent.tools.ToolEventMessageProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -78,14 +78,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Timeout(120)
 class ApprovalResumeIntegrationTest {
 
-    private static final String USER = MusicSeedInitializer.USER_ALICE;
+    private static final String USER = ShopSeedInitializer.BUYER_SHOP_ONLY;
 
-    private static final String OTHER = MusicSeedInitializer.USER_BOB;
+    private static final String OTHER = ShopSeedInitializer.BUYER_TWO;
 
-    private static final String TOOL = "create_playlist";
+    private static final String TOOL = "submit_checkout_order";
 
     @Autowired
-    private PlaylistWriteTool playlistWriteTool;
+    private ShopCheckoutWriteTool checkoutWriteTool;
 
     @Autowired
     private ApprovalToolPolicy approvalToolPolicy;
@@ -151,10 +151,12 @@ class ApprovalResumeIntegrationTest {
          * 否则别的用例（例如种子数据条数断言）会被这里多出来的歌单带偏。
          */
         jdbcTemplate.update(
-                "DELETE FROM music_playlist_song WHERE playlist_id IN "
-                        + "(SELECT id FROM music_playlist WHERE name LIKE ?)", NAME_PREFIX + "%");
+                "DELETE FROM shop_order_item WHERE order_id IN (SELECT id FROM shop_order WHERE buyer_id IN (?, ?))",
+                USER, OTHER);
+        jdbcTemplate.update("DELETE FROM shop_order WHERE buyer_id IN (?, ?)", USER, OTHER);
         jdbcTemplate.update(
-                "DELETE FROM music_playlist WHERE name LIKE ?", NAME_PREFIX + "%");
+                "UPDATE shop_product SET price_cents = 36900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75);
 
         for (String runId : createdRuns) {
             jdbcTemplate.update("DELETE FROM agent_approval WHERE run_id = ?", runId);
@@ -364,7 +366,7 @@ class ApprovalResumeIntegrationTest {
         Executor async = command -> new Thread(command, "resume-test").start();
 
         // 真正并发需要一个异步执行器的 Agent；配置指纹与暂停时一致，检查点校验可通过
-        MusicAgent asyncAgent = newAgent(model, async, 4, 10);
+        ShopAssistantAgent asyncAgent = newAgent(model, async, 4, 10);
         ApprovalResumeService service =
                 new ApprovalResumeService(claimService, approvalProperties, List.of(asyncAgent));
 
@@ -410,7 +412,7 @@ class ApprovalResumeIntegrationTest {
 
         // 可控排队执行器：只把任务放进队列，不运行
         Deque<Runnable> queue = new ArrayDeque<>();
-        MusicAgent queuedAgent = newAgent(model, queue::add, 4, 10);
+        ShopAssistantAgent queuedAgent = newAgent(model, queue::add, 4, 10);
 
         resumeService(queuedAgent).resume(paused.approvalId(), USER);
 
@@ -454,7 +456,7 @@ class ApprovalResumeIntegrationTest {
         int callsAfterPause = model.calls.get();
 
         Deque<Runnable> queue = new ArrayDeque<>();
-        MusicAgent queuedAgent = newAgent(model, queue::add, 4, 10);
+        ShopAssistantAgent queuedAgent = newAgent(model, queue::add, 4, 10);
 
         resumeService(queuedAgent).resume(paused.approvalId(), USER);
         assertEquals("CLAIMED", approvalRow(paused.approvalId()).get("resume_state"));
@@ -506,7 +508,7 @@ class ApprovalResumeIntegrationTest {
             }
         };
 
-        MusicAgent agent = newAgent(model, Runnable::run, 4, 10);
+        ShopAssistantAgent agent = newAgent(model, Runnable::run, 4, 10);
         agent.setApprovalClaimService(failing);
 
         resumeService(agent).resume(paused.approvalId(), USER);
@@ -561,7 +563,7 @@ class ApprovalResumeIntegrationTest {
 
         RecordingEmitter emitter = new RecordingEmitter();
 
-        MusicAgent agent = newAgent(model, Runnable::run, 4, 10, emitter);
+        ShopAssistantAgent agent = newAgent(model, Runnable::run, 4, 10, emitter);
 
         /*
          * 终态事务固定失败：证明"写不进数据库就不发成功事件"。
@@ -605,44 +607,31 @@ class ApprovalResumeIntegrationTest {
     }
 
     @Test
-    @DisplayName("业务权限在执行时重新检查：归属变化是业务失败，不是检查点损坏")
+    @DisplayName("业务状态在执行时重新检查：暂停期间商品改价是业务失败，不是检查点损坏")
     void businessOwnershipRecheckedAtExecution() {
-        String name = uniqueName();
-        jdbcTemplate.update(
-                "INSERT INTO music_playlist (user_id, name, is_public, created_at) "
-                        + "VALUES (?, ?, FALSE, CURRENT_TIMESTAMP)", USER, name);
-        Long playlistId = jdbcTemplate.queryForObject(
-                "SELECT id FROM music_playlist WHERE user_id = ? AND name = ?",
-                Long.class, USER, name);
+        long ordersBefore = playlistCount();
 
         ScriptedModel model = new ScriptedModel()
-                .toolCall("call-o1", "add_songs_to_playlist",
-                        "{\"playlistId\":" + playlistId + ",\"songIds\":[1001]}")
-                .answer("已完成");
+                .toolCall("call-o1", TOOL, createArgs(uniqueName()))
+                .answer("商品价格已变动，请按最新报价重新确认。");
 
         Paused paused = pause(model, 4, 10);
         assertEquals(200, decide(paused, true).httpStatus());
 
-        /*
-         * 合法检查点、业务数据变了：歌单在暂停期间被转给别人。
-         * 这不是检查点损坏（归属字段没被篡改），恢复必须成功，
-         * 由执行时的 requireOwned 拒绝写入。
-         */
-        jdbcTemplate.update("UPDATE music_playlist SET user_id = ? WHERE id = ?",
-                OTHER, playlistId);
+        // 合法检查点，但业务价格在暂停期间变动：执行时必须重查并拒绝落单
+        jdbcTemplate.update("UPDATE shop_product SET price_cents = 39900 WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75);
 
         resume(paused);
 
         assertEquals("SUCCEEDED", runRow(paused.runId()).get("state"),
                 "业务数据变化不应把任务判成失败");
         assertEquals("APPROVED", approvalRow(paused.approvalId()).get("status"),
-                "不得因为业务归属变化就 INVALIDATED 审批");
+                "不得因为业务状态变化就 INVALIDATED 审批");
         assertEquals("FINISHED", approvalRow(paused.approvalId()).get("resume_state"));
 
-        assertEquals(0, jdbcTemplate.queryForObject(
-                        "SELECT COUNT(*) FROM music_playlist_song WHERE playlist_id = ?",
-                        Integer.class, playlistId),
-                "执行时的归属校验必须拦住写入");
+        assertEquals(ordersBefore, playlistCount(),
+                "执行时的实时报价校验必须拦住落单");
     }
 
     @Test
@@ -661,7 +650,7 @@ class ApprovalResumeIntegrationTest {
             throw new RejectedExecutionException("线程池已满");
         };
 
-        MusicAgent failingAgent = newAgent(model, rejecting, 4, 10);
+        ShopAssistantAgent failingAgent = newAgent(model, rejecting, 4, 10);
 
         BusinessException e = assertThrows(BusinessException.class,
                 () -> resumeService(failingAgent).resume(paused.approvalId(), USER));
@@ -1009,7 +998,7 @@ class ApprovalResumeIntegrationTest {
 
     // ==================== 辅助 ====================
 
-    private record Paused(MusicAgent agent, String runId, String approvalId, ScriptedModel model) {
+    private record Paused(ShopAssistantAgent agent, String runId, String approvalId, ScriptedModel model) {
     }
 
     private int ctxToolCalls(Paused paused) {
@@ -1035,13 +1024,13 @@ class ApprovalResumeIntegrationTest {
     }
 
     private Paused pause(ScriptedModel model, int maxSteps, int maxToolCalls) {
-        MusicAgent agent = newAgent(model, Runnable::run, maxSteps, maxToolCalls);
+        ShopAssistantAgent agent = newAgent(model, Runnable::run, maxSteps, maxToolCalls);
 
         AgentRunContext ctx = new AgentRunContext();
 
         UserContextHolder.set(USER);
         try {
-            agent.run("帮我建一个歌单", ctx);
+            agent.run("请帮我下单 Air75 一把", ctx);
         } finally {
             UserContextHolder.clear();
         }
@@ -1059,44 +1048,32 @@ class ApprovalResumeIntegrationTest {
         return new Paused(agent, runId, approvalId, model);
     }
 
-    private MusicAgent newAgent(
+    private ShopAssistantAgent newAgent(
             ChatModel model, Executor executor, int maxSteps, int maxToolCalls) {
         return newAgent(model, executor, maxSteps, maxToolCalls, null);
     }
 
-    /**
-     * 同上，但把恢复流的 emitter 换成测试替身，用来断言事件顺序。
-     *
-     * 只有"事件顺序"类用例需要它：真实 SseEmitter 没有连接就发不出事件，
-     * 而这里要证明的正是"哪些事件根本没发"。
-     */
-    private MusicAgent newAgent(
+    private ShopAssistantAgent newAgent(
             ChatModel model,
             Executor executor,
             int maxSteps,
             int maxToolCalls,
             SseEmitter resumeEmitter
     ) {
-        ToolCallback[] callbacks = ToolCallbacks.from(playlistWriteTool);
+        ToolCallback[] callbacks = ToolCallbacks.from(checkoutWriteTool);
 
-        MusicAgent agent = resumeEmitter == null
-                ? new MusicAgent(
+        ShopAssistantAgent agent = resumeEmitter == null
+                ? new ShopAssistantAgent(
                         model,
                         callbacks,
                         executor,
-                        toolEventMessageProvider,
-                        AgentType.MUSIC_USER,
-                        "approval-resume-test",
-                        MusicAgent.USER_SYSTEM_PROMPT
+                        toolEventMessageProvider
                 )
-                : new MusicAgent(
+                : new ShopAssistantAgent(
                         model,
                         callbacks,
                         executor,
-                        toolEventMessageProvider,
-                        AgentType.MUSIC_USER,
-                        "approval-resume-test",
-                        MusicAgent.USER_SYSTEM_PROMPT
+                        toolEventMessageProvider
                 ) {
                     @Override
                     public SseEmitter createResumeEmitter(AgentRunContext ctx) {
@@ -1128,12 +1105,12 @@ class ApprovalResumeIntegrationTest {
     }
 
     private String createArgs(String name) {
-        return "{\"name\":\"" + name + "\",\"songIds\":[1001,1002]}";
+        return "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}";
     }
 
     private long playlistCount() {
         Long value = jdbcTemplate.queryForObject(
-                "SELECT COUNT(*) FROM music_playlist", Long.class);
+                "SELECT COUNT(*) FROM shop_order WHERE buyer_id = ?", Long.class, USER);
         return value == null ? 0L : value;
     }
 

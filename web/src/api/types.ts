@@ -21,8 +21,8 @@ export type AgentState =
   | 'TIMED_OUT'
   | 'MAX_STEPS_REACHED'
 
-/** 音乐相关的两个入口，对应 AgentType */
-export type MusicEntry = 'MUSIC_USER' | 'MUSIC_ADMIN'
+/** 电商 Agent 入口类型，对应后端 AgentType */
+export type ShopAgentEntry = 'SHOP_ASSISTANT' | 'AFTER_SALES'
 
 export interface AgentRunVO {
   runId: string
@@ -63,6 +63,7 @@ export type AgentEventType =
   | 'step'
   | 'tool_start'
   | 'tool_result'
+  | 'structured_data'
   | 'final_answer'
   | 'error'
   | 'done'

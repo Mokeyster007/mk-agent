@@ -2,9 +2,9 @@ package com.example.mkagent.approval;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
 import com.example.mkagent.agent.AgentTaskRegistry;
-import com.example.mkagent.music.MusicSeedInitializer;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
 import com.example.mkagent.resilience.AgentConcurrencyGuard;
+import com.example.mkagent.shop.ShopSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -69,7 +69,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Timeout(90)
 class ApprovalPauseSseIntegrationTest {
 
-    private static final String USER = MusicSeedInitializer.USER_ALICE;
+    private static final String USER = ShopSeedInitializer.BUYER_SHOP_ONLY;
 
     @LocalServerPort
     private int port;
@@ -97,17 +97,17 @@ class ApprovalPauseSseIntegrationTest {
         scriptedChatModel.calls.set(0);
 
         Mockito.when(approvalToolPolicy.isEnabled()).thenReturn(true);
-        Mockito.when(approvalToolPolicy.requiresApproval("search_songs")).thenReturn(true);
+        Mockito.when(approvalToolPolicy.requiresApproval("search_products")).thenReturn(true);
         Mockito.when(approvalToolPolicy.anyRequiresApproval(Mockito.anyList()))
                 .thenReturn(true);
         Mockito.when(approvalToolPolicy.requiredToolNames())
-                .thenReturn(Set.of("search_songs"));
+                .thenReturn(Set.of("search_products"));
     }
 
     @Test
     @DisplayName("命中写工具：SSE 以 approval_required + done 结束，任务停在 WAITING_APPROVAL")
     void pauseEndsStreamWithoutTerminalState() throws Exception {
-        String body = request("/ai/music/chat", USER, "帮我找几首和夜有关的歌");
+        String body = request("/ai/shop/chat", USER, "帮我找几款 400 元以内的无线键盘");
 
         int statusAt = body.indexOf("event:status");
         int approvalAt = body.indexOf("event:approval_required");
@@ -153,7 +153,7 @@ class ApprovalPauseSseIntegrationTest {
 
         String summaryText = approval.get("summary_text").toString();
         assertFalse(summaryText.isBlank(), "摘要不能为空");
-        assertFalse(summaryText.contains("\"q\""),
+        assertFalse(summaryText.contains("\"keyword\""),
                 "摘要不得包含参数原文，实际：" + summaryText);
 
         // 检查点：history 只有 system + user，pending 调用完整
@@ -163,7 +163,7 @@ class ApprovalPauseSseIntegrationTest {
 
         ApprovalCheckpoint checkpoint = CheckpointCodec.decode(payload);
         assertEquals(1, checkpoint.pendingToolCalls().size());
-        assertEquals("search_songs", checkpoint.pendingToolCalls().get(0).name());
+        assertEquals("search_products", checkpoint.pendingToolCalls().get(0).name());
         assertEquals(2, checkpoint.messages().size(),
                 "history 只含 system + user");
         assertNotNull(checkpoint.pendingAssistant(), "pendingAssistant 不能为空");
@@ -233,8 +233,8 @@ class ApprovalPauseSseIntegrationTest {
                             "",
                             Map.of(),
                             List.of(new AssistantMessage.ToolCall(
-                                    "call-1", "function", "search_songs",
-                                    "{\"q\":\"夜\"}"))))),
+                                    "call-1", "function", "search_products",
+                                    "{\"keyword\":\"键盘\"}"))))),
                     ChatResponseMetadata.builder()
                             .model("stub-model")
                             .usage(new StubUsage(10, 5))

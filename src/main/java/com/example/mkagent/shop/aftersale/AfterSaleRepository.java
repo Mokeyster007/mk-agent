@@ -92,6 +92,48 @@ public class AfterSaleRepository {
             rs.getString("note"),
             toLocal(rs.getTimestamp("created_at")));
 
+    private static final RowMapper<AfterSaleDecision> DECISION_MAPPER =
+            (rs, rowNum) -> new AfterSaleDecision(
+                    rs.getLong("id"),
+                    rs.getLong("return_id"),
+                    AfterSaleStatus.parse(rs.getString("decision")),
+                    rs.getString("reason"),
+                    rs.getString("decided_by"),
+                    toLocal(rs.getTimestamp("decided_at")));
+
+    private static final String SELECT_RECEIPT = """
+            SELECT id, receipt_no, return_id, order_item_id, received_qty,
+                   qualified_qty, damaged_qty, note, operator_id, created_at
+            FROM shop_aftersale_receipt
+            """;
+
+    private static final RowMapper<AfterSaleReceipt> RECEIPT_MAPPER = (rs, rowNum) ->
+            new AfterSaleReceipt(
+                    rs.getLong("id"),
+                    rs.getString("receipt_no"),
+                    rs.getLong("return_id"),
+                    rs.getLong("order_item_id"),
+                    rs.getInt("received_qty"),
+                    rs.getInt("qualified_qty"),
+                    rs.getInt("damaged_qty"),
+                    rs.getString("note"),
+                    rs.getString("operator_id"),
+                    toLocal(rs.getTimestamp("created_at")));
+
+    private static final String SELECT_REFUND = """
+            SELECT id, refund_no, return_id, amount_cents, operator_id, created_at
+            FROM shop_aftersale_refund
+            """;
+
+    private static final RowMapper<AfterSaleRefund> REFUND_MAPPER = (rs, rowNum) ->
+            new AfterSaleRefund(
+                    rs.getLong("id"),
+                    rs.getString("refund_no"),
+                    rs.getLong("return_id"),
+                    rs.getLong("amount_cents"),
+                    rs.getString("operator_id"),
+                    toLocal(rs.getTimestamp("created_at")));
+
     private final JdbcTemplate jdbcTemplate;
 
     public AfterSaleRepository(JdbcTemplate jdbcTemplate) {
@@ -183,6 +225,55 @@ public class AfterSaleRepository {
                 returnId);
     }
 
+    /**
+     * 客服视角的退货单分页（**不带 buyer_id 过滤**）。
+     *
+     * <p>为什么客服可以看全部：这是单店 demo，客服就是这家店的处理人，
+     * 把"买家所有权"规则套到客服身上会得出"客服只能处理自己的退货申请"这种
+     * 没有意义的结论。真正的多租户隔离应该在店铺维度上做，不是在这里。
+     *
+     * @param status 为空表示全部
+     */
+    public List<AfterSaleReturn> findReturnsForAdmin(String status, int limit, int offset) {
+        if (status == null || status.isBlank()) {
+            return jdbcTemplate.query(
+                    SELECT_RETURN + " ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
+                    RETURN_MAPPER,
+                    limit,
+                    offset);
+        }
+        return jdbcTemplate.query(
+                SELECT_RETURN + " WHERE r.status = ? ORDER BY r.created_at DESC, r.id DESC LIMIT ? OFFSET ?",
+                RETURN_MAPPER,
+                status,
+                limit,
+                offset);
+    }
+
+    /** 客服视角的退货单总数（分页用）。 */
+    public long countReturnsForAdmin(String status) {
+        Long count = (status == null || status.isBlank())
+                ? jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM shop_aftersale_return", Long.class)
+                : jdbcTemplate.queryForObject(
+                        "SELECT COUNT(*) FROM shop_aftersale_return WHERE status = ?",
+                        Long.class,
+                        status);
+        return count == null ? 0L : count;
+    }
+
+    /** 某退货单的决策记录（没有则空）。 */
+    public Optional<AfterSaleDecision> findDecision(long returnId) {
+        return jdbcTemplate.query(
+                """
+                        SELECT id, return_id, decision, reason, decided_by, decided_at
+                        FROM shop_aftersale_decision
+                        WHERE return_id = ?
+                        """,
+                DECISION_MAPPER,
+                returnId).stream().findFirst();
+    }
+
     // ---------------------------------------------------------------
     // 写：事务内（调用方必须已开启事务）
     // ---------------------------------------------------------------
@@ -197,8 +288,11 @@ public class AfterSaleRepository {
      */
     public Optional<LockedItem> lockOrderItem(long orderItemId) {
         List<LockedItem> rows = jdbcTemplate.query(
-                "SELECT id, quantity FROM shop_order_item WHERE id = ? FOR UPDATE",
-                (rs, rowNum) -> new LockedItem(rs.getLong("id"), rs.getInt("quantity")),
+                "SELECT id, quantity, unit_price_cents FROM shop_order_item WHERE id = ? FOR UPDATE",
+                (rs, rowNum) -> new LockedItem(
+                        rs.getLong("id"),
+                        rs.getInt("quantity"),
+                        rs.getLong("unit_price_cents")),
                 orderItemId);
         return rows.stream().findFirst();
     }
@@ -250,6 +344,61 @@ public class AfterSaleRepository {
         return rows.stream().findFirst();
     }
 
+    /**
+     * 条件状态转换：只有当前状态仍是 {@code from} 时才改。
+     *
+     * <p>这是"只有赢得决策权的操作可以继续"的唯一判据：
+     * 返回 1 表示这一笔赢了（可以往下释放额度、写决策、写事件），
+     * 返回 0 表示别人已经决策过（必须原样退出，不碰额度）。
+     *
+     * <p>用它而不是"先 SELECT 判断再 UPDATE"：
+     * 两步之间会插进另一个事务，两个请求都会认为自己是第一个。
+     */
+    public int transitionStatus(long returnId, AfterSaleStatus from, AfterSaleStatus to) {
+        return jdbcTemplate.update("""
+                UPDATE shop_aftersale_return
+                   SET status = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND status = ?
+                """, to.name(), returnId, from.name());
+    }
+
+    /**
+     * 释放额度（驳回时用）。
+     *
+     * <p>条件 {@code reserved_qty >= ?} 是防负数的关键：
+     * 即使前面的重读被绕过，也只会更新 0 行，调用方据此整笔回滚，
+     * 而不是把 {@code reserved_qty} 减成负数再靠 CHECK 抛约束冲突。
+     *
+     * @return 影响行数；0 表示额度不足以释放（数据异常，调用方必须失败）
+     */
+    public int releaseQuota(long orderItemId, int quantity) {
+        return jdbcTemplate.update("""
+                UPDATE shop_aftersale_quota
+                   SET reserved_qty = reserved_qty - ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE order_item_id = ? AND reserved_qty >= ?
+                """, quantity, orderItemId, quantity);
+    }
+
+    /**
+     * 写决策记录。
+     *
+     * <p>调用方必须已经赢得状态转换：{@code uk(return_id)} 是兜底，
+     * 不是去重手段——靠撞唯一键来处理重试，会把"重复提交"变成一条
+     * 事务中止的错误，而不是一个可解释的 409。
+     */
+    public void insertDecision(
+            long returnId,
+            AfterSaleStatus decision,
+            String reason,
+            String decidedBy
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_decision
+                    (return_id, decision, reason, decided_by, decided_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, returnId, decision.name(), reason, decidedBy);
+    }
+
     /** 插入退货单，返回自增 id。 */
     public long insertReturn(
             String returnNo,
@@ -289,6 +438,185 @@ public class AfterSaleRepository {
                     (return_id, event_type, actor_id, note, created_at)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, returnId, type, actorId, note);
+    }
+
+    // ---------------------------------------------------------------
+    // B2：收货 / 验货
+    // ---------------------------------------------------------------
+
+    /** 某退货单的全部收货记录（按写入顺序）。 */
+    public List<AfterSaleReceipt> findReceipts(long returnId) {
+        return jdbcTemplate.query(
+                SELECT_RECEIPT + " WHERE return_id = ? ORDER BY id",
+                RECEIPT_MAPPER,
+                returnId);
+    }
+
+    /**
+     * 累计实收数量。
+     *
+     * <p>必须在**持有订单行锁之后**读：锁之前读到的累计值可能已经被
+     * 另一批收货改掉，用它判断"还能收几件"会放过一次超收。
+     */
+    public int sumReceivedQty(long returnId) {
+        Integer sum = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(SUM(received_qty), 0) FROM shop_aftersale_receipt WHERE return_id = ?",
+                Integer.class,
+                returnId);
+        return sum == null ? 0 : sum;
+    }
+
+    /**
+     * 一批退货单的累计实收（列表页用，避免每行一次查询）。
+     *
+     * @return key = return_id；没有收货记录的退货单不出现在结果里
+     */
+    public java.util.Map<Long, Integer> receivedQtyByReturns(List<Long> returnIds) {
+        if (returnIds == null || returnIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(returnIds.size(), "?"));
+        java.util.Map<Long, Integer> result = new java.util.HashMap<>();
+        jdbcTemplate.query(
+                "SELECT return_id, SUM(received_qty) AS received"
+                        + " FROM shop_aftersale_receipt"
+                        + " WHERE return_id IN (" + placeholders + ")"
+                        + " GROUP BY return_id",
+                rs -> {
+                    result.put(rs.getLong("return_id"), rs.getInt("received"));
+                },
+                returnIds.toArray());
+        return result;
+    }
+
+    /** 按幂等键找收货记录（重放用）。 */
+    public Optional<StoredReceipt> findReceiptByRequestKey(String requestKey) {
+        return jdbcTemplate.query(
+                """
+                        SELECT id, receipt_no, return_id, order_item_id, received_qty,
+                               qualified_qty, damaged_qty, note, operator_id, created_at,
+                               request_hash
+                        FROM shop_aftersale_receipt
+                        WHERE request_key = ?
+                        """,
+                (rs, rowNum) -> new StoredReceipt(
+                        rs.getString("request_hash"),
+                        RECEIPT_MAPPER.mapRow(rs, rowNum)),
+                requestKey).stream().findFirst();
+    }
+
+    public Optional<AfterSaleReceipt> findReceiptById(long receiptId) {
+        return jdbcTemplate.query(
+                SELECT_RECEIPT + " WHERE id = ?",
+                RECEIPT_MAPPER,
+                receiptId).stream().findFirst();
+    }
+
+    /**
+     * 写一条收货记录，返回自增 id。
+     *
+     * <p>{@code uk(request_key)} 是"同一次收货动作只落一条"的数据库兜底；
+     * 正常路径由写入前的幂等预检 + 行锁挡住，**不靠撞唯一键**来处理重试。
+     */
+    public long insertReceipt(
+            String receiptNo,
+            long returnId,
+            long orderItemId,
+            int receivedQty,
+            int qualifiedQty,
+            int damagedQty,
+            String note,
+            String requestKey,
+            String requestHash,
+            String operatorId
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_receipt
+                    (receipt_no, return_id, order_item_id, received_qty, qualified_qty,
+                     damaged_qty, note, request_key, request_hash, operator_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                receiptNo, returnId, orderItemId, receivedQty, qualifiedQty,
+                damagedQty, note, requestKey, requestHash, operatorId);
+
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM shop_aftersale_receipt WHERE receipt_no = ?", Long.class, receiptNo);
+        if (id == null) {
+            throw new IllegalStateException("收货记录插入后取不到 id：" + receiptNo);
+        }
+        return id;
+    }
+
+    /** 幂等键命中时读到的"首次结果"。 */
+    public record StoredReceipt(String requestHash, AfterSaleReceipt receipt) {
+    }
+
+    // ---------------------------------------------------------------
+    // B3：模拟退款
+    // ---------------------------------------------------------------
+
+    /** 某退货单的模拟退款（没有则空；一张退货单最多一笔）。 */
+    public Optional<AfterSaleRefund> findRefundByReturnId(long returnId) {
+        return jdbcTemplate.query(
+                SELECT_REFUND + " WHERE return_id = ?",
+                REFUND_MAPPER,
+                returnId).stream().findFirst();
+    }
+
+    /**
+     * 一批退货单的模拟退款（列表 / 工具用，避免每行一次查询）。
+     *
+     * @return key = return_id；没退过款的退货单不出现在结果里
+     */
+    public java.util.Map<Long, AfterSaleRefund> findRefundsByReturns(List<Long> returnIds) {
+        if (returnIds == null || returnIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        String placeholders = String.join(",", java.util.Collections.nCopies(returnIds.size(), "?"));
+        java.util.Map<Long, AfterSaleRefund> result = new java.util.HashMap<>();
+        jdbcTemplate.query(
+                SELECT_REFUND + " WHERE return_id IN (" + placeholders + ")",
+                rs -> {
+                    AfterSaleRefund refund = REFUND_MAPPER.mapRow(rs, 0);
+                    result.put(refund.returnId(), refund);
+                },
+                returnIds.toArray());
+        return result;
+    }
+
+    /**
+     * 写一笔模拟退款，返回自增 id。
+     *
+     * <p>{@code uk(return_id)} 是"一张退货单最多一笔"的数据库兜底：
+     * 并发重复退款时只有一个能插入成功，输的那个由服务层翻译成 409。
+     *
+     * @throws org.springframework.dao.DuplicateKeyException 这张退货单已经退过款
+     */
+    public long insertRefund(
+            String refundNo,
+            long returnId,
+            long amountCents,
+            String operatorId
+    ) {
+        jdbcTemplate.update("""
+                INSERT INTO shop_aftersale_refund
+                    (refund_no, return_id, amount_cents, operator_id, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, refundNo, returnId, amountCents, operatorId);
+
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT id FROM shop_aftersale_refund WHERE refund_no = ?", Long.class, refundNo);
+        if (id == null) {
+            throw new IllegalStateException("模拟退款记录插入后取不到 id：" + refundNo);
+        }
+        return id;
+    }
+
+    public Optional<AfterSaleRefund> findRefundById(long refundId) {
+        return jdbcTemplate.query(
+                SELECT_REFUND + " WHERE id = ?",
+                REFUND_MAPPER,
+                refundId).stream().findFirst();
     }
 
     // ---------------------------------------------------------------
@@ -333,10 +661,11 @@ public class AfterSaleRepository {
     /**
      * 事务里锁住的订单行。
      *
-     * @param id       订单行 id
-     * @param quantity 已购数量（额度上限）
+     * @param id             订单行 id
+     * @param quantity       已购数量（额度上限）
+     * @param unitPriceCents 成交单价快照（分）；模拟退款按它算，**不读请求、不读退货单估算值**
      */
-    public record LockedItem(long id, int quantity) {
+    public record LockedItem(long id, int quantity, long unitPriceCents) {
     }
 
     /**

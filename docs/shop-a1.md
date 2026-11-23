@@ -3,6 +3,11 @@
 > 本轮只做到 **「退货申请已提交、可查」**。
 > 客服审核、仓库验收、退货入库、退款、Redis / MQ / 外部 ERP **都没有做**，
 > A1 也**不修改可售库存、不写退货入库流水**。
+>
+> 📌 **后续阶段**：客服批准 / 驳回已在 **B1** 实施（`docs/shop-b1.md`）。
+> B1 把状态 `CHECK` 扩成 `SUBMITTED / APPROVED / REJECTED`，并新增
+> `shop_aftersale_decision` 表；本文中"状态只有一种"等描述记录的是 **A1 交付时**的事实，
+> 迁移与扩展方式见 `docs/shop-b1.md` 第 5、6 节。
 
 ---
 
@@ -114,6 +119,9 @@ remaining = max(0, purchased - occupied)
 数量就是 `return.quantity`。客服驳回 / 释放额度不在本轮——所以本轮**没有**释放路径，
 额度只增不减（除非事务回滚）。
 
+> B1 之后不变式变成：`reserved_qty = Σ(status ∈ {SUBMITTED, APPROVED} 的 quantity)`。
+> 批准仍占额度（实物还在买家手里），**只有驳回**释放。见 `docs/shop-b1.md` 第 4.1 节。
+
 判定顺序（`AfterSaleEligibility`，服务端唯一一份）：
 
 1. 订单行存在且属于当前买家 → 否则 `ORDER_NOT_FOUND`（HTTP 404，不是 403）；
@@ -126,6 +134,20 @@ remaining = max(0, purchased - occupied)
 
 **请求体里没有 `buyerId` / 单价 / 签收时间 / 已购数量**：DTO 里没有这些字段，
 传了也绑不进来。签收时间与已购数量只从数据库读。
+
+### 4.1 金额：预览与提交共用一份计算
+
+`refundCents = unit_price_cents × quantity`，**整数分**，由 `AfterSaleMoney` 一处实现，
+预览与提交都调它（`Math.multiplyExact`，溢出抛异常而不是静默回绕）。
+
+| 情况 | 预览 | 提交 |
+| --- | --- | --- |
+| 正常 | 显示金额（与提交算出的完全一致） | 落库同一个数 |
+| 溢出 | `eligible=false`、`code=REFUND_AMOUNT_OUT_OF_RANGE`、金额显示「—」 | `400` 同一个码，不建单、不占额度 |
+
+早期的预览用的是裸乘法，溢出会回绕成负数（页面显示「预计退款 -¥21474836.48」），
+而提交那边直接拒绝——同一笔申请两个入口给出互相矛盾的结果。
+现在两处共用一份实现，`AfterSaleAmountConsistencyTest` 同时钉住"正常一致"和"溢出两边都拒"。
 
 ---
 
@@ -153,6 +175,17 @@ remaining = max(0, purchased - occupied)
 | 方法 | 路径 | 权限 | 说明 |
 | --- | --- | --- | --- |
 | `GET` | `/api/ai/aftersale/chat?message=…&conversationId=…` | 买家身份 | SSE；不带 `conversationId` 是单轮，带上就是同一会话的下一轮 |
+| `POST` | `/api/shop/aftersale/conversations` | 买家身份 | 新建**售后**会话（先建再发，刷新后能接回来） |
+| `GET` | `/api/shop/aftersale/conversations` | 买家身份 | 我的售后会话（只含 `AFTER_SALES` 领域） |
+| `GET` | `/api/shop/aftersale/conversations/{id}` | 买家身份 | 会话详情；刷新后靠它恢复对话与待确认的卡 |
+
+**为什么售后有自己的一套会话接口**：`/api/ai/conversations` 的守卫要求 `music_user`。
+合法的商城买家完全可能没开通音乐服务，用那个入口会 403 → 建不出会话 → 追问退化成单轮。
+修法不是放宽音乐守卫（那会让音乐入口对非音乐用户开放），也不是给买家补一条 `music_user`
+（那是伪造身份），而是**另开一个领域受限的入口**：守卫换成买家身份，会话领域钉死 `AFTER_SALES`。
+
+两个方向的跨领域读取都是 **404**（与"不存在"同一句文案，不泄露它是否存在）：
+音乐会话 id 拿到售后入口读不到，售后会话 id 拿到 `/ai/conversations` 也读不到。
 
 审批复用现有接口，**没有新增**：
 
@@ -181,9 +214,10 @@ remaining = max(0, purchased - occupied)
    - 缺 `X-User-Id` → 401；
    - demo 身份关闭且无可信身份 → 403 `SHOP_IDENTITY_NOT_CONFIGURED`（**先于**角色判断）；
    - `shop_user` 里没有这个人 → 403 `SHOP_USER_NOT_PROVISIONED`。
-2. 别人的订单 / 别人的退货单一律 **404**（不是 403）：403 等于告诉对方"这单存在"。
+2. 别人的订单 / 别人的退货单 / 别人的会话一律 **404**（不是 403）：403 等于告诉对方"它存在"。
 3. 审批、恢复、重放、详情都校验归属：`ApprovalResumeService` 按 run 的 owner 判定，
    `AfterSaleService` 按 `buyer_id` 过滤；**操作人不来自模型参数**。
+   会话同理：`ConversationService` 同时校验 `user_id` 与 `agent_type`。
 4. 写工具的身份只来自 `AgentRunContextHolder`，它在 `runStream` 的同步段被冻结，
    模型无法改。
 5. **本轮不是真实认证上线**：`X-User-Id` 仍是本地 demo 边界内的占位方案。
@@ -208,6 +242,24 @@ remaining = max(0, purchased - occupied)
   改订单/数量/原因就**换新**（否则会撞上"同键不同参数"）。
 - Agent 的幂等键来自框架：`runId + step + toolCallId`，因此"同一次确认被重试"
   天然是同一个键，而"用户重新发起一次申请"是新的 `runId` → 新的键。
+
+### 7.1 只有"幂等占位行"的冲突才算命中
+
+`submitForm` 早期版本 catch 了笼统的 `DuplicateKeyException`，于是**退货单号重号**、
+**事件 `(return_id, event_type)` 重复**这类真实写入失败，会被当成"同一提交正在处理中"——
+用户看到"稍等再试"，而那次提交其实根本没成功，等多久都不会好。
+
+现在只有占位行的冲突会被翻译成 `IdempotencyKeyConflictException`，也**只有它**触发回放：
+
+| 冲突位置 | 含义 | 处理 |
+| --- | --- | --- |
+| `shop_aftersale_idempotency.idempotency_key` | 同一次提交已经（或正在）被处理 | 回放首次结果，返回原单号 |
+| `shop_aftersale_return.return_no` | 退货单号撞了（数据异常） | `409 RETURN_WRITE_CONFLICT`，不回放 |
+| `shop_aftersale_event (return_id, event_type)` | 事件重复（数据异常） | `409 RETURN_WRITE_CONFLICT`，不回放 |
+
+两条路径都**整体回滚**：额度不占、退货单不留、幂等占位行也不留，
+因此同一个 `clientRequestId` 重试不会被误判成"已经提交过"。
+`AfterSaleConflictClassificationTest` 用同一组参数分别覆盖这两条路径。
 
 ---
 
@@ -295,11 +347,14 @@ cd web && npm run dev
 # A1 Agent：工具归属、真实审批暂停/批准/拒绝、卡过期重校验、模型不可用
 ./mvnw test -Dtest='AfterSaleAgentToolTest,AfterSaleApprovalFlowTest,AfterSaleModelIndependenceTest'
 
+# A1 收尾：会话领域与归属、异常归类、金额一致
+./mvnw test -Dtest='AfterSaleConversationIntegrationTest,AfterSaleConflictClassificationTest,AfterSaleAmountConsistencyTest'
+
 # 白名单与守卫（含音乐侧不回归）
 ./mvnw test -Dtest='WriteToolGuardTest,AgentToolWhitelistTest,ApprovalSummaryBuilderTest'
 
-# 全量默认套件
-./mvnw test
+# 全量默认套件（显式不继承模型密钥，避免凭据类用例被本机环境影响）
+env -u MKAGENT_MODEL_API_KEY ./mvnw test
 
 # 真实 PostgreSQL 16（一次性容器，默认构建排除）
 ./mvnw -Ppg test -Dtest='AfterSalePostgres*'
@@ -309,13 +364,16 @@ cd web && npm run dev
 ### 10.3 浏览器验收
 
 ```bash
-cd web && node tools/e2e-aftersale.mjs        # A1 主链路：买两把 → 发货 → 签收 → 对话退一把（24 项）
-cd web && node tools/e2e-aftersale-form.mjs   # 拒绝零写入 + 普通表单（15 项）
-cd web && node tools/e2e-shop.mjs             # A0 复跑
+cd web && node tools/e2e-aftersale.mjs           # A1 主链路（music-user-1，24 项）
+cd web && node tools/e2e-aftersale-form.mjs      # 拒绝零写入 + 普通表单（15 项）
+cd web && node tools/e2e-aftersale-shopbuyer.mjs # 纯商城买家多轮 + 刷新恢复（26 项）
+cd web && node tools/e2e-shop.mjs                # A0 复跑（19 项）
 ```
 
-两个 A1 脚本**各自新建一单**，互不依赖，但都假设"该买家在这些订单上没有售后记录"。
-重复跑会继续消耗 SKU 库存；库存见底时先清 `tmp/` 下的 H2 文件库再起后端。
+四个脚本**各自新建订单**，互不依赖，但都假设"该买家在这些订单上没有售后记录"。
+重复跑会持续消耗 SKU 库存；库存见底时换一个新的 H2 文件库再起后端。
+`e2e-aftersale-shopbuyer.mjs` 用 `shop-user-1`，它是**只有商城身份**的买家，
+因此能真正覆盖"不是音乐用户也能多轮售后"这条路径。
 
 ---
 
@@ -334,6 +392,9 @@ cd web && node tools/e2e-shop.mjs             # A0 复跑
 | `AfterSaleAgentToolTest` | 8 | 8/8 通过 |
 | `AfterSaleApprovalFlowTest` | 6 | 6/6 通过 |
 | `AfterSaleModelIndependenceTest` | 1 | 1/1 通过 |
+| `AfterSaleConversationIntegrationTest` | 6（收尾新增） | 6/6 通过 |
+| `AfterSaleConflictClassificationTest` | 3（收尾新增） | 3/3 通过 |
+| `AfterSaleAmountConsistencyTest` | 3（收尾新增） | 3/3 通过 |
 | `WriteToolGuardTest` | 5 | 5/5 通过 |
 | `AgentToolWhitelistTest` | 7 | 7/7 通过 |
 | `ApprovalSummaryBuilderTest` | 6 | 6/6 通过 |
@@ -353,7 +414,13 @@ cd web && node tools/e2e-shop.mjs             # A0 复跑
 - 确认前不建单；批准后恰好一单；拒绝零写入；重复批准 409 `ALREADY_APPROVED`；
 - 他人批准/拒绝 404；他人订单预览/提交 404；列表里看不到别人的单；
 - 工具无上下文失败关闭（`NO_CONTEXT_MESSAGE` / `NO_USER_MESSAGE`）；
-- 模型不可用时表单仍能提交与查询（`@Primary` 换成必抛异常的模型）。
+- 模型不可用时表单仍能提交与查询（`@Primary` 换成必抛异常的模型）；
+- **纯商城买家**（`shop-user-1`，不在 `music_user` 里）能在售后入口建会话、读详情、列列表，
+  而音乐入口对它仍然 403；
+- **领域隔离**：同一个人的音乐会话与售后会话两个方向都读不到（都是 404）；
+- **异常归类**：只有幂等占位行冲突才回放，退货单/事件的唯一键冲突是 `RETURN_WRITE_CONFLICT`，
+  且失败后零残留、同 `clientRequestId` 重试能正常建单；
+- **金额一致**：正常金额预览与提交同值，溢出时预览不下发金额（「—」）、提交 400 不建单。
 
 ### 11.2 真实 PostgreSQL 16
 
@@ -424,28 +491,52 @@ A1 改了 `AgentToolProvider` / `ToolRegistryConfig` / `ApprovalSummary` / schem
 → 只有 1 笔 `OUTBOUND_SHIPMENT -2` 流水 → 签收库存不变 → 刷新后仍为已签收。
 **A0 无回归。**
 
+#### 11.4.4 纯商城买家 `node tools/e2e-aftersale-shopbuyer.mjs` → 26/26 通过
+
+用 `shop-user-1`（只有 `shop_user`，**不在** `music_user` 里）走完整多轮链路：
+
+| 断言 | 实测 |
+| --- | --- |
+| 下单 / 发货 / 签收 | `SO20261122185055-5A35` 等，全程走页面 |
+| 售后页没有「会话没建成」的降级提示 | 无 |
+| 第一轮只说"我要退货" → 追问 | 助手回答"请提供订单号…"，**没有出卡** |
+| 第一轮不建单 | `returns=0` |
+| 第二轮补齐参数 → 确认卡 | 订单号 / 1 件 / 键盘按键失灵 / 剩余 2 件 |
+| 确认前不建单、不占额度 | `returns=0`，`0/2` |
+| **刷新后两轮对话都恢复** | `turns=2` |
+| **刷新后确认卡还在，仍是「待确认」** | 内容仍是服务端摘要（订单号 + 原因） |
+| 恢复后仍未建单、未占额度 | `returns=0`，`occupied=0` |
+| 在恢复出来的卡上批准 → 真实单号 | `RT20261122184933-C4D3` |
+| 剩余可退额度 | `{"occupied":1,"remaining":1}` |
+| 再刷新，单仍在 | 是 |
+| 另一个买家：看不到单、恢复不到会话 | `visible=0`，`turns=0` |
+| 控制台错误 | 无 |
+
+> 这一段能成立的前提是收尾修的两处：会话按领域隔离 + 售后有自己的会话入口。
+> 在此之前，这个身份在售后页会 403 → 退化单轮 → 第二轮追问失忆。
+
 ### 11.5 全量默认套件
 
-`./mvnw -o test` → **882 项，1 失败**。
-
-失败项 `ModelCredentialConfigTest.templatePlaceholderFallsBackToSdkEnvironmentVariable`
-**与本轮改动无关**：本机设置了 `MKAGENT_MODEL_API_KEY`，而该用例断言"占位符回退后凭据应为空"。
-去掉该环境变量后复跑：
-
 ```
-env -u MKAGENT_MODEL_API_KEY ./mvnw -o test -Dtest=ModelCredentialConfigTest   # 5/5 通过
+env -u MKAGENT_MODEL_API_KEY ./mvnw -o test
 ```
+
+→ **894 项，0 失败，0 错误，BUILD SUCCESS**（不继承模型密钥的干净进程）。
+
+> 之前那次"882 项 / 1 失败"是 `ModelCredentialConfigTest` 受本机
+> `MKAGENT_MODEL_API_KEY` 影响，与本轮改动无关；这次按验收要求显式去掉该变量后全绿。
+> 894 = 882 + 12 个收尾新增用例。
 
 ### 11.6 汇总
 
 | 层次 | 范围 | 结果 |
 | --- | --- | --- |
-| 自动化测试（H2，模型桩） | A1 业务 + Agent + 白名单 + 守卫 + A0 回归 | 全通过（见 §11.1） |
+| 自动化测试（H2，模型桩） | A1 业务 + Agent + 会话领域 + 异常归类 + 金额 + 白名单 + A0 回归 | 全通过（见 §11.1） |
 | 真实 PostgreSQL 16（一次性容器） | A1 并发/回滚/归属 + A0-PG 回归 | 5/5 + 13/13 通过（见 §11.2） |
-| 前端单测 / 类型 / 构建 | vitest 21 文件 173 用例 | 全通过（见 §11.3） |
-| 浏览器验收（真实 Chrome） | A1 主链路 24 项 + 拒绝/表单 15 项 + A0 回归 19 项 | 58/58 通过（见 §11.4） |
-| 真实模型联调 | 真实 qwen-plus（`modelCalls=4~5`，`state=SUCCEEDED`） | 确认卡由模型真实产出，单号真实落库 |
-| 全量默认套件 | 882 项 | 1 项预存在环境变量失败（见 §11.5） |
+| 前端单测 / 类型 / 构建 | vitest 21 文件 177 用例 | 全通过（见 §11.3） |
+| 浏览器验收（真实 Chrome） | 主链路 24 + 拒绝/表单 15 + A0 回归 19 + 纯商城买家 26 | 84/84 通过（见 §11.4） |
+| 真实模型联调 | 真实 qwen-plus | 确认卡由模型真实产出，单号真实落库 |
+| 全量默认套件 | 894 项（不继承模型密钥） | 0 失败 |
 
 **未验证 / 不在本轮**：真实认证（`X-User-Id` 仍可伪造）、客服审批与额度释放、退货入库、
 退款、多实例部署下的限流、移动端布局。
@@ -464,14 +555,18 @@ env -u MKAGENT_MODEL_API_KEY ./mvnw -o test -Dtest=ModelCredentialConfigTest   #
 3. **不碰库存**：A1 不改 `shop_inventory`、不写 `shop_stock_movement`。
    退货入库是 B 阶段的事。
 4. **额度只增不减**：因为本轮没有驳回路径，额度一旦占用就只能靠事务回滚恢复。
-5. **会话依赖现有 `/api/ai/conversations`**：该入口的身份守卫是 music 用户。
-   demo 身份同时是 music 用户与 shop 用户，所以演示无感；
-   但"只有商城身份、不是音乐用户"的账号目前只能单轮问答（前端会明确提示）。
+5. **会话有自己的领域维度**（收尾修复）：`agent_conversation.agent_type` 区分
+   `MUSIC_USER` / `AFTER_SALES`，售后走 `/api/shop/aftersale/conversations`。
+   纯商城买家（`shop-user-1`）现在可以正常多轮，音乐入口对它仍然 403——
+   这不是"放宽守卫"，是另开了一个领域受限的入口。
 6. **退货窗口是 demo 值**（默认 7 天，`mkagent.shop.return-window-days`），
    不是业务规则，也不含"物流在途"等真实场景。
-7. **金额只有"预计退款"**：`unit_price × quantity`，没有运费、优惠、税费。
+7. **金额只有"预计退款"**：`unit_price × quantity`（整数分，溢出即拒），
+   没有运费、优惠、税费；也**没有真实退款**。
 8. **售后 Agent 的写工具依赖框架幂等存储** `music_tool_idempotency`（历史命名），
    表名带 music 但语义是框架级；改名前请先看 `AfterSaleToolConfig` 的注释。
+9. **恢复只还原文本与待确认的卡**：刷新后不会重放工具进度（历史进度不是当前进度），
+   也不会把已结束的轮次重新执行。
 
 ---
 

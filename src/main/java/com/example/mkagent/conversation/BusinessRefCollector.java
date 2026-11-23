@@ -10,19 +10,15 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 从**真实工具结果**里抽取业务引用，累积到当前 run 的上下文上。
+ * 从**真实工具结果**里抽取业务引用，累积到当前 run 上下文并写回会话。
  *
- * <p>只认工具返回的信封 JSON（{@code {"ok":true,"data":...}}），
- * 不读模型的话。原因很直接：模型可以把歌名说错、把 id 编出来，
- * 而工具结果是数据库查出来的。
- *
- * <p>为什么是静态工具类而不是 Spring Bean：它没有状态、没有依赖，
- * 唯一需要落库的动作（{@code ConversationService#saveRefs}）由调用方
- * （{@code ToolCallAgent}）在同一个位置顺手做掉。少一层注入，
- * 就少一处"装配忘了配"的失败点。
- *
- * <p>失败一律静默：引用只是"让下一轮能听懂指代"的辅助信息，
- * 不能因为它让工具调用失败，也不能因为它改变工具结果本身。
+ * <p>覆盖电商导购与售后两类真实工具结果：
+ * <ul>
+ *   <li>{@code search_products} → 有序候选商品列表（支持“第二款加一把”精确绑定 SKU）；</li>
+ *   <li>{@code preview_checkout} → 最近一次合格结算预览；</li>
+ *   <li>{@code list_my_signed_orders} / {@code get_my_order_detail} → 本人可退订单候选；</li>
+ *   <li>{@code preview_return} → 最近一次合格退货试算。</li>
+ * </ul>
  */
 public final class BusinessRefCollector {
 
@@ -34,14 +30,6 @@ public final class BusinessRefCollector {
     private BusinessRefCollector() {
     }
 
-    /**
-     * 收集一次工具结果。
-     *
-     * @param ctx          当前 run 上下文（引用会累积到它上面）
-     * @param toolName     工具名
-     * @param responseData 工具返回的原始 JSON 字符串
-     * @return 引用是否发生变化；调用方据此决定要不要落库
-     */
     public static boolean collect(AgentRunContext ctx, String toolName, String responseData) {
         if (ctx == null || toolName == null || responseData == null || responseData.isBlank()) {
             return false;
@@ -49,19 +37,10 @@ public final class BusinessRefCollector {
 
         try {
             JsonNode root = MAPPER.readTree(responseData);
-
-            /*
-             * 工具结果是"信封 JSON 的字符串"。某些链路（重试包装 / 框架序列化）
-             * 会再套一层 JSON 字符串，于是 readTree 得到的是一个 TextNode。
-             * 这里剥掉这层，否则 root.path("ok") 永远是缺失的，
-             * 引用会被静默地当成"工具失败"全部丢掉——而且没有任何报错。
-             */
             if (root.isTextual()) {
                 root = MAPPER.readTree(root.asText());
             }
-
             if (!root.path("ok").asBoolean(false)) {
-                // 失败结果不产生任何事实：查不到就是查不到，不能拿错误信息当引用
                 return false;
             }
 
@@ -69,28 +48,59 @@ public final class BusinessRefCollector {
             ConversationRefs before = ctx.getConversationRefs();
 
             switch (toolName) {
-                /*
-                 * 只有**搜索**结果进入"歌曲引用"。
-                 *
-                 * 不让 get_playlist_songs / get_song 覆盖它，是因为用户说的
-                 * "刚才第三首"通常指"刚才搜出来的第三首"。如果中途查了一次
-                 * 某个歌单的曲目（2 首），引用被替换成那 2 首，"第三首"就直接
-                 * 不存在了——真实联调里模型因此答成了"歌单里只有两首"。
-                 * 歌单曲目本来就能用 playlistId 现场查，不需要占用这份引用。
-                 */
-                case "search_songs" ->
-                        ctx.setConversationRefs(before.withSongs(songsOf(data)));
-                case "get_user_playlists" ->
-                        ctx.setConversationRefs(before.withPlaylists(playlistsOf(data)));
-                case "create_playlist" -> {
-                    ConversationRefs.PlaylistRef created = createdPlaylistOf(data);
-                    if (created != null) {
-                        ctx.setConversationRefs(before.withLastPlaylist(created));
+                case "search_products" -> {
+                    JsonNode items = data.has("items") ? data.path("items") : data;
+                    ctx.setConversationRefs(before.withProducts(productsOf(items)));
+                }
+                case "preview_checkout" -> {
+                    if (data.path("eligible").asBoolean(false) && data.path("productId").canConvertToLong()) {
+                        ctx.setConversationRefs(before.withLastCheckoutPreview(
+                                new ConversationRefs.CheckoutPreviewRef(
+                                        data.path("productId").asLong(),
+                                        data.path("sku").asText(""),
+                                        data.path("productName").asText(""),
+                                        data.path("quantity").asInt(1),
+                                        data.path("unitPriceCents").asLong(0L),
+                                        data.path("totalCents").asLong(0L)
+                                )));
+                    }
+                }
+                case "list_my_signed_orders" ->
+                        ctx.setConversationRefs(before.withOrders(ordersOf(data)));
+                case "get_my_order_detail" -> {
+                    String orderNo = data.path("orderNo").asText("");
+                    if (!orderNo.isBlank()) {
+                        ConversationRefs.OrderRef single = new ConversationRefs.OrderRef(
+                                orderNo,
+                                data.path("sku").asText(""),
+                                data.path("productName").asText(""),
+                                data.path("remainingQty").asInt(0),
+                                data.path("remainingQty").asInt(0) > 0
+                                        && "SIGNED".equals(data.path("status").asText(""))
+                        );
+                        List<ConversationRefs.OrderRef> merged = new ArrayList<>();
+                        merged.add(single);
+                        for (ConversationRefs.OrderRef existing : before.orders()) {
+                            if (!orderNo.equals(existing.orderNo())) {
+                                merged.add(existing);
+                            }
+                        }
+                        ctx.setConversationRefs(before.withOrders(merged));
+                    }
+                }
+                case "preview_return" -> {
+                    if (data.path("eligible").asBoolean(false) && !data.path("orderNo").asText("").isBlank()) {
+                        ctx.setConversationRefs(before.withLastReturnPreview(
+                                new ConversationRefs.ReturnPreviewRef(
+                                        data.path("orderNo").asText(""),
+                                        data.path("productName").asText(""),
+                                        data.path("requestedQty").asInt(1),
+                                        data.path("reason").asText(""),
+                                        data.path("refundCents").asLong(0L)
+                                )));
                     }
                 }
                 default -> {
-                    // 其他工具不产生引用：
-                    // 它们不改变"用户指的是哪首歌/哪个歌单"。
                     return false;
                 }
             }
@@ -102,74 +112,47 @@ public final class BusinessRefCollector {
         }
     }
 
-    /**
-     * 歌曲列表：{@code [{"id":1001,"title":"城市霓虹",...}]}。
-     *
-     * <p>保留顺序——"第一首""前两首"全靠这个顺序。
-     * 查不到（空数组）时返回空列表，表示"这次没有结果"，
-     * 由 {@link ConversationRefs#withSongs} 清掉旧引用。
-     */
-    private static List<ConversationRefs.SongRef> songsOf(JsonNode data) {
+    private static List<ConversationRefs.ProductRef> productsOf(JsonNode items) {
+        if (!items.isArray()) {
+            return List.of();
+        }
+        List<ConversationRefs.ProductRef> list = new ArrayList<>();
+        for (JsonNode n : items) {
+            if (!n.path("id").canConvertToLong()) {
+                continue;
+            }
+            String sku = n.path("sku").asText("");
+            String name = n.path("name").asText("");
+            if (sku.isBlank() || name.isBlank()) {
+                continue;
+            }
+            list.add(new ConversationRefs.ProductRef(
+                    n.path("id").asLong(),
+                    sku,
+                    name,
+                    n.path("priceCents").asLong(0L),
+                    n.path("available").asInt(0)));
+        }
+        return list;
+    }
+
+    private static List<ConversationRefs.OrderRef> ordersOf(JsonNode data) {
         if (!data.isArray()) {
             return List.of();
         }
-
-        List<ConversationRefs.SongRef> songs = new ArrayList<>();
-        for (JsonNode node : data) {
-            if (!node.path("id").canConvertToLong()) {
+        List<ConversationRefs.OrderRef> list = new ArrayList<>();
+        for (JsonNode n : data) {
+            String orderNo = n.path("orderNo").asText("");
+            if (orderNo.isBlank()) {
                 continue;
             }
-            String title = node.path("title").asText("");
-            if (title.isBlank()) {
-                // 没标题的条目对"指代"没有意义，宁可不收
-                continue;
-            }
-            songs.add(new ConversationRefs.SongRef(node.path("id").asLong(), title));
+            list.add(new ConversationRefs.OrderRef(
+                    orderNo,
+                    n.path("sku").asText(""),
+                    n.path("productName").asText(""),
+                    n.path("remainingQty").asInt(0),
+                    n.path("returnable").asBoolean(false)));
         }
-
-        return songs;
-    }
-
-    /**
-     * 歌单列表：{@code [{"id":2,"name":"周末清晨","songCount":6}]}。
-     */
-    private static List<ConversationRefs.PlaylistRef> playlistsOf(JsonNode data) {
-        if (!data.isArray()) {
-            return List.of();
-        }
-
-        List<ConversationRefs.PlaylistRef> playlists = new ArrayList<>();
-        for (JsonNode node : data) {
-            if (!node.path("id").canConvertToLong()) {
-                continue;
-            }
-            String name = node.path("name").asText("");
-            if (name.isBlank()) {
-                continue;
-            }
-            playlists.add(new ConversationRefs.PlaylistRef(node.path("id").asLong(), name));
-        }
-
-        return playlists;
-    }
-
-    /**
-     * 新建歌单：{@code {"playlistId":33,"name":"...","songCount":1}}。
-     *
-     * <p>注意字段名是 {@code playlistId} 而不是 {@code id}——
-     * 写工具返回的是"刚建出来的歌单"，与查询工具的形状不同。
-     */
-    private static ConversationRefs.PlaylistRef createdPlaylistOf(JsonNode data) {
-        if (!data.isObject() || !data.path("playlistId").canConvertToLong()) {
-            return null;
-        }
-
-        String name = data.path("name").asText("");
-        if (name.isBlank()) {
-            return null;
-        }
-
-        return new ConversationRefs.PlaylistRef(
-                data.path("playlistId").asLong(), name);
+        return list;
     }
 }

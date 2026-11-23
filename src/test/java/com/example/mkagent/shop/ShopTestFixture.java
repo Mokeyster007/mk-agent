@@ -21,16 +21,25 @@ final class ShopTestFixture {
 
     static void reset(JdbcTemplate jdbc) {
         /*
-         * 先清售后（A1），再清订单（A0）：
-         * shop_aftersale_return / quota / event 都有外键指向订单与订单行，
+         * 先清售后（A1 / B1 / B2 / B3），再清订单（A0）：
+         * shop_aftersale_return / quota / event / decision / receipt / refund 都有外键指向订单与订单行，
          * 顺序反了会直接违反外键约束。
+         *
+         * shop_inventory_movement 有外键指向收货记录（B2），
+         * 所以它必须排在收货记录**之前**删除；
+         * shop_aftersale_refund 有外键指向退货单（B3），必须排在退货单之前。
          */
         jdbc.update("DELETE FROM shop_aftersale_event");
+        jdbc.update("DELETE FROM shop_aftersale_decision");
+        jdbc.update("DELETE FROM shop_inventory_movement");
+        jdbc.update("DELETE FROM shop_aftersale_receipt");
+        jdbc.update("DELETE FROM shop_aftersale_refund");
         jdbc.update("DELETE FROM shop_aftersale_return");
         jdbc.update("DELETE FROM shop_aftersale_quota");
         jdbc.update("DELETE FROM shop_aftersale_idempotency");
 
-        jdbc.update("DELETE FROM shop_inventory_movement");
+        jdbc.update("DELETE FROM shop_cart_item");
+        jdbc.update("DELETE FROM shop_order_idempotency");
         jdbc.update("DELETE FROM shop_order_item");
         jdbc.update("DELETE FROM shop_order");
 
@@ -40,7 +49,37 @@ final class ShopTestFixture {
                 ShopSeedInitializer.PRODUCT_MOUSE, ShopSeedInitializer.MOUSE_STOCK);
         setStock(jdbc, ShopSeedInitializer.SKU_CABLE,
                 ShopSeedInitializer.PRODUCT_CABLE, ShopSeedInitializer.CABLE_STOCK);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_AIR75,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75, 8);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_B68,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_B68, 6);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_G98,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_G98, 4);
+        setStock(jdbc, ShopSeedInitializer.SKU_KEYBOARD_PRO1,
+                ShopSeedInitializer.PRODUCT_KEYBOARD_PRO1, 5);
+        setStock(jdbc, ShopSeedInitializer.SKU_MOUSE_M5,
+                ShopSeedInitializer.PRODUCT_MOUSE_M5, 7);
 
+        // 恢复可能被价格/下架测试修改过的商品价格和状态
+        jdbc.update("UPDATE shop_product SET price_cents = 29900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD);
+        jdbc.update("UPDATE shop_product SET price_cents = 12900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_MOUSE);
+        jdbc.update("UPDATE shop_product SET price_cents = 1900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_CABLE);
+        jdbc.update("UPDATE shop_product SET price_cents = 36900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_AIR75);
+        jdbc.update("UPDATE shop_product SET price_cents = 25900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_B68);
+        jdbc.update("UPDATE shop_product SET price_cents = 38900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_G98);
+        jdbc.update("UPDATE shop_product SET price_cents = 59900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_KEYBOARD_PRO1);
+        jdbc.update("UPDATE shop_product SET price_cents = 19900, status = 'ACTIVE' WHERE id = ?",
+                ShopSeedInitializer.PRODUCT_MOUSE_M5);
+
+        ensureUser(jdbc, ShopSeedInitializer.BUYER_SHOP_ONLY, "BUYER");
+        ensureUser(jdbc, ShopSeedInitializer.ADMIN_SHOP_ONLY, "ADMIN");
         ensureUser(jdbc, ShopSeedInitializer.BUYER_ONE, "BUYER");
         ensureUser(jdbc, ShopSeedInitializer.BUYER_TWO, "BUYER");
         ensureUser(jdbc, ShopSeedInitializer.ADMIN, "ADMIN");
@@ -195,5 +234,191 @@ final class ShopTestFixture {
                 "SELECT quantity FROM shop_aftersale_return WHERE return_no = ?",
                 Integer.class, returnNo);
         return values.isEmpty() ? -1 : values.get(0);
+    }
+
+    // ---------------------------------------------------------------
+    // B1 决策夹具
+    // ---------------------------------------------------------------
+
+    /** 退货单当前状态（按退货单号）。 */
+    static String returnStatus(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList(
+                "SELECT status FROM shop_aftersale_return WHERE return_no = ?",
+                String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的决策记录条数（一单一决，正常只可能是 0 或 1）。 */
+    static int decisionCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的决策结果（没有决策时返回 {@code null}）。 */
+    static String decisionOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT d.decision
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的驳回原因（没有决策或批准时返回 {@code null}）。 */
+    static String rejectReasonOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT d.reason
+                FROM shop_aftersale_decision d
+                JOIN shop_aftersale_return r ON r.id = d.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
+    }
+
+    /** 某退货单的事件类型序列（按写入顺序）。 */
+    static List<String> eventTypes(JdbcTemplate jdbc, String returnNo) {
+        return jdbc.queryForList("""
+                SELECT e.event_type
+                FROM shop_aftersale_event e
+                JOIN shop_aftersale_return r ON r.id = e.return_id
+                WHERE r.return_no = ?
+                ORDER BY e.id
+                """, String.class, returnNo);
+    }
+
+    /**
+     * 全库一致性断言：占用额度必须等于"未被驳回的申请数量之和"。
+     *
+     * <p>这条不变式是 B1 的核心：批准保留额度、驳回释放额度，
+     * 任何一次决策写错都会让它不成立。
+     *
+     * @return 不成立时返回说明，成立返回 {@code null}
+     */
+    static String quotaConsistencyError(JdbcTemplate jdbc, String orderNo) {
+        int occupied = occupiedQty(jdbc, orderNo);
+        Integer expected = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(r.quantity), 0)
+                FROM shop_aftersale_return r
+                JOIN shop_order o ON o.id = r.order_id
+                WHERE o.order_no = ? AND r.status <> 'REJECTED'
+                """, Integer.class, orderNo);
+        int want = expected == null ? 0 : expected;
+        return occupied == want ? null : "occupied=" + occupied + " 但有效申请合计=" + want;
+    }
+
+    // ---------------------------------------------------------------
+    // B2 收货夹具
+    // ---------------------------------------------------------------
+
+    /** 某退货单的收货记录条数。 */
+    static int receiptCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的累计实收数量（没有收货记录时为 0）。 */
+    static int receivedQtyOf(JdbcTemplate jdbc, String returnNo) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(c.received_qty), 0)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某退货单的累计合格数量（= 应当回补到可售库存的数量）。 */
+    static int qualifiedQtyOf(JdbcTemplate jdbc, String returnNo) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(c.qualified_qty), 0)
+                FROM shop_aftersale_receipt c
+                JOIN shop_aftersale_return r ON r.id = c.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某 SKU 上指定类型的流水条数（断言"只有一笔 +1 入库"时用）。 */
+    static int movementCountOfType(JdbcTemplate jdbc, String sku, String type) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*) FROM shop_inventory_movement
+                WHERE sku = ? AND movement_type = ?
+                """, Integer.class, sku, type);
+        return count == null ? 0 : count;
+    }
+
+    /** 某 SKU 上指定类型流水的数量合计（正负号原样相加）。 */
+    static int movementDeltaOfType(JdbcTemplate jdbc, String sku, String type) {
+        Integer sum = jdbc.queryForObject("""
+                SELECT COALESCE(SUM(quantity_delta), 0) FROM shop_inventory_movement
+                WHERE sku = ? AND movement_type = ?
+                """, Integer.class, sku, type);
+        return sum == null ? 0 : sum;
+    }
+
+    /** 某张收货记录关联的流水条数（最多一条：整批损坏时没有流水）。 */
+    static int movementCountOfReceipt(JdbcTemplate jdbc, String receiptNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_inventory_movement m
+                JOIN shop_aftersale_receipt c ON c.id = m.receipt_id
+                WHERE c.receipt_no = ?
+                """, Integer.class, receiptNo);
+        return count == null ? 0 : count;
+    }
+
+    // ---------------------------------------------------------------
+    // B3 模拟退款夹具
+    // ---------------------------------------------------------------
+
+    /** 某退货单的模拟退款条数（一张退货单最多 1）。 */
+    static int refundCount(JdbcTemplate jdbc, String returnNo) {
+        Integer count = jdbc.queryForObject("""
+                SELECT COUNT(*)
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, Integer.class, returnNo);
+        return count == null ? 0 : count;
+    }
+
+    /** 全库模拟退款条数（断言"重复点击没有多出一笔"）。 */
+    static int totalRefunds(JdbcTemplate jdbc) {
+        Integer count = jdbc.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_refund", Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    /** 某退货单的退款金额（分）；没退过款返回 -1。 */
+    static long refundAmountOf(JdbcTemplate jdbc, String returnNo) {
+        List<Long> values = jdbc.queryForList("""
+                SELECT f.amount_cents
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, Long.class, returnNo);
+        return values.isEmpty() ? -1L : values.get(0);
+    }
+
+    /** 某退货单的模拟退款单号；没退过款返回 {@code null}。 */
+    static String refundNoOf(JdbcTemplate jdbc, String returnNo) {
+        List<String> values = jdbc.queryForList("""
+                SELECT f.refund_no
+                FROM shop_aftersale_refund f
+                JOIN shop_aftersale_return r ON r.id = f.return_id
+                WHERE r.return_no = ?
+                """, String.class, returnNo);
+        return values.isEmpty() ? null : values.get(0);
     }
 }

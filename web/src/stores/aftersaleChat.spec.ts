@@ -9,7 +9,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/api/errors'
-import type { AgentEvent, ApprovalView } from '@/api/types'
+import type { AgentEvent, ApprovalView, ConversationDetailVO } from '@/api/types'
 import type { AfterSaleChatOptions } from '@/api/aftersale'
 import { createAfterSaleChatStore, type AfterSaleChatDeps } from './aftersaleChat'
 
@@ -222,5 +222,168 @@ describe('售后对话 store', () => {
     expect(deps.resume).toHaveBeenCalledWith(APPROVAL_ID, expect.anything())
     expect(deps.onExecuted).toHaveBeenCalledTimes(1)
     expect(turn.answer).toContain('RT20261122101500-00A1')
+  })
+})
+
+// ==================== 刷新恢复 ====================
+
+/** 会话详情：一轮追问 + 一轮带待确认卡的申请。 */
+function detail(): ConversationDetailVO {
+  return {
+    conversationId: 'conv-restore',
+    title: '帮我退一把键盘',
+    messages: [
+      {
+        runId: 'run-a',
+        role: 'USER',
+        content: '我想退货',
+        state: null,
+        createdAt: '2026-11-22T10:00:00',
+        approvalId: null,
+      },
+      {
+        runId: 'run-a',
+        role: 'ASSISTANT',
+        content: '请问是哪一单、退几件、什么原因？',
+        state: 'SUCCEEDED',
+        createdAt: '2026-11-22T10:00:01',
+        approvalId: null,
+      },
+      {
+        runId: 'run-b',
+        role: 'USER',
+        content: 'SO1 那把键盘，退 1 件，按键失灵',
+        state: null,
+        createdAt: '2026-11-22T10:01:00',
+        approvalId: null,
+      },
+      {
+        runId: 'run-b',
+        role: 'ASSISTANT',
+        content: '',
+        state: 'WAITING_APPROVAL',
+        createdAt: '2026-11-22T10:01:01',
+        approvalId: APPROVAL_ID,
+      },
+    ],
+    updatedAt: '2026-11-22T10:01:01',
+  }
+}
+
+function summary() {
+  return {
+    tool: 'submit_return',
+    toolLabel: '提交退货申请',
+    playlistName: null,
+    songCount: null,
+    songs: [],
+    roundToolCount: 1,
+    text: '提交退货申请：订单号 SO1',
+    details: [
+      { label: '订单号', value: 'SO1' },
+      { label: '退货数量', value: '1 件' },
+    ],
+  }
+}
+
+describe('售后对话 store：刷新恢复', () => {
+  it('按会话详情还原每一轮，并用服务端摘要重建待确认的卡', async () => {
+    const key = 'test.aftersale.conv.restore'
+    window.localStorage.setItem(key, 'conv-restore')
+
+    const deps = buildDeps({
+      storageKey: () => key,
+      conversationDetail: vi.fn(async () => detail()),
+      approval: vi.fn(async () => view({ summary: summary() })),
+    })
+    const store = createAfterSaleChatStore(deps)
+
+    expect(store.conversationId.value).toBe('conv-restore')
+    expect(await store.restore()).toBe(true)
+
+    expect(store.turns.value).toHaveLength(2)
+    expect(store.turns.value[0].prompt).toBe('我想退货')
+    expect(store.turns.value[0].answer).toContain('哪一单')
+    expect(store.turns.value[0].approvalPayload).toBeNull()
+
+    const second = store.turns.value[1]
+    expect(second.prompt).toContain('按键失灵')
+    expect(second.approvalPayload?.approvalId).toBe(APPROVAL_ID)
+    // 卡片内容来自审批查询接口，不是前端拼的
+    expect(second.approvalPayload?.summary.details).toEqual([
+      { label: '订单号', value: 'SO1' },
+      { label: '退货数量', value: '1 件' },
+    ])
+    expect(second.approval?.status).toBe('PENDING')
+    // 恢复出来的轮次不是"正在执行"
+    expect(second.transport).toBe('closed')
+
+    window.localStorage.removeItem(key)
+  })
+
+  it('会话不存在（404）时丢掉本地 id，下次发送会新建', async () => {
+    const key = 'test.aftersale.conv.stale'
+    window.localStorage.setItem(key, 'conv-gone')
+
+    const deps = buildDeps({
+      storageKey: () => key,
+      conversationDetail: vi.fn(async () => {
+        throw new ApiError('not_found', { status: 404 })
+      }),
+      conversation: vi.fn(async () => ({ conversationId: 'conv-new' })),
+    })
+    const store = createAfterSaleChatStore(deps)
+
+    expect(await store.restore()).toBe(false)
+    expect(store.conversationId.value).toBeNull()
+    expect(window.localStorage.getItem(key)).toBeNull()
+    // 不把"上一次的会话没了"当成错误弹给用户
+    expect(store.panelError.value).toBeNull()
+
+    await store.submit('重新问一次')
+    expect((deps.chat as ReturnType<typeof vi.fn>).mock.calls[0][0].conversationId).toBe('conv-new')
+
+    window.localStorage.removeItem(key)
+  })
+
+  it('conversationId 按身份持久化：换一个 store 仍能续上同一个会话', async () => {
+    const key = 'test.aftersale.conv.persist'
+    window.localStorage.removeItem(key)
+
+    const first = buildDeps({ storageKey: () => key })
+    const storeA = createAfterSaleChatStore(first)
+    await storeA.submit('第一句')
+    expect(window.localStorage.getItem(key)).toBe('conv-1')
+
+    const second = buildDeps({
+      storageKey: () => key,
+      conversationDetail: vi.fn(async () => detail()),
+    })
+    const storeB = createAfterSaleChatStore(second)
+    expect(storeB.conversationId.value).toBe('conv-1')
+
+    // 换人：reset 必须把持久化的 id 一起清掉，否则会去续上一个人的会话
+    storeB.reset()
+    expect(window.localStorage.getItem(key)).toBeNull()
+    expect(storeB.conversationId.value).toBeNull()
+  })
+
+  it('拿不到审批摘要时不显示一张没有依据的卡', async () => {
+    const key = 'test.aftersale.conv.nosummary'
+    window.localStorage.setItem(key, 'conv-restore')
+
+    const deps = buildDeps({
+      storageKey: () => key,
+      conversationDetail: vi.fn(async () => detail()),
+      approval: vi.fn(async () => view({ summary: null })),
+    })
+    const store = createAfterSaleChatStore(deps)
+    await store.restore()
+
+    const second = store.turns.value[1]
+    expect(second.approvalPayload).toBeNull()
+    expect(second.error).toContain('确认信息已不可读取')
+
+    window.localStorage.removeItem(key)
   })
 })

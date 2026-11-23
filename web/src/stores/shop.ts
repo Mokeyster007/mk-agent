@@ -1,27 +1,32 @@
 /**
- * 商城状态（买家页 + 后台页共用）。
- *
- * 三条边界：
- * 1. **不在前端判断权限**：能不能下单、能不能发货，读的是 `/shop/session`
- *    给出的服务端结论；这里只负责把它显示出来。
- * 2. **成功与失败必须分开**：`notice` 是"做成了什么"，
- *    `error` 是"为什么没做成"。混在一起时，用户分不清"下单成功"和"下单被拒"。
- * 3. **重复操作不是错误**：后端对重复发货/签收返回 200 + applied=false，
- *    这里如实显示"未重复扣减"，不弹红条。
+ * 商城状态（买家页 + 共享购物车 + 结算预览/确认 + 后台页共用）。
  */
 import { computed, reactive } from 'vue'
 import { ApiError, describeError } from '@/api/errors'
 import {
+  addCartItem,
+  compareShopProducts,
+  confirmCheckout,
   getAdminOrder,
   getInventory,
+  getMyCart,
   getMyOrder,
   getShopSession,
   listAdminOrders,
   listMyOrders,
   listShopProducts,
   placeShopOrder,
+  previewCheckout,
+  removeCartItem,
+  searchShopProducts,
   shipOrder,
   signOrder,
+  updateCartItem,
+  type ShopCartVO,
+  type ShopCatalogSearchParams,
+  type ShopCatalogSearchVO,
+  type ShopComparisonVO,
+  type ShopCheckoutPreviewVO,
   type ShopInventoryVO,
   type ShopOrderStatus,
   type ShopOrderVO,
@@ -34,6 +39,14 @@ const ADMIN_PAGE_SIZE = 20
 interface ShopState {
   session: ShopSessionVO | null
   products: ShopProductVO[]
+  searchResult: ShopCatalogSearchVO | null
+  compareKeys: string[]
+  comparison: ShopComparisonVO | null
+  cart: ShopCartVO | null
+  checkoutPreview: ShopCheckoutPreviewVO | null
+  checkoutClientRequestId: string | null
+  checkoutPriceChanged: boolean
+  checkoutBusy: boolean
   myOrders: ShopOrderVO[]
   detail: ShopOrderVO | null
   adminOrders: ShopOrderVO[]
@@ -42,6 +55,7 @@ interface ShopState {
   adminTotal: number
   inventory: ShopInventoryVO | null
   loadingProducts: boolean
+  loadingCart: boolean
   loadingOrders: boolean
   loadingAdmin: boolean
   placing: boolean
@@ -54,6 +68,14 @@ function initialState(): ShopState {
   return {
     session: null,
     products: [],
+    searchResult: null,
+    compareKeys: [],
+    comparison: null,
+    cart: null,
+    checkoutPreview: null,
+    checkoutClientRequestId: null,
+    checkoutPriceChanged: false,
+    checkoutBusy: false,
     myOrders: [],
     detail: null,
     adminOrders: [],
@@ -62,6 +84,7 @@ function initialState(): ShopState {
     adminTotal: 0,
     inventory: null,
     loadingProducts: false,
+    loadingCart: false,
     loadingOrders: false,
     loadingAdmin: false,
     placing: false,
@@ -71,13 +94,13 @@ function initialState(): ShopState {
   }
 }
 
-/**
- * 商城错误 → 用户可读文案。
- *
- * 先认 code（稳定契约），认不出来才退回通用文案。
- * 这里**不拼接后端 message**：文案会变，而且一旦某天后端把参数回显进 message，
- * 界面就会跟着泄露内部信息。
- */
+function newRequestId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `chk-${crypto.randomUUID()}`
+  }
+  return `chk-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`
+}
+
 export function describeShopError(error: unknown): string {
   if (!(error instanceof ApiError)) {
     return '出现了未预期的问题，请稍后重试。'
@@ -87,9 +110,15 @@ export function describeShopError(error: unknown): string {
     case 'SHOP_IDENTITY_NOT_CONFIGURED':
       return '商城身份未启用：当前无法确认买家身份。本地演示请用 demo profile 启动（mkagent.shop.demo-identity-enabled=true）。'
     case 'SHOP_USER_NOT_PROVISIONED':
-      return '当前身份未开通商城。演示可用 music-user-1 / music-user-2（买家）或 music-admin-1（后台）。'
+      return '当前身份未开通商城。演示可用 shop-user-1（买家）或 shop-admin-1（后台）。'
     case 'NOT_ADMIN':
       return '当前身份不是商城后台人员，不能发货或签收。'
+    case 'PRICE_CHANGED':
+      return '商品价格刚发生变动，旧报价未建单；请核对最新报价后再确认下单。'
+    case 'PRODUCT_UNAVAILABLE':
+      return '商品已下架或暂不可售，未创建订单。'
+    case 'INSUFFICIENT_STOCK_AT_CHECKOUT':
+      return '当前可售库存不足，未能创建订单；请调整数量或换选其他商品。'
     case 'INSUFFICIENT_STOCK':
       return '库存不足，发货没有执行：订单仍为待发货，库存与出库流水都没有变动。'
     case 'ORDER_NOT_SHIPPED':
@@ -105,7 +134,7 @@ export function describeShopError(error: unknown): string {
     case 'DATA_CONFLICT':
       return '操作与当前数据状态冲突，请刷新后重试。'
     case 'MODEL_UNAVAILABLE':
-      return '模型不可用；商城下单与发货不依赖模型，可以继续使用。'
+      return '模型不可用；普通商品筛选、购物车、结算下单与发货不依赖模型，可以继续使用。'
     default:
       return describeError(error)
   }
@@ -114,6 +143,14 @@ export function describeShopError(error: unknown): string {
 export interface ShopDeps {
   session: typeof getShopSession
   products: typeof listShopProducts
+  search?: typeof searchShopProducts
+  compare?: typeof compareShopProducts
+  cart?: typeof getMyCart
+  addCart?: typeof addCartItem
+  updateCart?: typeof updateCartItem
+  removeCart?: typeof removeCartItem
+  previewCheckout?: typeof previewCheckout
+  confirmCheckout?: typeof confirmCheckout
   place: typeof placeShopOrder
   myOrders: typeof listMyOrders
   myOrder: typeof getMyOrder
@@ -127,7 +164,6 @@ export interface ShopDeps {
 export function createShopStore(deps: ShopDeps) {
   const state = reactive<ShopState>(initialState())
 
-  /** 只保留最后一次列表请求的结果（切状态时旧请求迟到不覆盖新结果） */
   let adminSeq = 0
   let orderSeq = 0
 
@@ -135,7 +171,6 @@ export function createShopStore(deps: ShopDeps) {
   const canOperate = computed(() => state.session?.canOperate === true)
   const identityMode = computed(() => state.session?.identityMode ?? 'UNKNOWN')
 
-  /** 切身份或离开页面时清空，避免上一个人的订单短暂留在界面上 */
   function reset(): void {
     Object.assign(state, initialState())
   }
@@ -160,11 +195,181 @@ export function createShopStore(deps: ShopDeps) {
     }
   }
 
-  /**
-   * 下单。
-   *
-   * @return 成功返回订单，失败返回 null（错误已写进 state.error）
-   */
+  async function searchProducts(params: ShopCatalogSearchParams): Promise<void> {
+    if (!deps.search) return
+    state.loadingProducts = true
+    state.error = null
+    try {
+      const result = await deps.search(params)
+      state.searchResult = result
+      state.products = result.items
+    } catch (error) {
+      state.error = describeShopError(error)
+    } finally {
+      state.loadingProducts = false
+    }
+  }
+
+  async function clearSearch(): Promise<void> {
+    state.searchResult = null
+    await loadProducts()
+  }
+
+  function toggleCompare(sku: string): void {
+    const idx = state.compareKeys.indexOf(sku)
+    if (idx >= 0) {
+      state.compareKeys = state.compareKeys.filter((k) => k !== sku)
+      if (state.compareKeys.length < 2) {
+        state.comparison = null
+      }
+      return
+    }
+    if (state.compareKeys.length >= 3) {
+      state.compareKeys = [...state.compareKeys.slice(1), sku]
+    } else {
+      state.compareKeys = [...state.compareKeys, sku]
+    }
+  }
+
+  async function runCompare(keys: string[] = state.compareKeys): Promise<void> {
+    if (!deps.compare || keys.length < 2) {
+      return
+    }
+    state.error = null
+    try {
+      state.comparison = await deps.compare(keys)
+    } catch (error) {
+      state.error = describeShopError(error)
+    }
+  }
+
+  function clearCompare(): void {
+    state.compareKeys = []
+    state.comparison = null
+  }
+
+  async function loadCart(): Promise<void> {
+    if (!deps.cart || !state.session?.canOrder) {
+      return
+    }
+    state.loadingCart = true
+    try {
+      state.cart = await deps.cart()
+    } catch (error) {
+      state.error = describeShopError(error)
+    } finally {
+      state.loadingCart = false
+    }
+  }
+
+  async function addToCart(
+    input: { productId?: number; sku?: string; quantity: number },
+  ): Promise<boolean> {
+    if (!deps.addCart) return false
+    state.error = null
+    state.notice = null
+    try {
+      state.cart = await deps.addCart(input)
+      state.notice = '已加入共享购物车（加购不等于下单，也不锁定库存）。'
+      return true
+    } catch (error) {
+      state.error = describeShopError(error)
+      return false
+    }
+  }
+
+  async function updateCartQty(productId: number, quantity: number): Promise<void> {
+    if (!deps.updateCart) return
+    state.error = null
+    try {
+      state.cart = await deps.updateCart(productId, quantity)
+    } catch (error) {
+      state.error = describeShopError(error)
+    }
+  }
+
+  async function removeFromCart(productId: number): Promise<void> {
+    if (!deps.removeCart) return
+    state.error = null
+    try {
+      state.cart = await deps.removeCart(productId)
+      if (state.checkoutPreview?.productId === productId) {
+        closeCheckoutPreview()
+      }
+    } catch (error) {
+      state.error = describeShopError(error)
+    }
+  }
+
+  async function openCheckoutPreview(productId: number, quantity: number): Promise<void> {
+    if (!deps.previewCheckout) return
+    state.checkoutBusy = true
+    state.error = null
+    state.notice = null
+    state.checkoutPriceChanged = false
+    try {
+      state.checkoutPreview = await deps.previewCheckout({ productId, quantity })
+      state.checkoutClientRequestId = newRequestId()
+    } catch (error) {
+      state.error = describeShopError(error)
+    } finally {
+      state.checkoutBusy = false
+    }
+  }
+
+  function closeCheckoutPreview(): void {
+    state.checkoutPreview = null
+    state.checkoutClientRequestId = null
+    state.checkoutPriceChanged = false
+  }
+
+  async function confirmCurrentCheckout(removeFromCartAfter = true): Promise<ShopOrderVO | null> {
+    const preview = state.checkoutPreview
+    if (!deps.confirmCheckout || !preview || !preview.eligible || state.checkoutBusy) {
+      return null
+    }
+    const clientRequestId = state.checkoutClientRequestId ?? newRequestId()
+    state.checkoutClientRequestId = clientRequestId
+    state.checkoutBusy = true
+    state.error = null
+    state.notice = null
+
+    try {
+      const result = await deps.confirmCheckout({
+        productId: preview.productId,
+        quantity: preview.quantity,
+        expectedUnitPriceCents: preview.unitPriceCents,
+        removeFromCart: removeFromCartAfter,
+        clientRequestId,
+      })
+      state.detail = result.order
+      state.notice = result.replayed
+        ? `检测到重复确认，已返回原订单 ${result.order.orderNo}（未多建订单）。`
+        : `下单成功：${result.order.orderNo}，${result.order.totalText}（演示付款，发货时才扣库存）。`
+      closeCheckoutPreview()
+      await Promise.all([loadProducts(), loadCart(), loadMyOrders()])
+      return result.order
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'PRICE_CHANGED' && deps.previewCheckout) {
+        // 价格变动：旧报价未建单，刷新最新报价并生成新请求号，要求用户重新确认
+        try {
+          state.checkoutPreview = await deps.previewCheckout({
+            productId: preview.productId,
+            quantity: preview.quantity,
+          })
+          state.checkoutClientRequestId = newRequestId()
+          state.checkoutPriceChanged = true
+        } catch {
+          // 忽略预览刷新失败，保留主错误提示
+        }
+      }
+      state.error = describeShopError(error)
+      return null
+    } finally {
+      state.checkoutBusy = false
+    }
+  }
+
   async function place(productId: number, quantity: number): Promise<ShopOrderVO | null> {
     if (state.placing) {
       return null
@@ -178,7 +383,6 @@ export function createShopStore(deps: ShopDeps) {
       const order = await deps.place({ productId, quantity })
       state.detail = order
       state.notice = `下单成功：${order.orderNo}，${order.totalText}。当前为待发货，尚未扣减库存。`
-      // 下单后刷新两处：库存数量（可能被别人买走）与我的订单
       await Promise.all([loadProducts(), loadMyOrders()])
       return order
     } catch (error) {
@@ -191,7 +395,6 @@ export function createShopStore(deps: ShopDeps) {
 
   async function loadMyOrders(): Promise<void> {
     if (!state.session?.canOrder) {
-      // 身份不可用时不去请求：否则页面会先闪一个 403 再显示"未启用"
       return
     }
 
@@ -288,12 +491,6 @@ export function createShopStore(deps: ShopDeps) {
     await runAdminAction(orderNo, () => deps.sign(orderNo), '签收')
   }
 
-  /**
-   * 发货 / 签收共用的收尾逻辑。
-   *
-   * <p>三种结果都要如实反映：
-   * 真的做了（applied=true）、本来就做过（applied=false）、失败（抛错）。
-   */
   async function runAdminAction(
     orderNo: string,
     action: () => Promise<{ applied: boolean; message: string; order: ShopOrderVO }>,
@@ -313,11 +510,6 @@ export function createShopStore(deps: ShopDeps) {
       state.notice = result.applied ? result.message : `${label}未重复执行：${result.message}`
       await loadInventory()
     } catch (error) {
-      /*
-       * 先记下失败原因，再刷新列表与库存，最后把原因写回。
-       * 顺序不能反：刷新方法自己会清 error（它们是"重新读取"，不是"操作结果"），
-       * 先写 error 再刷新会把刚发生的失败悄悄抹掉。
-       */
       const message = describeShopError(error)
       await Promise.all([loadAdminOrders(), loadInventory()])
       state.error = message
@@ -357,6 +549,18 @@ export function createShopStore(deps: ShopDeps) {
     reset,
     loadSession,
     loadProducts,
+    searchProducts,
+    clearSearch,
+    toggleCompare,
+    runCompare,
+    clearCompare,
+    loadCart,
+    addToCart,
+    updateCartQty,
+    removeFromCart,
+    openCheckoutPreview,
+    closeCheckoutPreview,
+    confirmCurrentCheckout,
     place,
     loadMyOrders,
     openOrder,
@@ -373,6 +577,14 @@ export function createShopStore(deps: ShopDeps) {
 export const shop = createShopStore({
   session: getShopSession,
   products: listShopProducts,
+  search: searchShopProducts,
+  compare: compareShopProducts,
+  cart: getMyCart,
+  addCart: addCartItem,
+  updateCart: updateCartItem,
+  removeCart: removeCartItem,
+  previewCheckout,
+  confirmCheckout,
   place: placeShopOrder,
   myOrders: listMyOrders,
   myOrder: getMyOrder,

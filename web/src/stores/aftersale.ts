@@ -1,9 +1,9 @@
 /**
- * 售后状态（A1：普通表单 + 我的售后）。
+ * 买家售后状态（B1：普通表单 + 我的售后 + 客服决策结果）。
  *
  * 四条边界：
  * 1. **额度三个数由服务端给**：已购 / 已占用 / 剩余，前端不自己减。
- *    A1 里占额度的只有"已提交"的退货申请；客服驳回与释放额度不在本轮。
+ *    B1 起「已提交」与「已批准」都占额度，「已驳回」不占（服务端已释放）。
  * 2. **`clientRequestId` 的生命周期只在这里**：
  *    同一次提交重试必须沿用同一个值（后端据此重放，不会重复建单）；
  *    用户改了订单/数量/原因就是另一次提交，必须换新值
@@ -15,6 +15,7 @@
  */
 import { reactive } from 'vue'
 import { ApiError, describeError } from '@/api/errors'
+import type { Tone } from '@/utils/status'
 import {
   getMyReturn,
   listAfterSaleOrders,
@@ -64,6 +65,46 @@ export function describeAfterSaleError(error: unknown): string {
       return '这次提交的标识已经用于另一笔参数不同的申请，已被拒绝。请刷新后重新填写。'
     case 'SUBMIT_CONFLICT':
       return '同一笔提交还在处理中，请稍等片刻再刷新查看结果。'
+    case 'RETURN_WRITE_CONFLICT':
+      return '退货单写入冲突（不是重复提交），本次提交没有生效。请重新提交；若反复出现请联系管理员。'
+    case 'REFUND_AMOUNT_OUT_OF_RANGE':
+      return '退款金额超出可表示范围：请核对成交单价与实收数量（金额按整数分计算）。'
+    case 'ALREADY_APPROVED':
+      return '这一单已经是「已批准」，重复操作不会产生新的决策或额度变化。请以详情里的决策记录为准。'
+    case 'ALREADY_REJECTED':
+      return '这一单已经是「已驳回」，重复操作不会再次释放额度。请以详情里的决策记录为准。'
+    case 'DECISION_CONFLICT':
+      return '这一单已经做出过决策，不能再改成相反结果。请刷新后以详情里的决策记录为准。'
+    case 'INVALID_REJECT_REASON':
+      return '驳回原因必填（最多 200 字）。'
+    case 'RETURN_QUOTA_INCONSISTENT':
+      return '额度与退货单不一致，本次操作已回滚（没有释放任何额度）。请联系管理员核对数据。'
+    case 'INVALID_STATUS':
+      return '状态筛选值不合法，请重新选择。'
+    case 'RETURN_NOT_APPROVED':
+      return '只有「已批准」的退货单才能收货：待审批的还没同意退，已驳回的实物应退回买家。'
+    case 'RECEIPT_OVER_APPROVED':
+      return '本批实收超过批准数量（累计实收不能超过批准件数）。请刷新后按最新剩余数量填写。'
+    case 'RECEIPT_QUANTITY_INVALID':
+      return '数量不合法：实收必须大于 0，且合格 + 损坏必须等于实收。'
+    case 'RECEIPT_REQUEST_CONFLICT':
+      return '同一个收货标识被用于不同的验货参数，已被拒绝。请刷新后重新填写这一批。'
+    case 'RECEIPT_WRITE_CONFLICT':
+      return '收货记录写入冲突（不是重复提交），本次收货没有生效。请重新提交；若反复出现请联系管理员。'
+    case 'INVALID_RECEIPT_NOTE':
+      return '验货备注最多 200 字。'
+    case 'REFUND_NOT_ALLOWED':
+      return '只有「已批准」的退货单才能模拟退款：待审批的还没同意退，已驳回的本来就不退钱。'
+    case 'REFUND_NOT_RECEIVED':
+      return '还没收满批准数量，不能模拟退款：必须全部实收（含损坏件）之后才能结算。'
+    case 'REFUND_ALREADY_EXISTS':
+      return '这张退货单已经生成过一笔模拟退款，重复操作不会产生第二笔。请以详情里的退款记录为准。'
+    case 'REFUND_AMOUNT_MISMATCH':
+      return '退货单上的单价快照与订单行成交单价不一致，已拒绝退款（没有写入任何金额）。请联系管理员核对数据。'
+    case 'INVENTORY_ROW_MISSING':
+      return '库存行不存在，本次收货已回滚（库存没有变化）。请联系管理员核对商品库存。'
+    case 'NOT_ADMIN':
+      return '当前身份不是商城后台人员，不能处理售后。演示可切换为 music-admin-1。'
     case 'ORDER_STATUS_CONFLICT':
     case 'DATA_CONFLICT':
       return '数据状态已变化，请刷新后重试。'
@@ -71,6 +112,27 @@ export function describeAfterSaleError(error: unknown): string {
       return '模型不可用；售后表单与查询不依赖模型，可以继续使用。'
     default:
       return describeError(error)
+  }
+}
+
+/**
+ * 售后状态 → 色调。
+ *
+ * 只做"枚举 → 颜色"的翻译，不改变任何后端语义：
+ * 已提交（等客服）用 warn，已批准用 ok，已驳回用 neutral
+ * （驳回不是"错误"，是"处理完了，结果是不退"）。
+ * 未知状态一律中性色 + 原值，不猜。
+ */
+export function afterSaleStatusTone(status: string): Tone {
+  switch (status) {
+    case 'SUBMITTED':
+      return 'wait'
+    case 'APPROVED':
+      return 'ok'
+    case 'REJECTED':
+      return 'neutral'
+    default:
+      return 'neutral'
   }
 }
 
@@ -297,7 +359,7 @@ export function createAfterSaleStore(deps: AfterSaleDeps) {
 
     try {
       const created = await deps.submit(input)
-      state.notice = `退货申请已提交：${created.returnNo}（${created.quantity} 件，预计退款 ${created.refundText}）。当前状态「${created.statusLabel}」，客服审核不在本轮范围。`
+      state.notice = `退货申请已提交：${created.returnNo}（${created.quantity} 件，预计退款 ${created.refundText}）。当前状态「${created.statusLabel}」，等客服处理；结果会显示在「我的售后」里。`
       state.preview = null
       // 下一笔申请是新的提交身份
       rekey()

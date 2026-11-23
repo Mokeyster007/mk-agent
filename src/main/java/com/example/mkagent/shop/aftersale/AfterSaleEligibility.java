@@ -47,6 +47,15 @@ public final class AfterSaleEligibility {
     /** 原因为空或过长。 */
     public static final String CODE_INVALID_REASON = "INVALID_REASON";
 
+    /**
+     * 退款金额超出可表示范围。
+     *
+     * <p>金额是整数分，{@code 单价 × 数量} 溢出时**不能**回绕成一个看似正常的数字。
+     * 预览据此拒绝展示金额，提交据此拒绝建单——两处共用这一个码，
+     * 前端也只需要认一个。
+     */
+    public static final String CODE_REFUND_AMOUNT_OUT_OF_RANGE = "REFUND_AMOUNT_OUT_OF_RANGE";
+
     private AfterSaleEligibility() {
     }
 

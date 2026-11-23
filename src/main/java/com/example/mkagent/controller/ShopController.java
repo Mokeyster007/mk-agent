@@ -3,83 +3,96 @@ package com.example.mkagent.controller;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopAccessGuard;
 import com.example.mkagent.shop.api.ShopViews;
+import com.example.mkagent.shop.api.ShopViews.CartVO;
+import com.example.mkagent.shop.api.ShopViews.CatalogSearchVO;
+import com.example.mkagent.shop.api.ShopViews.CheckoutConfirmVO;
+import com.example.mkagent.shop.api.ShopViews.CheckoutPreviewVO;
+import com.example.mkagent.shop.api.ShopViews.ComparisonVO;
 import com.example.mkagent.shop.api.ShopViews.OrderVO;
 import com.example.mkagent.shop.api.ShopViews.ProductVO;
 import com.example.mkagent.shop.api.ShopViews.SessionVO;
+import com.example.mkagent.shop.cart.ShopCartService;
+import com.example.mkagent.shop.catalog.ShopCatalogService;
 import com.example.mkagent.shop.catalog.ShopProductRepository;
+import com.example.mkagent.shop.order.ShopCheckoutService;
 import com.example.mkagent.shop.order.ShopOrderService;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
- * 买家侧商城接口：商品列表 → 立即购买 → 我的订单 / 订单详情。
+ * 买家侧商城接口：商品检索与比较 → 共享购物车 → 结算预览与确认 → 我的订单 / 订单详情。
  *
- * <p>三条约束：
- * <ol>
- *   <li><b>商品列表不需要身份</b>：浏览商品是公开行为。
- *       但"我的订单"必须要求身份——没有身份就没有"我的"；</li>
- *   <li><b>下单只接受 productId + quantity</b>：单价与买家都由服务端决定，
- *       请求体里多传 {@code price} 或 {@code buyerId} 不会生效（也没有对应字段可绑）；</li>
- *   <li><b>只返回自己的订单</b>：归属条件写在 SQL 里，
- *       别人的订单号返回 404 而不是 403，避免用它探测订单是否存在。</li>
- * </ol>
- *
- * <p>本类不调用任何模型：商城闭环与 Agent 完全解耦，
- * 模型不可用时这些接口照常工作。
+ * <p>完全不依赖大模型：普通用户不聊 Agent 也能走通全部选品、加购、结算与订单查看。
  */
 @RestController
 @RequestMapping("/shop")
 public class ShopController {
 
     private final ShopAccessGuard accessGuard;
-
     private final ShopProductRepository productRepository;
-
+    private final ShopCatalogService catalogService;
+    private final ShopCartService cartService;
+    private final ShopCheckoutService checkoutService;
     private final ShopOrderService orderService;
 
     public ShopController(
             ShopAccessGuard accessGuard,
             ShopProductRepository productRepository,
+            ShopCatalogService catalogService,
+            ShopCartService cartService,
+            ShopCheckoutService checkoutService,
             ShopOrderService orderService
     ) {
         this.accessGuard = accessGuard;
         this.productRepository = productRepository;
+        this.catalogService = catalogService;
+        this.cartService = cartService;
+        this.checkoutService = checkoutService;
         this.orderService = orderService;
     }
 
-    /**
-     * 下单请求体。
-     *
-     * <p>只有两个字段，这是刻意的：字段不存在，客户端就传不进来。
-     * 用"接收了再忽略"的写法，会让人误以为传了有用。
-     */
     public record PlaceOrderRequest(Long productId, Integer quantity) {
     }
 
-    /**
-     * 当前会话：身份、商城角色、能做什么。
-     *
-     * <p>不抛异常：页面需要在点击之前就知道"能不能下单"，
-     * 而不是等用户填完数量再吃一个 403。
-     */
+    public record CompareRequest(List<String> keys) {
+    }
+
+    public record CartAddRequest(Long productId, String sku, Integer quantity) {
+    }
+
+    public record CartUpdateRequest(Integer quantity) {
+    }
+
+    public record CheckoutPreviewRequest(Long productId, Integer quantity) {
+    }
+
+    public record CheckoutConfirmRequest(
+            Long productId,
+            Integer quantity,
+            Long expectedUnitPriceCents,
+            Boolean removeFromCart,
+            String clientRequestId
+    ) {
+    }
+
     @GetMapping("/session")
     public SessionVO session() {
         return ShopViews.session(accessGuard.session());
     }
 
-    /**
-     * 商品列表（含已售罄的，{@code purchasable=false}）。
-     *
-     * <p>不需要身份：售罄商品也返回，让页面能显示"已售罄"而不是"消失"。
-     */
+    /** 全部上架商品（保留 A0 契约，扩展结构化规格字段）。 */
     @GetMapping("/products")
     public List<ProductVO> products() {
         return productRepository.findActive().stream()
@@ -87,12 +100,115 @@ public class ShopController {
                 .toList();
     }
 
-    /**
-     * 下单（演示付款）。
-     *
-     * <p>返回 201：语义上是"创建了一个订单资源"。
-     * 响应里带完整订单（含订单号），页面据此展示"下单成功"。
-     */
+    /** 按硬条件与软偏好检索商品（公开只读，与导购 Agent 共用同一商品服务）。 */
+    @GetMapping("/products/search")
+    public CatalogSearchVO searchProducts(
+            @RequestParam(required = false) String keyword,
+            @RequestParam(required = false) String category,
+            @RequestParam(required = false) Double maxPriceYuan,
+            @RequestParam(required = false) Double minPriceYuan,
+            @RequestParam(required = false) Boolean wirelessOnly,
+            @RequestParam(required = false) Boolean macCompatible,
+            @RequestParam(required = false) Boolean preferSilent,
+            @RequestParam(required = false) Boolean inStockOnly
+    ) {
+        Long maxCents = maxPriceYuan == null ? null
+                : BigDecimal.valueOf(Math.max(0, maxPriceYuan)).multiply(BigDecimal.valueOf(100)).longValue();
+        Long minCents = minPriceYuan == null ? null
+                : BigDecimal.valueOf(Math.max(0, minPriceYuan)).multiply(BigDecimal.valueOf(100)).longValue();
+
+        return ShopViews.catalogSearch(catalogService.search(new ShopCatalogService.SearchCriteria(
+                keyword, category, maxCents, minCents,
+                wirelessOnly, macCompatible, preferSilent, inStockOnly)));
+    }
+
+    /** 对比 2~3 款商品规格（公开只读）。 */
+    @PostMapping("/products/compare")
+    public ComparisonVO compareProducts(@RequestBody(required = false) CompareRequest request) {
+        if (request == null || request.keys() == null) {
+            throw new BusinessException(400, "INVALID_COMPARE_INPUT", "请提供要比较的商品列表");
+        }
+        return ShopViews.comparison(catalogService.compare(request.keys()));
+    }
+
+    // ==================== 共享购物车 ====================
+
+    @GetMapping("/cart")
+    public CartVO myCart() {
+        String buyerId = accessGuard.requireBuyerIdentity();
+        return ShopViews.cart(cartService.myCart(buyerId));
+    }
+
+    @PostMapping("/cart/items")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CartVO addToCart(@RequestBody(required = false) CartAddRequest request) {
+        String buyerId = accessGuard.requireBuyerIdentity();
+        if (request == null) {
+            throw new BusinessException(400, "INVALID_REQUEST", "请求体不能为空");
+        }
+        int qty = request.quantity() == null ? 1 : request.quantity();
+        if (request.productId() != null) {
+            cartService.addItem(buyerId, request.productId(), qty);
+        } else if (request.sku() != null && !request.sku().isBlank()) {
+            cartService.addBySkuOrId(buyerId, request.sku(), qty);
+        } else {
+            throw new BusinessException(400, "INVALID_PRODUCT", "请指定要加入购物车的商品");
+        }
+        return ShopViews.cart(cartService.myCart(buyerId));
+    }
+
+    @PatchMapping("/cart/items/{productId}")
+    public CartVO updateCartItem(
+            @PathVariable long productId,
+            @RequestBody(required = false) CartUpdateRequest request
+    ) {
+        String buyerId = accessGuard.requireBuyerIdentity();
+        if (request == null || request.quantity() == null) {
+            throw new BusinessException(400, "INVALID_QUANTITY", "请提供修改后的数量");
+        }
+        cartService.updateQuantity(buyerId, productId, request.quantity());
+        return ShopViews.cart(cartService.myCart(buyerId));
+    }
+
+    @DeleteMapping("/cart/items/{productId}")
+    public CartVO removeCartItem(@PathVariable long productId) {
+        String buyerId = accessGuard.requireBuyerIdentity();
+        cartService.removeItem(buyerId, productId);
+        return ShopViews.cart(cartService.myCart(buyerId));
+    }
+
+    // ==================== 结算预览与确认下单 ====================
+
+    @PostMapping("/checkout/preview")
+    public CheckoutPreviewVO previewCheckout(@RequestBody(required = false) CheckoutPreviewRequest request) {
+        accessGuard.requireBuyerIdentity();
+        if (request == null || request.productId() == null) {
+            throw new BusinessException(400, "INVALID_PRODUCT", "请先选择要结算的商品");
+        }
+        int qty = request.quantity() == null ? 1 : request.quantity();
+        return ShopViews.checkoutPreview(checkoutService.preview(request.productId(), qty));
+    }
+
+    @PostMapping("/checkout/confirm")
+    @ResponseStatus(HttpStatus.CREATED)
+    public CheckoutConfirmVO confirmCheckout(@RequestBody(required = false) CheckoutConfirmRequest request) {
+        String buyerId = accessGuard.requireBuyerIdentity();
+        if (request == null || request.productId() == null) {
+            throw new BusinessException(400, "INVALID_REQUEST", "请提供确认结算参数");
+        }
+        int qty = request.quantity() == null ? 1 : request.quantity();
+        boolean removeFromCart = request.removeFromCart() == null || request.removeFromCart();
+        return ShopViews.checkoutConfirm(checkoutService.confirmFromPage(
+                buyerId,
+                request.productId(),
+                qty,
+                request.expectedUnitPriceCents(),
+                removeFromCart,
+                request.clientRequestId()));
+    }
+
+    // ==================== 既有 A0 下单与订单查询 ====================
+
     @PostMapping("/orders")
     @ResponseStatus(HttpStatus.CREATED)
     public OrderVO placeOrder(@RequestBody(required = false) PlaceOrderRequest request) {
@@ -106,7 +222,6 @@ public class ShopController {
                 orderService.placeOrder(buyerId, request.productId(), request.quantity()));
     }
 
-    /** 我的订单（新的在前）。 */
     @GetMapping("/orders")
     public List<OrderVO> myOrders() {
         String buyerId = accessGuard.requireBuyerIdentity();
@@ -116,7 +231,6 @@ public class ShopController {
                 .toList();
     }
 
-    /** 订单详情（含出库流水）。 */
     @GetMapping("/orders/{orderNo}")
     public OrderVO order(@PathVariable String orderNo) {
         String buyerId = accessGuard.requireBuyerIdentity();

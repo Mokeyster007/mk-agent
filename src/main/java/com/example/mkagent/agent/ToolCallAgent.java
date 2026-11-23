@@ -554,19 +554,33 @@ public class ToolCallAgent extends ReActAgent {
          * 没有工具调用，通常表示模型已给出最终回答。
          */
         if (!hasToolCalls) {
+            String rawText = assistantMessage.getText();
+            List<AssistantMessage.ToolCall> bridgedCalls = interceptEarlyTextFinish(ctx, rawText);
+            if (bridgedCalls != null && !bridgedCalls.isEmpty()) {
+                AssistantMessage synthetic = new AssistantMessage("", java.util.Map.of(), bridgedCalls);
+                ctx.setPendingResponse(new ChatResponse(
+                        List.of(new Generation(synthetic)),
+                        response.getMetadata()));
+                log.info("触发确定性确认桥接：runId={}, step={}, tools={}",
+                        ctx.getRunId(), ctx.getCurrentStep(),
+                        bridgedCalls.stream().map(AssistantMessage.ToolCall::name).toList());
+                return true;
+            }
+
             /*
              * 此时 ToolCallingManager 不会参与，
              * 因此普通 AssistantMessage 要自己写入历史。
              */
-            ctx.getMessages().add(assistantMessage);
-
-            String finalAnswer = assistantMessage.getText();
+            String finalAnswer = rawText;
 
             if (finalAnswer == null || finalAnswer.isBlank()) {
                 finalAnswer = "任务结束：模型没有返回有效文本，也没有请求工具。";
             }
 
+            finalAnswer = sanitizeFinalAnswer(ctx, finalAnswer);
+            ctx.getMessages().add(new AssistantMessage(finalAnswer));
             ctx.setFinalAnswer(finalAnswer);
+            onTextFinished(ctx, finalAnswer);
 
             /*
              * 模型给出有效最终回答，任务成功，结束 Agent Loop。
@@ -1258,6 +1272,8 @@ public class ToolCallAgent extends ReActAgent {
                 toolCalls.size(), configVersion
         );
 
+        onPausedForApproval(ctx, result, toolCalls);
+
         return null;
     }
 
@@ -1523,6 +1539,7 @@ public class ToolCallAgent extends ReActAgent {
         });
 
         recordBusinessRefs(ctx, toolResponseMessage);
+        onToolsExecuted(ctx, toolResponseMessage);
 
         /*
          * 判断模型是否调用了终止工具。
@@ -1713,6 +1730,7 @@ public class ToolCallAgent extends ReActAgent {
         ctx.addToolCallCount(toolResponseMessage.getResponses().size());
 
         recordBusinessRefs(ctx, toolResponseMessage);
+        onToolsExecuted(ctx, toolResponseMessage);
 
         log.info("暂停轮已执行完成：runId={}, tools={}, step={}",
                 ctx.getRunId(), toolResponseMessage.getResponses().size(),
@@ -1792,6 +1810,115 @@ public class ToolCallAgent extends ReActAgent {
             }
         }
         return names;
+    }
+
+    /**
+     * 子类钩子：工具执行完毕后检查真实工具返回值并推送结构化业务载荷。
+     */
+    protected void onToolsExecuted(AgentRunContext ctx, ToolResponseMessage toolResponseMessage) {
+    }
+
+    /**
+     * 子类钩子：当模型未请求工具而直接输出文本时，允许子类决定是否桥接到需人工确认的写工具。
+     * 返回非空列表时，本轮将进入 {@code act() -> pauseForApproval()}，不会伪装成已提交。
+     */
+    protected List<AssistantMessage.ToolCall> interceptEarlyTextFinish(
+            AgentRunContext ctx,
+            String assistantText
+    ) {
+        return List.of();
+    }
+
+    /**
+     * 子类钩子：对最终文本做诚实性兜底校验。
+     */
+    protected String sanitizeFinalAnswer(AgentRunContext ctx, String candidateAnswer) {
+        return candidateAnswer;
+    }
+
+    /**
+     * 子类钩子：纯文本收尾时推送最终结构化状态。
+     */
+    protected void onTextFinished(AgentRunContext ctx, String finalAnswer) {
+    }
+
+    /**
+     * 子类钩子：进入审批暂停后推送结构化待确认状态。
+     */
+    protected void onPausedForApproval(
+            AgentRunContext ctx,
+            PauseResult result,
+            List<AssistantMessage.ToolCall> toolCalls
+    ) {
+    }
+
+    /**
+     * 向 SSE 推送结构化业务事件（绝不要求前端反解析聊天文案）。
+     */
+    protected void emitStructuredData(AgentRunContext ctx, Object payload) {
+        if (ctx == null || payload == null) {
+            return;
+        }
+        try {
+            String json = OBJECT_MAPPER.writeValueAsString(payload);
+            sendEvent(ctx, AgentEventType.STRUCTURED_DATA, json);
+        } catch (Exception e) {
+            log.warn("结构化事件序列化失败（忽略）：runId={}, err={}",
+                    ctx.getRunId(), e.getMessage());
+        }
+    }
+
+    /**
+     * 结构化发起结果（用于页面按钮或服务端编排直接创建真实待确认卡，绝不绕过确认）。
+     */
+    public record PreparedApproval(String runId, String approvalId, String eventJson) {
+    }
+
+    /**
+     * 直接为单个需人工确认的写工具创建真实暂停点与待确认卡（复用同一套审批与恢复机制）。
+     *
+     * <p>不执行任何业务写入；用户点击“批准并执行”后才由 {@code ApprovalResumeService} 恢复并执行。
+     */
+    public PreparedApproval prepareDirectApproval(
+            String userId,
+            String conversationId,
+            String promptSummary,
+            AssistantMessage.ToolCall writeToolCall
+    ) {
+        if (approvalToolPolicy == null || !approvalToolPolicy.requiresApproval(writeToolCall.name())) {
+            throw new IllegalStateException("工具未纳入审批策略，拒绝直接准备确认卡：" + writeToolCall.name());
+        }
+        approvalToolPolicy.verifyExposedTools(getAgentType() + "/" + getName(), exposedToolNames());
+
+        AgentRunContext ctx = new AgentRunContext();
+        ctx.setUserId(userId);
+        ctx.setAgentType(getAgentType());
+        if (conversationId != null && !conversationId.isBlank()) {
+            ctx.setConversationId(conversationId);
+        }
+        ctx.transitionTo(AgentState.RUNNING);
+        ctx.nextStep();
+
+        if (getSystemPrompt() != null && !getSystemPrompt().isBlank()) {
+            ctx.getMessages().add(new SystemMessage(getSystemPrompt()));
+        }
+        ctx.getMessages().add(new org.springframework.ai.chat.messages.UserMessage(promptSummary));
+
+        recordRunStart(ctx, promptSummary);
+
+        AssistantMessage synthetic = new AssistantMessage(
+                "", java.util.Map.of(), List.of(writeToolCall));
+        ChatResponse response = new ChatResponse(List.of(new Generation(synthetic)));
+
+        try {
+            pauseForApproval(ctx, response, List.of(writeToolCall));
+            return new PreparedApproval(
+                    ctx.getRunId().toString(),
+                    ctx.getApprovalId(),
+                    ctx.getPendingApprovalJson());
+        } finally {
+            releaseHandoffLock(ctx);
+        }
     }
 
     private List<AssistantMessage.ToolCall> toToolCalls(ApprovalCheckpoint checkpoint) {

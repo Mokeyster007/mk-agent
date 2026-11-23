@@ -1,8 +1,8 @@
 package com.example.mkagent.conversation;
 
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
-import com.example.mkagent.music.MusicSeedInitializer;
 import com.example.mkagent.rag.ChatAppDocumentLoader;
+import com.example.mkagent.shop.ShopSeedInitializer;
 import com.example.mkagent.support.HermeticSpringBootTest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -67,14 +67,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @HermeticSpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
-                "mkagent.approval.ttl=10m",
-                "mkagent.agent.music.write-enabled=true"
+                "mkagent.approval.ttl=10m"
         }
 )
 @Timeout(180)
 class ConversationLoopIntegrationTest {
 
-    private static final String USER = MusicSeedInitializer.USER_ALICE;
+    private static final String USER = ShopSeedInitializer.BUYER_SHOP_ONLY;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -111,16 +110,15 @@ class ConversationLoopIntegrationTest {
         String conversationId = createConversation();
         createdConversations.add(conversationId);
 
-        String firstRun = send("帮我查一下夜航星的歌", conversationId);
+        String firstRun = send("帮我找 400 元以内的无线 Mac 键盘", conversationId);
         assertEquals("SUCCEEDED", runState(firstRun), "第一轮应成功");
 
-        // 第一轮真实工具结果：夜航星有 5 首（种子数据）
-        assertTrue(toolNames(firstRun).contains("search_songs"),
-                "第一轮应调用 search_songs，实际：" + toolNames(firstRun));
+        assertTrue(toolNames(firstRun).contains("search_products"),
+                "第一轮应调用 search_products，实际：" + toolNames(firstRun));
 
         List<Message> firstPrompt = model.promptOf(0);
 
-        String secondRun = send("第一首是哪一年发行的？", conversationId);
+        String secondRun = send("第一款用的是什么轴体？", conversationId);
         assertEquals("SUCCEEDED", runState(secondRun), "第二轮应成功");
 
         // 1. 每轮都是新 run：绝不复活终态 run
@@ -134,21 +132,21 @@ class ConversationLoopIntegrationTest {
                         + " 第二轮=" + turn2Prompt.size());
 
         assertTrue(turn2Prompt.stream().anyMatch(m -> m instanceof UserMessage
-                        && m.getText().contains("帮我查一下夜航星的歌")),
+                        && m.getText().contains("帮我找 400 元以内的无线 Mac 键盘")),
                 "第二轮输入应包含第一轮的用户原话");
         assertTrue(turn2Prompt.stream().anyMatch(m -> m instanceof AssistantMessage
                         && m.getText().contains(RecordingChatModel.ANSWER)),
                 "第二轮输入应包含第一轮的助手回答");
 
-        // 3. 业务引用来自真实工具结果（歌曲 ID + 顺序），不是模型自述
+        // 3. 业务引用来自真实工具结果（商品 SKU + 顺序），不是模型自述
         String lastUserText = lastUserText(turn2Prompt);
         assertTrue(lastUserText.contains("[会话已知对象"),
                 "第二轮输入应带会话已知对象，实际：" + lastUserText);
-        assertTrue(lastUserText.contains("城市霓虹"),
-                "引用里应有第一轮真实搜到的歌名，实际：" + lastUserText);
-        assertTrue(lastUserText.contains("（id=1001）"),
-                "引用里应带真实歌曲 ID，实际：" + lastUserText);
-        assertTrue(lastUserText.contains("第一首是哪一年发行的？"),
+        assertTrue(lastUserText.contains("Air75"),
+                "引用里应有第一轮真实搜到的商品名，实际：" + lastUserText);
+        assertTrue(lastUserText.contains("SKU-KEYBOARD-A75"),
+                "引用里应带真实 SKU，实际：" + lastUserText);
+        assertTrue(lastUserText.contains("第一款用的是什么轴体？"),
                 "用户原话必须原样保留在本轮输入里，实际：" + lastUserText);
 
         // 第一轮不该有引用（会话还没有任何工具结果）
@@ -160,7 +158,7 @@ class ConversationLoopIntegrationTest {
                 "SELECT refs_json FROM agent_conversation WHERE conversation_id = ?",
                 String.class, conversationId);
         assertNotNull(refsJson, "业务引用应落库");
-        assertTrue(refsJson.contains("1001"), "落库的引用应含真实歌曲 ID，实际：" + refsJson);
+        assertTrue(refsJson.contains("SKU-KEYBOARD-A75"), "落库的引用应含真实 SKU，实际：" + refsJson);
     }
 
     @Test
@@ -169,24 +167,24 @@ class ConversationLoopIntegrationTest {
         String conversationId = createConversation();
         createdConversations.add(conversationId);
 
-        send("帮我查一下夜航星的歌", conversationId);
-        send("第一首是哪一年发行的？", conversationId);
+        send("帮我找 400 元以内的无线 Mac 键盘", conversationId);
+        send("第一款用的是什么轴体？", conversationId);
 
-        JsonNode detail = getJson("/ai/conversations/" + conversationId);
+        JsonNode detail = getJson("/shop/assistant/conversations/" + conversationId);
         JsonNode messages = detail.get("messages");
 
         assertEquals(4, messages.size(), "两轮 = 4 条消息（用户+助手各两条）");
         assertEquals("USER", messages.get(0).get("role").asText());
-        assertEquals("帮我查一下夜航星的歌", messages.get(0).get("content").asText());
+        assertEquals("帮我找 400 元以内的无线 Mac 键盘", messages.get(0).get("content").asText());
         assertEquals("ASSISTANT", messages.get(1).get("role").asText());
         assertEquals("USER", messages.get(2).get("role").asText());
-        assertEquals("第一首是哪一年发行的？", messages.get(2).get("content").asText());
+        assertEquals("第一款用的是什么轴体？", messages.get(2).get("content").asText());
 
         // 标题取首条输入，便于列表里辨认
-        assertEquals("帮我查一下夜航星的歌", detail.get("title").asText());
+        assertEquals("帮我找 400 元以内的无线 Mac 键盘", detail.get("title").asText());
 
         // 列表里能看到这个会话
-        JsonNode list = getJson("/ai/conversations");
+        JsonNode list = getJson("/shop/assistant/conversations");
         boolean found = false;
         for (JsonNode item : list) {
             if (conversationId.equals(item.get("conversationId").asText())) {
@@ -205,14 +203,14 @@ class ConversationLoopIntegrationTest {
         createdConversations.add(first);
         createdConversations.add(second);
 
-        send("帮我查一下夜航星的歌", first);
-        send("把前两首建一个歌单", second);
+        send("帮我找 400 元以内的无线 Mac 键盘", first);
+        send("帮我推荐一款鼠标", second);
 
         List<Message> secondPrompt = model.promptOf(model.size() - 1);
         String lastUser = lastUserText(secondPrompt);
 
         assertFalse(secondPrompt.stream().anyMatch(m -> m instanceof UserMessage
-                        && m.getText().contains("帮我查一下夜航星的歌")),
+                        && m.getText().contains("帮我找 400 元以内的无线 Mac 键盘")),
                 "第二个会话不应看到第一个会话的历史");
         assertFalse(lastUser.contains("[会话已知对象"),
                 "第二个会话不应继承第一个会话的引用，实际：" + lastUser);
@@ -225,21 +223,17 @@ class ConversationLoopIntegrationTest {
         createdConversations.add(conversationId);
 
         // 让桩模型提出一次写请求 → 任务停在审批上
-        model.toolName = "create_playlist";
-        model.toolArgs = "{\"name\":\"会话并发验证\",\"songIds\":[1001]}";
+        model.toolName = "submit_checkout_order";
+        model.toolArgs = "{\"sku\":\"SKU-KEYBOARD-A75\",\"quantity\":1,\"expectedUnitPriceCents\":36900}";
 
-        String pausedRun = send("帮我建一个歌单叫「会话并发验证」", conversationId);
+        String pausedRun = send("请帮我下单 Air75 一把", conversationId);
         assertEquals("WAITING_APPROVAL", runState(pausedRun),
                 "写工具应停在审批上，实际：" + runState(pausedRun));
 
-        /*
-         * 暂停中的轮次只有用户消息（助手回答要等恢复执行完才有），
-         * 所以这里记下当前条数，只断言"被拦下时没有多出任何一条"。
-         */
         int messagesBefore = countMessages(conversationId);
 
         HttpResponse<String> blocked = getRaw(
-                "/ai/music/chat?message=" + encode("再帮我加一首")
+                "/ai/shop/chat?message=" + encode("再帮我看看鼠标")
                         + "&conversationId=" + conversationId);
         assertEquals(409, blocked.statusCode(),
                 "同会话并发应被拦下，实际：" + blocked.statusCode() + " " + blocked.body());
@@ -248,7 +242,6 @@ class ConversationLoopIntegrationTest {
         assertEquals(messagesBefore, countMessages(conversationId),
                 "被拦下时不得落下第二条用户消息");
 
-        // 收尾：拒绝掉，避免残留 PENDING 影响其它用例
         String approvalId = jdbcTemplate.queryForObject(
                 "SELECT approval_id FROM agent_approval WHERE run_id = ? AND status = 'PENDING'",
                 String.class, pausedRun);
@@ -256,12 +249,12 @@ class ConversationLoopIntegrationTest {
     }
 
     @Test
-    @DisplayName("不带 conversationId 的老入口行为不变，且不产生会话记录")
+    @DisplayName("不带 conversationId 的独立入口行为不变，且不产生会话记录")
     void standaloneEntryCreatesNoConversation() throws Exception {
         int before = countAllConversations();
 
         HttpResponse<String> response = getRaw(
-                "/ai/music/chat?message=" + encode("帮我查一下夜航星的歌"));
+                "/ai/shop/chat?message=" + encode("帮我找 400 元以内的无线 Mac 键盘"));
         assertEquals(200, response.statusCode(), "独立任务入口应正常，body=" + response.body());
 
         assertEquals(before, countAllConversations(),
@@ -271,7 +264,7 @@ class ConversationLoopIntegrationTest {
     // ==================== 辅助 ====================
 
     private String createConversation() throws Exception {
-        HttpResponse<String> response = post("/ai/conversations");
+        HttpResponse<String> response = post("/shop/assistant/conversations");
         assertEquals(200, response.statusCode(), "建会话失败，body=" + response.body());
         JsonNode node = JSON.readTree(response.body());
         String conversationId = node.get("conversationId").asText();
@@ -284,7 +277,7 @@ class ConversationLoopIntegrationTest {
      */
     private String send(String message, String conversationId) throws Exception {
         HttpResponse<String> response = getRaw(
-                "/ai/music/chat?message=" + encode(message)
+                "/ai/shop/chat?message=" + encode(message)
                         + "&conversationId=" + conversationId);
 
         assertEquals(200, response.statusCode(),
@@ -423,19 +416,19 @@ class ConversationLoopIntegrationTest {
      */
     static class RecordingChatModel implements ChatModel {
 
-        static final String ANSWER = "夜航星一共有 5 首作品。";
+        static final String ANSWER = "找到 2 款 400 元以内且兼容 Mac 的无线键盘。";
 
         private final List<List<Message>> prompts =
                 Collections.synchronizedList(new ArrayList<>());
 
-        volatile String toolName = "search_songs";
+        volatile String toolName = "search_products";
 
-        volatile String toolArgs = "{\"keyword\":\"夜航星\",\"limit\":5}";
+        volatile String toolArgs = "{\"category\":\"KEYBOARD\",\"maxPriceYuan\":400,\"wireless\":true,\"macCompatible\":true}";
 
         void reset() {
             prompts.clear();
-            toolName = "search_songs";
-            toolArgs = "{\"keyword\":\"夜航星\",\"limit\":5}";
+            toolName = "search_products";
+            toolArgs = "{\"category\":\"KEYBOARD\",\"maxPriceYuan\":400,\"wireless\":true,\"macCompatible\":true}";
         }
 
         int size() {

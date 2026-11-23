@@ -46,7 +46,7 @@ export interface JsonRequestOptions {
    * 只允许这几种：不提供 PUT / PATCH，是因为当前没有任何接口需要
    * "部分更新"语义；少一种方法就少一类误用。
    */
-  method?: 'GET' | 'POST' | 'DELETE'
+  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   query?: Record<string, string | number | undefined>
   signal?: AbortSignal
   body?: unknown

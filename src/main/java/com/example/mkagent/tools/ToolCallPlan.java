@@ -1,6 +1,6 @@
 package com.example.mkagent.tools;
 
-import com.example.mkagent.music.IdempotencyKeys;
+import com.example.mkagent.idempotency.IdempotencyKeys;
 import org.springframework.ai.chat.messages.AssistantMessage;
 
 import java.util.ArrayDeque;

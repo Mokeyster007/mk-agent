@@ -82,6 +82,41 @@ public class ShopProperties {
      */
     private int aftersaleListLimit = 50;
 
+    /**
+     * 客服驳回原因的最大长度（按 Unicode 码点计）。
+     *
+     * <p>与 {@code shop_aftersale_decision.reason VARCHAR(200)} 对齐。
+     * 单独一个字段而不是复用 {@code maxReturnReasonLength}：
+     * 两者是不同角色填的不同字段，共用一个上限会让"改买家规则"
+     * 悄悄改掉客服的约束。
+     */
+    private int maxRejectReasonLength = 200;
+
+    /**
+     * 收货验货备注的最大长度（按 Unicode 码点计）。
+     *
+     * <p>与 {@code shop_aftersale_receipt.note VARCHAR(200)} 对齐。
+     * 同样单独一个字段：买家原因、客服驳回原因、仓库备注是三个角色填的三个字段，
+     * 共用一个上限会让"改买家规则"悄悄改掉仓库的约束。
+     */
+    private int maxReceiptNoteLength = 200;
+
+    public int getMaxReceiptNoteLength() {
+        return maxReceiptNoteLength;
+    }
+
+    public void setMaxReceiptNoteLength(int maxReceiptNoteLength) {
+        this.maxReceiptNoteLength = maxReceiptNoteLength;
+    }
+
+    public int getMaxRejectReasonLength() {
+        return maxRejectReasonLength;
+    }
+
+    public void setMaxRejectReasonLength(int maxRejectReasonLength) {
+        this.maxRejectReasonLength = maxRejectReasonLength;
+    }
+
     public int getReturnWindowDays() {
         return returnWindowDays;
     }

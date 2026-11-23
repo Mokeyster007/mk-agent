@@ -2,6 +2,8 @@ package com.example.mkagent.controller;
 
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.shop.ShopAccessGuard;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.api.AfterSaleViews;
@@ -18,6 +20,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * 买家侧售后接口：普通退货表单 + 我的售后。
@@ -120,20 +123,30 @@ public class AfterSaleController {
                 request.reason(),
                 request.clientRequestId());
 
-        return AfterSaleViews.detail(created, afterSaleService.events(created.id()));
+        return AfterSaleViews.detail(afterSaleService.detail(created));
     }
 
-    /** 我的售后列表（新的在前，不含事件流）。 */
+    /**
+     * 我的售后列表（新的在前，不含事件流与收货明细）。
+     *
+     * <p>进度会带上：买家需要一眼看出"仓库收了没有"；退款也会带上，
+     * 让他知道这张单有没有生成过**模拟退款**（不代表资金到账）。
+     */
     @GetMapping("/returns")
     public List<ReturnVO> myReturns() {
         String buyerId = accessGuard.requireBuyerIdentity();
 
-        return afterSaleService.myReturns(buyerId).stream()
-                .map(AfterSaleViews::summary)
+        List<AfterSaleReturn> values = afterSaleService.myReturns(buyerId);
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(values);
+
+        return values.stream()
+                .map(value -> AfterSaleViews.summary(
+                        value, progress.get(value.id()), refunds.get(value.id())))
                 .toList();
     }
 
-    /** 售后详情（含事件流）。 */
+    /** 售后详情（含事件流、决策与收货记录）。 */
     @GetMapping("/returns/{returnNo}")
     public ReturnVO myReturn(@PathVariable String returnNo) {
         String buyerId = accessGuard.requireBuyerIdentity();
@@ -143,7 +156,7 @@ public class AfterSaleController {
         }
 
         return afterSaleService.myReturn(buyerId, returnNo)
-                .map(value -> AfterSaleViews.detail(value, afterSaleService.events(value.id())))
+                .map(value -> AfterSaleViews.detail(afterSaleService.detail(value)))
                 .orElseThrow(() -> new BusinessException(
                         404, "RETURN_NOT_FOUND", "退货申请不存在：" + returnNo));
     }

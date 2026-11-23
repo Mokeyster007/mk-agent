@@ -104,16 +104,24 @@ export function resumeStateMeta(state: string | null | undefined): { label: stri
   return RESUME_STATE_MAP[state] ?? { label: state, tone: 'neutral' }
 }
 
-/** 工具名 → 中文动作名。只映射后端白名单里真实存在的工具。 */
+/** 工具名 → 中文动作名。只映射后端电商/售后白名单里真实存在的工具。 */
 const TOOL_LABEL_MAP: Record<string, string> = {
-  search_songs: '搜索歌曲',
-  get_song_detail: '查询歌曲详情',
-  get_user_playlists: '查询我的歌单',
-  get_playlist_songs: '查询歌单歌曲',
-  get_play_stats: '统计播放数据',
-  get_top_songs: '查询热门歌曲',
-  create_playlist: '创建歌单',
-  add_songs_to_playlist: '向歌单添加歌曲',
+  search_products: '按条件筛选商品',
+  compare_products: '对比商品规格',
+  get_product_detail: '查询商品详情',
+  get_my_cart: '查看购物车',
+  add_to_cart: '加入购物车',
+  update_cart_item: '修改购物车数量',
+  remove_cart_item: '移出购物车',
+  preview_checkout: '生成结算预览',
+  submit_checkout_order: '确认提交演示订单',
+  list_my_recent_orders: '查询最近订单',
+  list_my_signed_orders: '查询可退签收订单',
+  get_my_order_detail: '查询订单详情',
+  check_return_eligibility: '核对退货资格',
+  list_my_return_requests: '查询退货单列表',
+  preview_return: '试算退货申请',
+  submit_return: '提交退货申请',
   terminate_task: '结束任务',
 }
 
@@ -124,8 +132,8 @@ export function toolLabel(tool: string | null | undefined): string {
   return TOOL_LABEL_MAP[tool] ?? tool
 }
 
-/** 只读工具集合，用于给工具轨迹加"只读/写入"标记 */
-const WRITE_TOOLS = new Set(['create_playlist', 'add_songs_to_playlist'])
+/** 写工具集合（需审批确认的落单写操作） */
+const WRITE_TOOLS = new Set(['submit_checkout_order', 'submit_return'])
 
 export function isWriteTool(tool: string | null | undefined): boolean {
   return !!tool && WRITE_TOOLS.has(tool)

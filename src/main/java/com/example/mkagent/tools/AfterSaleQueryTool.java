@@ -2,15 +2,20 @@ package com.example.mkagent.tools;
 
 import com.example.mkagent.context.AgentRunContextHolder;
 import com.example.mkagent.shop.aftersale.AfterSalePreview;
+import com.example.mkagent.shop.aftersale.AfterSaleReceiptProgress;
+import com.example.mkagent.shop.aftersale.AfterSaleRefund;
 import com.example.mkagent.shop.aftersale.AfterSaleReturn;
 import com.example.mkagent.shop.aftersale.AfterSaleService;
 import com.example.mkagent.shop.aftersale.ReturnSubject;
+import com.example.mkagent.shop.api.AfterSaleViews;
+import com.example.mkagent.shop.api.ShopViews;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -104,7 +109,7 @@ public class AfterSaleQueryTool {
 
                     返回：订单状态、签收时间、商品快照、成交单价、
                     已购 / 已占用 / 剩余可退数量、退货窗口天数与截止时间，
-                    以及该订单已有的退货申请列表。
+                    以及该订单已有的退货申请列表（含已批准单的收货进度）。
 
                     订单号必须来自 list_my_signed_orders 或用户明确提供的订单号；
                     不要编造订单号。
@@ -125,16 +130,11 @@ public class AfterSaleQueryTool {
         int windowDays = afterSaleService.returnWindowDays();
 
         List<Object> returns = new ArrayList<>();
-        for (AfterSaleReturn existing : afterSaleService.returnsOfOrderItem(value.orderItemId())) {
-            returns.add(new ReturnRow(
-                    existing.returnNo(),
-                    existing.orderNo(),
-                    existing.productName(),
-                    existing.quantity(),
-                    existing.status().name(),
-                    existing.status().label(),
-                    existing.source().name(),
-                    existing.createdAt() == null ? null : existing.createdAt().toString()));
+        List<AfterSaleReturn> existingReturns = afterSaleService.returnsOfOrderItem(value.orderItemId());
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(existingReturns);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(existingReturns);
+        for (AfterSaleReturn existing : existingReturns) {
+            returns.add(toReturnRow(existing, progress.get(existing.id()), refunds.get(existing.id())));
         }
 
         return ToolResponseEnvelope.okSingle(new OrderDetailRow(
@@ -177,6 +177,7 @@ public class AfterSaleQueryTool {
                     preview.orderNo(),
                     preview.productName(),
                     preview.requestedQty(),
+                    null,
                     preview.unitPriceCents(),
                     preview.refundCents(),
                     preview.quota().purchased(),
@@ -198,8 +199,35 @@ public class AfterSaleQueryTool {
                     用途：回答"我上次那单退得怎么样了"，以及**在提交前确认是否已经退过**，
                     避免同一订单行重复申请。
 
-                    A1 阶段所有申请的状态都是「已提交」（等待客服处理）；
-                    没有客服批准、没有退款、没有退货入库。
+                    状态含义：SUBMITTED 等客服处理；APPROVED 客服已同意退（等仓库收货）；
+                    REJECTED 已驳回。已批准的单会带收货进度字段：
+                    receivedQty（仓库累计实收）、remainingQty（还没收到的数量）、
+                    receiptProgress / receiptProgressLabel（NONE/PARTIAL/COMPLETE，
+                    未收货 / 部分收货 / 全部收货）；未批准时这些字段为 null。
+
+                    stageCode / stageLabel / stageHint 是**给人看的阶段**（服务端算好的，
+                    与买家页面同一套措辞）：WAITING_DECISION 待客服处理、REJECTED 已驳回
+                    （终止，没有后续收货或退款）、WAITING_RECEIPT 待收货、
+                    PARTIAL_RECEIPT 部分收货、RECEIVED_NOT_REFUNDED 已全部收货但尚未登记模拟退款、
+                    REFUNDED 已登记模拟退款。回答"退到哪一步"时优先引用 stageLabel + hint，
+                    不要自己另起一套说法。
+
+                    收货口径：receivedQty 是**累计实收**，损坏件也计入；
+                    qualifiedQty 只影响"能不能再卖"，不影响"是否收满"。
+
+                    退款字段（只读）：refundNo（模拟退款单号）、refundAmountCents /
+                    refundAmountText（金额，分 / ¥ 文案）、refundLabel（固定为"模拟退款"）。
+                    它们为 null 表示这单还没有退款记录——此时应回答"尚未登记模拟退款"，
+                    不能说"已退款"，也不能说"正在退款中"。
+
+                    口径必须说对：这是**模拟退款**，只代表业务上生成了一条退款记录，
+                    没有真实资金流、没有到账、没有支付渠道结果可查。
+                    不要说"钱已退回"或"已到账"；也不要因为收了货就回答"已退款"。
+                    不要推断物流轨迹或到账时间，那些数据不在本工具里。
+
+                    也不要去解释"真实退款会走哪个支付渠道、要几个工作日到账"——
+                    同样没有这些数据，说了就是编。用户追问到账时间时，
+                    只回答"这笔是模拟退款，没有真实资金流，查不到到账时间"。
                     """
     )
     public String listMyReturnRequests(
@@ -211,19 +239,14 @@ public class AfterSaleQueryTool {
         String filter = orderNo == null ? "" : orderNo.trim();
 
         List<Object> rows = new ArrayList<>();
-        for (AfterSaleReturn value : afterSaleService.myReturns(userId)) {
+        List<AfterSaleReturn> values = afterSaleService.myReturns(userId);
+        Map<Long, AfterSaleReceiptProgress> progress = afterSaleService.progressOf(values);
+        Map<Long, AfterSaleRefund> refunds = afterSaleService.refundsOf(values);
+        for (AfterSaleReturn value : values) {
             if (!filter.isEmpty() && !filter.equals(value.orderNo())) {
                 continue;
             }
-            rows.add(new ReturnRow(
-                    value.returnNo(),
-                    value.orderNo(),
-                    value.productName(),
-                    value.quantity(),
-                    value.status().name(),
-                    value.status().label(),
-                    value.source().name(),
-                    value.createdAt() == null ? null : value.createdAt().toString()));
+            rows.add(toReturnRow(value, progress.get(value.id()), refunds.get(value.id())));
         }
 
         if (rows.isEmpty()) {
@@ -232,14 +255,55 @@ public class AfterSaleQueryTool {
         return ToolResponseEnvelope.okList(rows);
     }
 
+    /**
+     * 退货申请 → 工具行。
+     *
+     * <p>收货进度、阶段与退款对模型都是**只读事实**：{@code receiptProgress} 为空表示这单还没批准，
+     * 模型应当据此说明"还在等客服处理"，而不是编造"已入库"；
+     * {@code refundNo} 为空表示还没退款，不能因为收满了就推断"已退款"。
+     *
+     * <p>{@code stage} 直接复用 {@link AfterSaleViews#stage}——页面与 Agent
+     * 用同一个函数算阶段，措辞不会漂移。
+     */
+    private static ReturnRow toReturnRow(
+            AfterSaleReturn value,
+            AfterSaleReceiptProgress progress,
+            AfterSaleRefund refund
+    ) {
+        AfterSaleViews.StageVO stage = AfterSaleViews.stage(value, progress, refund);
+        return new ReturnRow(
+                value.returnNo(),
+                value.orderNo(),
+                value.productName(),
+                value.quantity(),
+                progress == null ? null : progress.approvedQty(),
+                value.status().name(),
+                value.status().label(),
+                value.source().name(),
+                value.createdAt() == null ? null : value.createdAt().toString(),
+                stage.code(),
+                stage.label(),
+                stage.hint(),
+                progress == null ? null : progress.receivedQty(),
+                progress == null ? null : progress.remainingQty(),
+                progress == null ? null : progress.code(),
+                progress == null ? null : progress.label(),
+                refund == null ? null : refund.refundNo(),
+                refund == null ? null : refund.amountCents(),
+                refund == null ? null : ShopViews.money(refund.amountCents()),
+                refund == null ? null : AfterSaleViews.LABEL_SIMULATED_REFUND);
+    }
+
     @Tool(
             name = "preview_return",
             description = """
                     预览一次退货申请：退几件、退多少钱、当前额度是多少、能不能提交。
-                    **不写任何数据、不占额度**。
+                    **不写任何数据、不占额度，也不会生成确认卡**。
 
                     调用它之前必须先确认：订单号、退货数量、退货原因三项都已明确。
-                    返回结果用于向用户复述"将要提交什么"，随后调用 submit_return 走人工确认。
+                    重要：如果用户已经明确要提交退货且本工具返回 eligible=true，
+                    你必须在下一步**立即调用 submit_return** 触发人工确认卡，
+                    不得只回复“正在为您提交”或“请确认”就结束本轮！
 
                     预览不是资格凭证：从预览到用户点确认之间，额度可能被另一笔申请用掉，
                     因此 submit_return 执行时会在事务内重新校验。
@@ -254,10 +318,13 @@ public class AfterSaleQueryTool {
 
         try {
             AfterSalePreview preview = afterSaleService.preview(userId, orderNo, quantity, reason);
+            String normalizedReason = com.example.mkagent.shop.aftersale.AfterSaleEligibility
+                    .normalizeReason(reason);
             return ToolResponseEnvelope.okSingle(new PreviewRow(
                     preview.orderNo(),
                     preview.productName(),
                     preview.requestedQty(),
+                    normalizedReason,
                     preview.unitPriceCents(),
                     preview.refundCents(),
                     preview.quota().purchased(),
@@ -310,10 +377,22 @@ public class AfterSaleQueryTool {
             String orderNo,
             String productName,
             int quantity,
+            Integer approvedQty,
             String status,
             String statusLabel,
             String source,
-            String createdAt
+            String createdAt,
+            String stageCode,
+            String stageLabel,
+            String stageHint,
+            Integer receivedQty,
+            Integer remainingQty,
+            String receiptProgress,
+            String receiptProgressLabel,
+            String refundNo,
+            Long refundAmountCents,
+            String refundAmountText,
+            String refundLabel
     ) {
     }
 
@@ -322,6 +401,7 @@ public class AfterSaleQueryTool {
             String orderNo,
             String productName,
             int requestedQty,
+            String reason,
             long unitPriceCents,
             long refundCents,
             int purchasedQty,

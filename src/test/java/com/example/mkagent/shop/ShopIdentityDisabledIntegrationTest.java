@@ -53,7 +53,7 @@ class ShopIdentityDisabledIntegrationTest {
         ShopApiClient.Reply reply = api.get("/shop/products", null);
 
         assertEquals(200, reply.status(), reply.raw());
-        assertEquals(3, reply.body().size(), "三个种子商品都应返回");
+        assertEquals(ShopSeedInitializer.SEED_PRODUCT_COUNT, reply.body().size(), "种子商品都应返回");
     }
 
     @Test
@@ -124,10 +124,85 @@ class ShopIdentityDisabledIntegrationTest {
         assertEquals(403, chat.status(), chat.raw());
         assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", chat.text("code"));
 
+        /*
+         * 售后会话入口（A1 收尾新增）：它是"纯商城买家也能建会话"的落点，
+         * 因此更必须在身份不可信时先拒绝——否则就成了绕过守卫的旁路。
+         */
+        ShopApiClient.Reply conversations = api.get("/shop/aftersale/conversations", ADMIN);
+        assertEquals(403, conversations.status(), conversations.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", conversations.text("code"));
+
+        assertEquals(403, api.post("/shop/aftersale/conversations", ADMIN, null).status());
+        assertEquals(403, api.get("/shop/aftersale/conversations/any-id", ADMIN).status());
+
+        Integer conversationsWritten = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM agent_conversation WHERE agent_type = 'AFTER_SALES'",
+                Integer.class);
+        assertEquals(0, conversationsWritten, "被拒绝的请求不得留下售后会话");
+
         assertEquals(0, ShopTestFixture.totalReturns(jdbcTemplate), "拒绝的请求不得建单");
         Integer runs = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM agent_run WHERE agent_type = 'AFTER_SALES'",
                 Integer.class);
         assertEquals(0, runs, "身份被拒绝时不得启动售后 Agent");
+    }
+
+    /**
+     * 客服售后接口（B1）：关闭 demo 且没有可信身份时，后台私有读写一律不放行。
+     *
+     * <p>这几个入口能改状态、能释放额度，比"读"更危险：
+     * 身份不可信时放行它们，等于任何人都能把别人的退货申请批掉。
+     * 断言的是 {@code SHOP_IDENTITY_NOT_CONFIGURED}（身份不可用）
+     * 而不是 {@code NOT_ADMIN}（权限不足）——先解释"为什么不行"。
+     */
+    @Test
+    @DisplayName("客服售后接口一律拒绝：列表、详情、批准、驳回、收货、模拟退款都不放行")
+    void afterSaleAdminEntriesRejected() {
+        ShopApiClient.Reply list = api.get("/shop/admin/aftersale/returns", ADMIN);
+        assertEquals(403, list.status(), list.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", list.text("code"));
+
+        assertEquals(403, api.get("/shop/admin/aftersale/returns/RT-ANY", ADMIN).status());
+
+        ShopApiClient.Reply approve = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/approve", ADMIN, null);
+        assertEquals(403, approve.status(), approve.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", approve.text("code"));
+
+        ShopApiClient.Reply reject = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/reject", ADMIN,
+                Map.of("reason", "尝试驳回"));
+        assertEquals(403, reject.status(), reject.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", reject.text("code"));
+
+        // B2：收货会改可售库存，身份不可信时同样一律拒绝
+        ShopApiClient.Reply receive = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/receipts", ADMIN,
+                Map.of("receivedQty", 1, "qualifiedQty", 1, "damagedQty", 0,
+                        "clientRequestId", "rc-disabled-0001"));
+        assertEquals(403, receive.status(), receive.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", receive.text("code"));
+
+        /*
+         * B3：模拟退款虽然是"模拟"，但它会落一条不可重复的退款记录（一张退货单最多一笔）。
+         * 身份不可信时放行，等于谁都能把别人的退货单标成"已退款"，
+         * 而且这个标记一旦落下就没有第二笔来纠正——所以同样必须在这里先拒绝。
+         */
+        ShopApiClient.Reply refund = api.post(
+                "/shop/admin/aftersale/returns/RT-ANY/refund", ADMIN, null);
+        assertEquals(403, refund.status(), refund.raw());
+        assertEquals("SHOP_IDENTITY_NOT_CONFIGURED", refund.text("code"));
+
+        Integer decisions = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_decision", Integer.class);
+        assertEquals(0, decisions, "被拒绝的请求不得留下决策记录");
+
+        Integer receipts = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_receipt", Integer.class);
+        assertEquals(0, receipts, "被拒绝的请求不得留下收货记录");
+
+        Integer refunds = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM shop_aftersale_refund", Integer.class);
+        assertEquals(0, refunds, "被拒绝的请求不得留下退款记录");
     }
 }

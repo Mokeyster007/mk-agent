@@ -9,7 +9,8 @@
  *
  * 页面不判断权限：能不能提交由服务端判定，页面只按 code 显示原因。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import AppShell from '@/components/AppShell.vue'
 import ShopNav from '@/components/ShopNav.vue'
 import AppIcon from '@/components/AppIcon.vue'
@@ -18,23 +19,46 @@ import AfterSaleChatPanel from '@/components/AfterSaleChatPanel.vue'
 import AfterSaleReturnPanel from '@/components/AfterSaleReturnPanel.vue'
 import { session } from '@/stores/session'
 import { shop } from '@/stores/shop'
-import { afterSale } from '@/stores/aftersale'
+import { afterSale, afterSaleStatusTone } from '@/stores/aftersale'
 import { createAfterSaleChatStore } from '@/stores/aftersaleChat'
-import { runAfterSaleChat } from '@/api/aftersale'
-import { createConversation } from '@/api/conversations'
+import {
+  createAfterSaleConversation,
+  getAfterSaleConversation,
+  prepareAfterSaleApproval,
+  runAfterSaleChat,
+  type AfterSaleReturnDraft,
+} from '@/api/aftersale'
 import { decideApproval, getApproval, resumeApproval } from '@/api/approvals'
 import { formatDateTime } from '@/utils/format'
 
+const route = useRoute()
 const navOpen = ref(false)
+
+/**
+ * 售后会话的持久化 key。
+ *
+ * 按**身份**分开：同一个浏览器换人之后，不能续上上一个人的会话。
+ * 会话本身在服务端也带领域（AFTER_SALES）与归属，这里的 key 只是前端便利。
+ */
+function conversationStorageKey(): string {
+  return `mkagent.aftersaleConversation.${session.userId.value ?? 'anonymous'}`
+}
 
 /**
  * 对话 store 在页面里建，是为了把"批准之后刷新业务数据"接上：
  * 批准只代表同意执行，是否真的建单要看「我的售后」——
  * 所以执行完必须重新读一次列表与额度，而不是相信对话里的措辞。
+ *
+ * 会话用**售后自己的**接口（`/api/shop/aftersale/conversations`），
+ * 不用 `/api/ai/conversations`：后者要求 music_user，
+ * 只有商城身份的合法买家会被 403，追问就退化成单轮了。
  */
 const chat = createAfterSaleChatStore({
   chat: runAfterSaleChat,
-  conversation: createConversation,
+  conversation: createAfterSaleConversation,
+  conversationDetail: getAfterSaleConversation,
+  prepareApproval: prepareAfterSaleApproval,
+  storageKey: conversationStorageKey,
   approval: getApproval,
   decide: decideApproval,
   resume: resumeApproval,
@@ -45,6 +69,23 @@ const chat = createAfterSaleChatStore({
 
 const detailOpen = computed(() => afterSale.state.detail !== null)
 const selected = computed(() => afterSale.quotaOf(afterSale.form.orderNo))
+const activeChatOrder = computed(() =>
+  chat.activeOrderNo.value ? afterSale.quotaOf(chat.activeOrderNo.value) : null,
+)
+
+function bindOrderContext(orderNo: string): void {
+  afterSale.selectOrder(orderNo)
+  chat.setActiveOrder(orderNo)
+}
+
+function applyDraftToForm(draft: AfterSaleReturnDraft): void {
+  afterSale.selectOrder(draft.orderNo)
+  afterSale.setQuantity(draft.quantity)
+  afterSale.setReason(draft.reason)
+  chat.setActiveOrder(draft.orderNo)
+  const formEl = document.getElementById('form')
+  formEl?.scrollIntoView({ behavior: 'smooth' })
+}
 const maxQuantity = computed(() => {
   const order = selected.value
   return order ? Math.max(1, order.quota.purchased) : 1
@@ -84,6 +125,8 @@ async function onSwitchIdentity(userId: string): Promise<void> {
   chat.reset()
   await shop.loadSession()
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
+  // 新身份可能有自己的售后会话，尝试恢复（没有就是空对话）
+  await chat.restore()
 }
 
 async function reloadAll(): Promise<void> {
@@ -91,9 +134,20 @@ async function reloadAll(): Promise<void> {
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
 }
 
+function applyRouteOrder(): void {
+  const q = route.query.orderNo
+  if (typeof q === 'string' && q.trim()) {
+    bindOrderContext(q.trim())
+  }
+}
+
+watch(() => route.query.orderNo, () => applyRouteOrder())
+
 onMounted(async () => {
   await shop.loadSession()
   await Promise.all([afterSale.loadOrders(), afterSale.loadReturns()])
+  applyRouteOrder()
+  await chat.restore()
 })
 </script>
 
@@ -111,7 +165,7 @@ onMounted(async () => {
     <template #topbar>
       <div class="topbar">
         <h1 class="topbar__title">售后</h1>
-        <span class="topbar__demo">A1 · 只到「已提交」</span>
+        <span class="topbar__demo">B1 · 客服可批准 / 驳回</span>
 
         <div class="topbar__right">
           <span class="topbar__identity" :title="shop.state.session?.userId ?? '未识别'">
@@ -138,7 +192,14 @@ onMounted(async () => {
           {{ afterSale.state.notice }}
         </p>
 
-        <AfterSaleChatPanel :chat="chat" />
+        <AfterSaleChatPanel
+          :chat="chat"
+          :active-order="activeChatOrder"
+          @clear-order="chat.setActiveOrder(null)"
+          @pick-order="bindOrderContext"
+          @fill-form="applyDraftToForm"
+          @open-return="afterSale.openReturn"
+        />
 
         <section id="orders" class="section">
           <header class="section__head">
@@ -188,7 +249,7 @@ onMounted(async () => {
                   type="button"
                   class="mk-btn mk-btn--sm"
                   :disabled="!order.returnable"
-                  @click="afterSale.selectOrder(order.orderNo)"
+                  @click="bindOrderContext(order.orderNo)"
                 >
                   申请退货
                 </button>
@@ -332,7 +393,9 @@ onMounted(async () => {
             >
               <div class="return__main">
                 <div class="return__title">
-                  <span class="chip chip--ok">{{ item.statusLabel }}</span>
+                  <span class="chip" :class="`chip--${afterSaleStatusTone(item.status)}`">
+                    {{ item.statusLabel }}
+                  </span>
                   <span class="return__no">{{ item.returnNo }}</span>
                   <span class="return__source">{{ item.sourceLabel }}</span>
                 </div>
@@ -341,10 +404,42 @@ onMounted(async () => {
                   <span class="return__sku">{{ item.sku }}</span>
                 </p>
                 <p class="return__meta">
-                  原订单 {{ item.orderNo }} · 预计退款 {{ item.refundText }} · 提交
-                  {{ formatDateTime(item.createdAt) }}
+                  原订单 {{ item.orderNo }}
+                  <!-- F-04：已驳回单不再并列展示“预计退款”，避免给买家退款错觉 -->
+                  <template v-if="item.status !== 'REJECTED'"> · 预计退款 {{ item.refundText }}</template>
+                  · 提交 {{ formatDateTime(item.createdAt) }}
+                </p>
+                <!-- 当前阶段：服务端算好的措辞，与详情/售后 Agent 一致 -->
+                <p class="return__stage" :data-stage="item.stage.code">
+                  阶段：{{ item.stage.label }}
+                  <span v-if="item.progress" class="return__stage-counts">
+                    （已收 {{ item.progress.receivedQty }}/{{ item.progress.approvedQty }} 件，还差
+                    {{ item.progress.remainingQty }} 件）
+                  </span>
                 </p>
                 <p class="return__reason">原因：{{ item.reason }}</p>
+                <p
+                  v-if="item.refund"
+                  class="return__refund"
+                  :data-refund-for="item.returnNo"
+                >
+                  {{ item.refund.label }} {{ item.refund.amountText }}
+                  <span class="return__refund-note">
+                    （{{ item.refund.refundNo }} · 模拟流程，不会真的打款）
+                  </span>
+                </p>
+                <p v-if="item.status === 'REJECTED'" class="return__decision" data-reject-note>
+                  客服已驳回，本次申请占用的额度已释放；驳回原因在详情里。
+                </p>
+                <p v-else-if="item.status === 'APPROVED'" class="return__decision" data-approve-note>
+                  客服已批准，这 {{ item.quantity }} 件仍计入已占用额度。
+                  <span v-if="item.progress" data-receipt-note>
+                    仓库收货：{{ item.progress.label }} {{ item.progress.receivedQty }}/{{
+                      item.progress.approvedQty
+                    }}
+                    件，还可收 {{ item.progress.remainingQty }} 件。
+                  </span>
+                </p>
               </div>
 
               <div class="return__side">
@@ -361,8 +456,11 @@ onMounted(async () => {
         </section>
 
         <p class="foot-note">
-          本轮只做到「已提交、可查」。A1 不修改可售库存、不写退货入库流水；
-          客服审核、仓库验收、退货入库与退款都在后续阶段。
+          B1 起客服会批准或驳回：批准保留原额度，驳回释放本单占用的额度。
+          批准后仓库会分批收货验货，只有合格数量回补可售库存，损坏只留记录；
+          收货不释放额度。
+          B3 起全部收满后客服会生成一笔<strong>模拟退款</strong>：金额按「成交单价 × 累计实收」结算，
+          不动库存、不释放额度、不接支付平台——这里没有真实资金流，页面上不会出现任何资金已结清的措辞。
         </p>
       </div>
     </div>
@@ -560,6 +658,31 @@ onMounted(async () => {
   overflow-wrap: anywhere;
 }
 
+.return__refund {
+  font-size: var(--fs-xs);
+  color: var(--c-ok);
+  overflow-wrap: anywhere;
+}
+
+.return__refund-note {
+  color: var(--c-text-3);
+}
+
+.return__stage {
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+}
+
+.return__stage-counts {
+  color: var(--c-text-3);
+}
+
+.return__decision {
+  font-size: var(--fs-xs);
+  color: var(--c-text-3);
+  overflow-wrap: anywhere;
+}
+
 .order__side,
 .return__side {
   display: flex;
@@ -714,6 +837,11 @@ onMounted(async () => {
 .chip--wait {
   background: var(--c-warn-weak);
   color: var(--c-warn);
+}
+
+.chip--neutral {
+  background: var(--c-surface-2);
+  color: var(--c-text-2);
 }
 
 .muted {

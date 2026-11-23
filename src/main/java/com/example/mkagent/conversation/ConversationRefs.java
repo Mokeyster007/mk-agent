@@ -3,85 +3,94 @@ package com.example.mkagent.conversation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 会话级"业务引用"：让模型能解析"这首歌""前两首""刚才那个歌单"。
+ * 会话级“业务引用”：让模型能确定性地解析“第二款加一把”“就是这一单”“刚才那份预览”。
  *
- * <p>来源只有**真实工具结果**（{@link BusinessRefCollector} 解析工具返回的信封），
- * 绝不从模型回答里正则抠 ID——模型可以写错、可以编，ID 必须来自数据库。
- *
- * <p>为什么不把工具调用本身存进会话再回放：
- * 回放旧的 tool_call / tool_response 会让模型把历史指令当成本轮指令重新执行
- * （"把前两首建歌单"被重放成再建一次）。这里只保留**对象事实**，
- * 需要写库时模型仍然要走工具 + 审批。
- *
- * <p>只保留"最近一次"：songs 被最近一次搜索/查看覆盖，playlists 被最近一次
- * 歌单列表覆盖。会话跨主题时旧引用自然失效，比无限累积更安全。
+ * <p>来源只有**真实工具结果**（{@link BusinessRefCollector} 解析工具信封），
+ * 绝不从模型回答里正则抠 ID/SKU/订单号。
+ * 兼容旧库里的历史 JSON（未知字段自动忽略，绝不因历史记录卡住会话）。
  */
 public record ConversationRefs(
-        List<SongRef> songs,
-        List<PlaylistRef> playlists,
-        PlaylistRef lastPlaylist
+        List<ProductRef> products,
+        List<OrderRef> orders,
+        ReturnPreviewRef lastReturnPreview,
+        CheckoutPreviewRef lastCheckoutPreview
 ) {
 
-    /** 单首歌的引用：只留 ID 与标题，够模型指代即可。 */
-    public record SongRef(long id, String title) {
+    /** 候选商品引用：保留顺序以支持“第一款/第二款”绑定到具体 SKU。 */
+    public record ProductRef(long id, String sku, String name, long priceCents, int available) {
     }
 
-    /** 歌单引用：ID + 名称。 */
-    public record PlaylistRef(long id, String name) {
+    /** 订单引用：来自 list_my_signed_orders 或 get_my_order_detail。 */
+    public record OrderRef(
+            String orderNo,
+            String sku,
+            String productName,
+            int remainingQty,
+            boolean returnable
+    ) {
+    }
+
+    /** 最近一次合格的退货预览引用（不代表已提交）。 */
+    public record ReturnPreviewRef(
+            String orderNo,
+            String productName,
+            int quantity,
+            String reason,
+            long refundCents
+    ) {
+    }
+
+    /** 最近一次合格的结算预览引用（不代表已下单）。 */
+    public record CheckoutPreviewRef(
+            long productId,
+            String sku,
+            String productName,
+            int quantity,
+            long unitPriceCents,
+            long totalCents
+    ) {
     }
 
     public static final ConversationRefs EMPTY =
-            new ConversationRefs(List.of(), List.of(), null);
+            new ConversationRefs(List.of(), List.of(), null, null);
 
-    /** 单次最多保留多少首歌：够覆盖"前三首/前五首"，再多只是白占 token。 */
-    private static final int MAX_SONGS = 10;
-
-    private static final int MAX_PLAYLISTS = 10;
+    private static final int MAX_ITEMS = 12;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public boolean isEmpty() {
-        return songs.isEmpty() && playlists.isEmpty() && lastPlaylist == null;
+        return products.isEmpty()
+                && orders.isEmpty()
+                && lastReturnPreview == null
+                && lastCheckoutPreview == null;
     }
 
-    /**
-     * 用新一批搜索结果**替换**歌曲引用。
-     *
-     * <p>刻意是替换而不是合并：用户又搜了一次却没搜到东西时，
-     * 旧的"前两首"必须失效。合并会让模型拿着上一次的结果回答"第一首"，
-     * 那是最难发现的错误——用户以为问的是这次的结果。
-     */
-    public ConversationRefs withSongs(List<SongRef> next) {
-        return new ConversationRefs(cap(next, MAX_SONGS), playlists, lastPlaylist);
+    /** 用新一批检索结果替换候选商品（新搜索无结果时清空旧候选，避免错绑）。 */
+    public ConversationRefs withProducts(List<ProductRef> next) {
+        return new ConversationRefs(cap(next, MAX_ITEMS), orders, lastReturnPreview, lastCheckoutPreview);
     }
 
-    /** 用新一批歌单列表替换歌单引用（同上，替换而非合并）。 */
-    public ConversationRefs withPlaylists(List<PlaylistRef> next) {
-        return new ConversationRefs(songs, cap(next, MAX_PLAYLISTS), lastPlaylist);
+    /** 用新一批订单列表替换候选订单。 */
+    public ConversationRefs withOrders(List<OrderRef> next) {
+        return new ConversationRefs(products, cap(next, MAX_ITEMS), lastReturnPreview, lastCheckoutPreview);
     }
 
-    /**
-     * 记下"最近创建/确认的歌单"。
-     *
-     * <p>只动这一项：新建歌单不应该把用户已有歌单列表挤掉，
-     * 否则紧接着问"我有哪些歌单"就答不全了。
-     */
-    public ConversationRefs withLastPlaylist(PlaylistRef playlist) {
-        return new ConversationRefs(songs, playlists, playlist);
+    public ConversationRefs withLastReturnPreview(ReturnPreviewRef next) {
+        return new ConversationRefs(products, orders, next, lastCheckoutPreview);
     }
 
-    /**
-     * 渲染成给模型看的一段事实清单。
-     *
-     * <p>没有任何引用时返回 null（调用方据此决定不注入），
-     * 避免给模型一段空的"已知对象"反而诱导它编造。
-     */
+    public ConversationRefs withLastCheckoutPreview(CheckoutPreviewRef next) {
+        return new ConversationRefs(products, orders, lastReturnPreview, next);
+    }
+
+    /** 渲染成注入给模型的事实块；无引用时返回 null。 */
     public String renderBlock() {
         if (isEmpty()) {
             return null;
@@ -90,58 +99,104 @@ public record ConversationRefs(
         StringBuilder sb = new StringBuilder();
         sb.append("[会话已知对象｜来自真实工具结果，不是模型自述]\n");
 
-        if (!songs.isEmpty()) {
-            sb.append("最近一次搜索到的歌曲（按返回顺序，序号可用于\"第一首/前两首\"）：\n");
+        if (!products.isEmpty()) {
+            sb.append("最近一次筛选出的候选商品（严格按返回顺序编号，用于解析“第一款/第二款”）：\n");
             int index = 1;
-            for (SongRef song : songs) {
+            for (ProductRef p : products) {
                 sb.append(index++).append(". ")
-                        .append(safe(song.title()))
-                        .append("（id=").append(song.id()).append("）\n");
+                        .append(safe(p.name()))
+                        .append("（sku=").append(safe(p.sku()))
+                        .append(", productId=").append(p.id())
+                        .append(", 现价=").append(money(p.priceCents()))
+                        .append(", 库存=").append(p.available()).append(" 件）\n");
             }
         }
 
-        if (lastPlaylist != null) {
-            sb.append("最近一次创建/确认的歌单：")
-                    .append(safe(lastPlaylist.name()))
-                    .append("（id=").append(lastPlaylist.id()).append("）\n");
+        if (lastCheckoutPreview != null) {
+            sb.append("最近一次结算预览（尚未下单）：")
+                    .append(safe(lastCheckoutPreview.productName()))
+                    .append("（sku=").append(safe(lastCheckoutPreview.sku()))
+                    .append(", productId=").append(lastCheckoutPreview.productId())
+                    .append(", 数量=").append(lastCheckoutPreview.quantity())
+                    .append(", 单价=").append(money(lastCheckoutPreview.unitPriceCents()))
+                    .append(", 总额=").append(money(lastCheckoutPreview.totalCents()))
+                    .append("）\n");
         }
 
-        if (!playlists.isEmpty()) {
-            sb.append("当前用户的歌单：\n");
-            for (PlaylistRef playlist : playlists) {
-                sb.append("- ")
-                        .append(safe(playlist.name()))
-                        .append("（id=").append(playlist.id()).append("）\n");
+        if (!orders.isEmpty()) {
+            sb.append("最近查询到的本人已签收/关联订单（用于确认退货目标）：\n");
+            int index = 1;
+            for (OrderRef o : orders) {
+                sb.append(index++).append(". 订单号 ").append(safe(o.orderNo()))
+                        .append("｜").append(safe(o.productName()))
+                        .append("（sku=").append(safe(o.sku()))
+                        .append(", 剩余可退=").append(o.remainingQty())
+                        .append(" 件, 当前可退=").append(o.returnable() ? "是" : "否")
+                        .append("）\n");
             }
         }
 
-        sb.append("规则：指代不清时按上面的顺序解析；只能使用上面列出的 id，"
-                + "不要编造列表以外的 id；真正写库仍然要调用工具并等待用户批准。");
+        if (lastReturnPreview != null) {
+            sb.append("最近一次合格的退货试算（尚未提交）：订单号 ")
+                    .append(safe(lastReturnPreview.orderNo()))
+                    .append("，商品 ").append(safe(lastReturnPreview.productName()))
+                    .append("，数量 ").append(lastReturnPreview.quantity())
+                    .append(" 件，原因「").append(safe(lastReturnPreview.reason()))
+                    .append("」，预计退款 ").append(money(lastReturnPreview.refundCents()))
+                    .append("\n");
+        }
 
+        sb.append("规则：仅可使用上方列出的真实 sku / productId / 订单号，不得编造；"
+                + "指代有歧义或列表为空时必须先向用户确认；下单与提交退货均需经人工确认卡。");
         return sb.toString();
     }
 
     public String toJson() {
         Map<String, Object> root = new LinkedHashMap<>();
 
-        List<Map<String, Object>> songNodes = new ArrayList<>();
-        for (SongRef song : songs) {
-            songNodes.add(Map.of("id", song.id(), "title", song.title() == null ? "" : song.title()));
+        List<Map<String, Object>> productNodes = new ArrayList<>();
+        for (ProductRef p : products) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", p.id());
+            m.put("sku", p.sku() == null ? "" : p.sku());
+            m.put("name", p.name() == null ? "" : p.name());
+            m.put("priceCents", p.priceCents());
+            m.put("available", p.available());
+            productNodes.add(m);
         }
-        root.put("songs", songNodes);
+        root.put("products", productNodes);
 
-        List<Map<String, Object>> playlistNodes = new ArrayList<>();
-        for (PlaylistRef playlist : playlists) {
-            playlistNodes.add(Map.of(
-                    "id", playlist.id(),
-                    "name", playlist.name() == null ? "" : playlist.name()));
+        List<Map<String, Object>> orderNodes = new ArrayList<>();
+        for (OrderRef o : orders) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("orderNo", o.orderNo() == null ? "" : o.orderNo());
+            m.put("sku", o.sku() == null ? "" : o.sku());
+            m.put("productName", o.productName() == null ? "" : o.productName());
+            m.put("remainingQty", o.remainingQty());
+            m.put("returnable", o.returnable());
+            orderNodes.add(m);
         }
-        root.put("playlists", playlistNodes);
+        root.put("orders", orderNodes);
 
-        if (lastPlaylist != null) {
-            root.put("lastPlaylist", Map.of(
-                    "id", lastPlaylist.id(),
-                    "name", lastPlaylist.name() == null ? "" : lastPlaylist.name()));
+        if (lastReturnPreview != null) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("orderNo", lastReturnPreview.orderNo());
+            m.put("productName", lastReturnPreview.productName());
+            m.put("quantity", lastReturnPreview.quantity());
+            m.put("reason", lastReturnPreview.reason());
+            m.put("refundCents", lastReturnPreview.refundCents());
+            root.put("lastReturnPreview", m);
+        }
+
+        if (lastCheckoutPreview != null) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("productId", lastCheckoutPreview.productId());
+            m.put("sku", lastCheckoutPreview.sku());
+            m.put("productName", lastCheckoutPreview.productName());
+            m.put("quantity", lastCheckoutPreview.quantity());
+            m.put("unitPriceCents", lastCheckoutPreview.unitPriceCents());
+            m.put("totalCents", lastCheckoutPreview.totalCents());
+            root.put("lastCheckoutPreview", m);
         }
 
         try {
@@ -151,50 +206,71 @@ public record ConversationRefs(
         }
     }
 
-    /**
-     * 从库里读回；坏数据一律当成"没有引用"，不让一条脏 JSON 卡住会话。
-     */
     public static ConversationRefs fromJson(String json) {
         if (json == null || json.isBlank()) {
             return EMPTY;
         }
-
         try {
             JsonNode root = MAPPER.readTree(json);
 
-            List<SongRef> songs = new ArrayList<>();
-            for (JsonNode node : root.path("songs")) {
-                if (node.path("id").canConvertToLong()) {
-                    songs.add(new SongRef(node.path("id").asLong(), node.path("title").asText("")));
+            List<ProductRef> products = new ArrayList<>();
+            for (JsonNode n : root.path("products")) {
+                if (n.path("id").canConvertToLong() && !n.path("sku").asText("").isBlank()) {
+                    products.add(new ProductRef(
+                            n.path("id").asLong(),
+                            n.path("sku").asText(""),
+                            n.path("name").asText(""),
+                            n.path("priceCents").asLong(0L),
+                            n.path("available").asInt(0)));
                 }
             }
 
-            List<PlaylistRef> playlists = new ArrayList<>();
-            for (JsonNode node : root.path("playlists")) {
-                if (node.path("id").canConvertToLong()) {
-                    playlists.add(new PlaylistRef(
-                            node.path("id").asLong(), node.path("name").asText("")));
+            List<OrderRef> orders = new ArrayList<>();
+            for (JsonNode n : root.path("orders")) {
+                String orderNo = n.path("orderNo").asText("");
+                if (!orderNo.isBlank()) {
+                    orders.add(new OrderRef(
+                            orderNo,
+                            n.path("sku").asText(""),
+                            n.path("productName").asText(""),
+                            n.path("remainingQty").asInt(0),
+                            n.path("returnable").asBoolean(false)));
                 }
             }
 
-            PlaylistRef last = null;
-            JsonNode lastNode = root.path("lastPlaylist");
-            if (lastNode.isObject() && lastNode.path("id").canConvertToLong()) {
-                last = new PlaylistRef(
-                        lastNode.path("id").asLong(), lastNode.path("name").asText(""));
+            ReturnPreviewRef returnPreview = null;
+            JsonNode rp = root.path("lastReturnPreview");
+            if (rp.isObject() && !rp.path("orderNo").asText("").isBlank()) {
+                returnPreview = new ReturnPreviewRef(
+                        rp.path("orderNo").asText(""),
+                        rp.path("productName").asText(""),
+                        rp.path("quantity").asInt(1),
+                        rp.path("reason").asText(""),
+                        rp.path("refundCents").asLong(0L));
             }
 
-            return new ConversationRefs(songs, playlists, last);
+            CheckoutPreviewRef checkoutPreview = null;
+            JsonNode cp = root.path("lastCheckoutPreview");
+            if (cp.isObject() && cp.path("productId").canConvertToLong()) {
+                checkoutPreview = new CheckoutPreviewRef(
+                        cp.path("productId").asLong(),
+                        cp.path("sku").asText(""),
+                        cp.path("productName").asText(""),
+                        cp.path("quantity").asInt(1),
+                        cp.path("unitPriceCents").asLong(0L),
+                        cp.path("totalCents").asLong(0L));
+            }
+
+            return new ConversationRefs(products, orders, returnPreview, checkoutPreview);
         } catch (Exception e) {
             return EMPTY;
         }
     }
 
-    /**
-     * 折叠控制字符：这段文本会进入模型输入，
-     * 换行/制表是结构的一部分，但其他控制字符（NUL、垂直制表等）
-     * 只会把输入搞乱。
-     */
+    private static String money(long cents) {
+        return "¥" + BigDecimal.valueOf(cents, 2).toPlainString();
+    }
+
     private static String safe(String value) {
         if (value == null) {
             return "";
@@ -205,9 +281,7 @@ public record ConversationRefs(
             i += Character.charCount(cp);
             if (cp == '\n' || cp == '\t') {
                 sb.append(' ');
-            } else if (Character.isISOControl(cp)) {
-                continue;
-            } else {
+            } else if (!Character.isISOControl(cp)) {
                 sb.appendCodePoint(cp);
             }
         }

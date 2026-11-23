@@ -1,26 +1,39 @@
 <script setup lang="ts">
 /**
- * 售后对话面板。
+ * 售后对话面板（F-01 / F-02 真实状态与确定性确认卡路径）。
  *
- * 展示顺序固定：用户这句话 → 进度（在做什么）→ 确认卡 → 最终回答 → 错误。
- *
- * 三条纪律：
- * 1. **确认卡只渲染服务端摘要**：订单号/商品/数量/原因都由 `approval_required`
- *    事件（随后用审批查询接口校准）给出，前端不拼、不改、不自己算钱；
- * 2. **按钮语义如实**：批准 = 同意执行，拒绝 = 什么都不做；
- *    没有"已批准"文案，只有"等待确认 / 已批准 / 已拒绝 / 已过期"这些真实状态；
- * 3. **回答不等于建单成功**：是否真的建单，以「我的售后」列表为准，
- *    面板底部明确写这句话，并在批准后由页面刷新列表。
+ * 纪律：
+ * 1. 按真实业务结果区分状态：信息待补 / 已准备、待确认 / 尚未提交 / 提交失败 / 提交成功；
+ *    只有收到真实 returnNo 才显示「提交成功」；Agent run SUCCEEDED 不是业务成功；
+ * 2. 确认卡内容完全来自服务端摘要（approval_required / GET /ai/approvals/{id}）；
+ * 3. 若带入明确订单上下文（从订单详情或可退订单卡片点入），展示绑定订单并透传 orderNo 给后端；
+ * 4. 当预览已齐备但未出确认卡时，提供显式按钮「发起退货确认卡」（仍经人工审批，不绕过确认）
+ *    与「填入普通表单」入口。
  */
 import { computed, nextTick, ref } from 'vue'
 import AppIcon from './AppIcon.vue'
 import ApprovalCard from './ApprovalCard.vue'
 import MarkdownView from './MarkdownView.vue'
-import type { AfterSaleChatStore, AfterSaleTurn } from '@/stores/aftersaleChat'
+import type { AfterSaleReturnDraft, AfterSaleSignedOrderVO } from '@/api/aftersale'
+import {
+  AFTERSALE_STATUS_LABELS,
+  type AfterSaleChatStore,
+  type AfterSaleTurn,
+} from '@/stores/aftersaleChat'
 
-const props = defineProps<{ chat: AfterSaleChatStore }>()
+const props = defineProps<{
+  chat: AfterSaleChatStore
+  activeOrder?: AfterSaleSignedOrderVO | null
+}>()
 
-const draft = ref('')
+const emit = defineEmits<{
+  (e: 'clear-order'): void
+  (e: 'pick-order', orderNo: string): void
+  (e: 'fill-form', draft: AfterSaleReturnDraft): void
+  (e: 'open-return', returnNo: string): void
+}>()
+
+const draftText = ref('')
 const listRef = ref<HTMLElement | null>(null)
 
 const turns = computed(() => props.chat.turns.value)
@@ -36,15 +49,14 @@ async function scrollToEnd(): Promise<void> {
 }
 
 async function onSend(): Promise<void> {
-  const text = draft.value
+  const text = draftText.value
   if (!text.trim() || busy.value) {
     return
   }
-  draft.value = ''
+  draftText.value = ''
   const accepted = await props.chat.submit(text)
   if (!accepted) {
-    // 被守卫拦下时不要把用户输入吞掉
-    draft.value = text
+    draftText.value = text
     return
   }
   await scrollToEnd()
@@ -66,8 +78,35 @@ function onRefresh(turn: AfterSaleTurn): void {
   void props.chat.refreshApproval(turn.id)
 }
 
+async function onPrepareCard(draft: AfterSaleReturnDraft): Promise<void> {
+  await props.chat.prepareApprovalCard(draft)
+  await scrollToEnd()
+}
+
+function onPickCandidate(orderNo: string): void {
+  emit('pick-order', orderNo)
+  if (!draftText.value.trim()) {
+    draftText.value = `我要退订单 ${orderNo}，数量 1 件，原因是：`
+  }
+}
+
 function running(turn: AfterSaleTurn): boolean {
   return turn.transport === 'submitting' || turn.transport === 'streaming'
+}
+
+function statusClass(status: AfterSaleTurn['businessStatus']): string {
+  switch (status) {
+    case 'SUBMITTED':
+      return 'turn__badge--ok'
+    case 'READY_FOR_CONFIRMATION':
+      return 'turn__badge--wait'
+    case 'SUBMIT_FAILED':
+      return 'turn__badge--danger'
+    case 'NEEDS_INFO':
+    case 'NOT_SUBMITTED':
+    default:
+      return 'turn__badge--neutral'
+  }
 }
 </script>
 
@@ -81,12 +120,30 @@ function running(turn: AfterSaleTurn): boolean {
         <div>
           <h2 class="chat__name">售后对话</h2>
           <p class="chat__sub">
-            能查你自己的订单、解释为什么不能退、查已有申请。创建退货申请是它唯一的写操作，
-            且必须你确认后才会执行。
+            支持查询本人签收订单、核对退货资格、发起退货确认卡。确认前零建单、零占额度；
+            仅收到真实退货单号才算提交成功。
           </p>
         </div>
       </div>
     </header>
+
+    <!-- 从订单详情或可退订单卡带入的明确订单上下文 -->
+    <div v-if="activeOrder" class="chat__context" data-active-order-context>
+      <div class="chat__context-info">
+        <span class="chat__context-tag">当前关联订单</span>
+        <strong class="mono">{{ activeOrder.orderNo }}</strong>
+        <span>{{ activeOrder.productName }}（可退 {{ activeOrder.quota.remaining }}/{{ activeOrder.quota.purchased }} 件）</span>
+      </div>
+      <div class="chat__context-actions">
+        <RouterLink
+          class="link-btn"
+          :to="{ path: '/shop', query: { orderNo: activeOrder.orderNo } }"
+        >
+          返回订单详情
+        </RouterLink>
+        <button type="button" class="link-btn" @click="emit('clear-order')">取消关联</button>
+      </div>
+    </div>
 
     <p v-if="conversationUnavailable" class="chat__warn">
       <AppIcon name="alert" :size="13" />
@@ -95,7 +152,12 @@ function running(turn: AfterSaleTurn): boolean {
 
     <div ref="listRef" class="chat__turns">
       <p v-if="!turns.length" class="chat__empty">
-        例：「我签收的订单里还有哪些能退？」或「帮我退一把键盘，键盘坏了」。
+        <template v-if="activeOrder">
+          已绑定订单 {{ activeOrder.orderNo }}。直接说「退 1 把，原因是按键回弹偏硬」即可试算并生成退货确认卡。
+        </template>
+        <template v-else>
+          例：「我签收的订单里还有哪些能退？」或「帮我退 1 件，原因是按键失灵」。
+        </template>
       </p>
 
       <article
@@ -103,7 +165,28 @@ function running(turn: AfterSaleTurn): boolean {
         :key="turn.id"
         class="turn"
         :data-turn-id="turn.id"
+        :data-business-status="turn.businessStatus ?? 'PENDING'"
       >
+        <div class="turn__top">
+          <span
+            v-if="turn.businessStatus"
+            class="turn__badge"
+            :class="statusClass(turn.businessStatus)"
+            data-turn-status
+          >
+            {{ AFTERSALE_STATUS_LABELS[turn.businessStatus] }}
+          </span>
+          <button
+            v-if="turn.returnNo"
+            type="button"
+            class="link-btn mono"
+            data-turn-return-no
+            @click="emit('open-return', turn.returnNo)"
+          >
+            退货单号：{{ turn.returnNo }}（查看详情）
+          </button>
+        </div>
+
         <p class="turn__prompt">{{ turn.prompt }}</p>
 
         <ul v-if="turn.steps.length" class="turn__steps">
@@ -113,6 +196,26 @@ function running(turn: AfterSaleTurn): boolean {
         </ul>
 
         <p v-if="running(turn) && !turn.steps.length" class="turn__pending">正在处理…</p>
+
+        <p v-if="turn.businessMessage" class="turn__status-note" data-business-message>
+          {{ turn.businessMessage }}
+        </p>
+
+        <!-- 多笔可退订单候选：让买家显式选择，绝不猜测 -->
+        <div v-if="turn.candidates.length > 1 && !turn.approvalPayload && !turn.returnNo" class="turn__candidates">
+          <p class="turn__candidates-label">请选择要退货的订单：</p>
+          <div class="turn__candidates-list">
+            <button
+              v-for="c in turn.candidates"
+              :key="c.orderNo"
+              type="button"
+              class="mk-btn mk-btn--sm"
+              @click="onPickCandidate(c.orderNo)"
+            >
+              {{ c.orderNo }} · {{ c.productName }}（可退 {{ c.remainingQty }}）
+            </button>
+          </div>
+        </div>
 
         <ApprovalCard
           v-if="turn.approvalPayload"
@@ -129,6 +232,32 @@ function running(turn: AfterSaleTurn): boolean {
           <MarkdownView :source="turn.answer" />
         </div>
 
+        <!-- 尚未产出确认卡且未提交时：给出显式继续方式（准备确认卡 / 普通表单） -->
+        <div
+          v-if="!running(turn) && !turn.approvalPayload && !turn.returnNo && turn.businessStatus !== 'SUBMITTED'"
+          class="turn__actions"
+        >
+          <button
+            v-if="turn.draft"
+            type="button"
+            class="mk-btn mk-btn--sm mk-btn--primary"
+            data-prepare-approval
+            :disabled="busy"
+            @click="onPrepareCard(turn.draft)"
+          >
+            发起退货确认卡（{{ turn.draft.orderNo }} × {{ turn.draft.quantity }}）
+          </button>
+          <button
+            v-if="turn.draft"
+            type="button"
+            class="mk-btn mk-btn--sm"
+            @click="emit('fill-form', turn.draft)"
+          >
+            填入普通退货表单
+          </button>
+          <a v-else class="mk-btn mk-btn--sm" href="#form">改用普通退货表单</a>
+        </div>
+
         <p v-if="turn.error" class="turn__error">
           <AppIcon name="alert" :size="13" />
           {{ turn.error }}
@@ -138,7 +267,7 @@ function running(turn: AfterSaleTurn): boolean {
 
     <form class="chat__composer" @submit.prevent="onSend">
       <textarea
-        v-model="draft"
+        v-model="draftText"
         class="chat__input"
         rows="2"
         placeholder="说说你要退哪一单、几件、为什么（也可以先问）"
@@ -146,15 +275,15 @@ function running(turn: AfterSaleTurn): boolean {
         aria-label="售后对话输入"
         @keydown.enter.exact.prevent="onSend"
       />
-      <button type="submit" class="mk-btn mk-btn--primary" :disabled="busy || !draft.trim()">
+      <button type="submit" class="mk-btn mk-btn--primary" :disabled="busy || !draftText.trim()">
         <AppIcon name="send" :size="14" />
         {{ busy ? '处理中…' : '发送' }}
       </button>
     </form>
 
     <p class="chat__foot">
-      回答只是说明；有没有真的建单，以「我的售后」里的退货单号为准。
-      拒绝确认不会创建申请、不会占用可退额度。
+      回答只是说明，不代表已提交；只有生成真实退货单号并在「我的售后」可见时才视为已提交。
+      拒绝确认不会建单、不会占额度。
     </p>
   </section>
 </template>
@@ -207,6 +336,41 @@ function running(turn: AfterSaleTurn): boolean {
   color: var(--c-text-3);
 }
 
+.chat__context {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+  padding: 8px var(--s-3);
+  border: 1px solid var(--c-accent-line);
+  border-radius: var(--r-sm);
+  background: var(--c-accent-weak);
+  font-size: var(--fs-xs);
+  color: var(--c-text);
+}
+
+.chat__context-info {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.chat__context-tag {
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--c-surface);
+  color: var(--c-accent-ink);
+  font-weight: 500;
+}
+
+.chat__context-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+}
+
 .chat__warn {
   display: flex;
   align-items: center;
@@ -237,6 +401,52 @@ function running(turn: AfterSaleTurn): boolean {
   background: var(--c-surface);
 }
 
+.turn__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.turn__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--c-line);
+}
+
+.turn__badge--ok {
+  border-color: rgba(118, 214, 178, 0.35);
+  background: rgba(118, 214, 178, 0.12);
+  color: var(--c-ok);
+}
+
+.turn__badge--wait {
+  border-color: rgba(224, 177, 95, 0.38);
+  background: var(--c-warn-weak);
+  color: var(--c-warn);
+}
+
+.turn__badge--danger {
+  border-color: rgba(232, 114, 114, 0.38);
+  background: rgba(232, 114, 114, 0.12);
+  color: var(--c-danger);
+}
+
+.turn__badge--neutral {
+  color: var(--c-text-2);
+  background: var(--c-bg-soft);
+}
+
+.turn__status-note {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+}
+
 .turn__prompt {
   justify-self: end;
   max-width: 90%;
@@ -260,7 +470,6 @@ function running(turn: AfterSaleTurn): boolean {
 .turn__step {
   font-size: var(--fs-xs);
   color: var(--c-text-3);
-  overflow-wrap: anywhere;
 }
 
 .turn__pending {
@@ -268,21 +477,42 @@ function running(turn: AfterSaleTurn): boolean {
   color: var(--c-text-3);
 }
 
+.turn__candidates {
+  display: grid;
+  gap: 6px;
+}
+
+.turn__candidates-label {
+  font-size: var(--fs-xs);
+  color: var(--c-text-2);
+}
+
+.turn__candidates-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .turn__answer {
   font-size: var(--fs-sm);
   line-height: var(--lh-base);
   color: var(--c-text);
-  overflow-wrap: anywhere;
+}
+
+.turn__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+  padding-top: 2px;
 }
 
 .turn__error {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 6px;
   font-size: var(--fs-xs);
-  line-height: var(--lh-base);
   color: var(--c-danger);
-  overflow-wrap: anywhere;
 }
 
 .chat__composer {
@@ -294,25 +524,33 @@ function running(turn: AfterSaleTurn): boolean {
 .chat__input {
   flex: 1;
   min-width: 0;
-  padding: var(--s-2) var(--s-3);
+  resize: vertical;
+  padding: 8px 10px;
   border: 1px solid var(--c-line);
   border-radius: var(--r-sm);
   background: var(--c-surface);
   color: var(--c-text);
-  font-family: inherit;
+  font: inherit;
   font-size: var(--fs-sm);
   line-height: var(--lh-base);
-  resize: vertical;
-}
-
-.chat__input:focus {
-  outline: 2px solid var(--c-accent-line);
-  outline-offset: 1px;
 }
 
 .chat__foot {
-  font-size: 10.5px;
-  line-height: 1.65;
+  font-size: 11px;
   color: var(--c-text-3);
+}
+
+.link-btn {
+  font-size: var(--fs-xs);
+  color: var(--c-accent-ink);
+  text-decoration: none;
+}
+
+.link-btn:hover {
+  text-decoration: underline;
+}
+
+.mono {
+  font-family: var(--font-mono);
 }
 </style>

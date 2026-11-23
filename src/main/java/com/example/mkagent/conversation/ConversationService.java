@@ -3,6 +3,7 @@ package com.example.mkagent.conversation;
 import com.baomidou.mybatisplus.core.toolkit.IdWorker;
 import com.example.mkagent.exception.BusinessException;
 import com.example.mkagent.model.AgentRunContext;
+import com.example.mkagent.model.AgentType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
@@ -76,6 +77,7 @@ public class ConversationService {
                     rs.getString("title"),
                     rs.getString("refs_json"),
                     rs.getString("last_run_id"),
+                    rs.getString("agent_type"),
                     toLocal(rs, "created_at"),
                     toLocal(rs, "updated_at")
             );
@@ -115,37 +117,68 @@ public class ConversationService {
     // ==================== 会话本身 ====================
 
     /**
-     * 新建会话。
+     * 新建会话（音乐入口的兼容重载）。
      */
     public String create(String userId) {
+        return create(userId, AgentType.MUSIC_USER);
+    }
+
+    /**
+     * 新建会话，并钉死它属于哪个业务领域。
+     *
+     * <p>{@code agentType} 由**入口**决定（音乐入口 MUSIC_USER、售后入口 AFTER_SALES），
+     * 不接受请求参数。它和 {@code user_id} 一起构成会话的归属：
+     * 同一个人的音乐会话与售后会话是两条互不可见的记录，
+     * 否则"能读自己的音乐会话"就等于"能拿它当售后会话继续聊"。
+     */
+    public String create(String userId, AgentType agentType) {
         String conversationId = UUID.randomUUID().toString();
         LocalDateTime now = LocalDateTime.now();
 
         jdbcTemplate.update(
                 "INSERT INTO agent_conversation "
-                        + "(id, conversation_id, user_id, title, refs_json, last_run_id, "
-                        + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                IdWorker.getId(), conversationId, userId, null, null, null, now, now);
+                        + "(id, conversation_id, user_id, agent_type, title, refs_json, last_run_id, "
+                        + "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                IdWorker.getId(), conversationId, userId, agentType.name(),
+                null, null, null, now, now);
 
         return conversationId;
     }
 
     /**
-     * 取会话并校验归属；不存在与不是本人返回同一句文案（不泄露他人会话是否存在）。
+     * 取会话并校验归属；不存在、不是本人、领域不符三种情况共用同一句文案。
+     *
+     * <p>领域不符也走 404 而不是 403：403 等于告诉调用方
+     * "这个 conversationId 确实存在，只是不属于这个入口"，
+     * 于是可以用音乐入口枚举出别人的售后会话 id。
      */
     public ConversationRow requireOwned(String userId, String conversationId) {
+        return requireOwned(userId, conversationId, AgentType.MUSIC_USER);
+    }
+
+    /**
+     * 取会话并校验归属 + 领域。
+     *
+     * @param agentType 当前入口对应的领域；与记录的领域不符时按"不存在"处理
+     */
+    public ConversationRow requireOwned(
+            String userId,
+            String conversationId,
+            AgentType agentType
+    ) {
         if (conversationId == null || conversationId.isBlank()) {
             throw new BusinessException(400, "缺少 conversationId");
         }
 
         List<ConversationRow> rows = jdbcTemplate.query(
-                "SELECT conversation_id, user_id, title, refs_json, last_run_id, "
+                "SELECT conversation_id, user_id, title, refs_json, last_run_id, agent_type, "
                         + "created_at, updated_at FROM agent_conversation "
                         + "WHERE conversation_id = ?",
                 CONVERSATION_MAPPER,
                 conversationId);
 
-        if (rows.isEmpty() || !userId.equals(rows.get(0).userId())) {
+        if (rows.isEmpty() || !userId.equals(rows.get(0).userId())
+                || !agentType.name().equals(rows.get(0).agentType())) {
             throw new BusinessException(404, "会话不存在或无权访问：" + conversationId);
         }
 
@@ -156,12 +189,17 @@ public class ConversationService {
      * 会话列表（按最近活动倒序），附带每条会话的最近一轮状态。
      */
     public List<ConversationSummary> list(String userId) {
+        return list(userId, AgentType.MUSIC_USER);
+    }
+
+    /** 会话列表，只含当前领域的会话。 */
+    public List<ConversationSummary> list(String userId, AgentType agentType) {
         return jdbcTemplate.query(
                 "SELECT c.conversation_id, c.title, c.updated_at, "
                         + "(SELECT COUNT(*) FROM agent_conversation_message m "
                         + "  WHERE m.conversation_id = c.conversation_id) AS message_count, "
                         + "(SELECT r.state FROM agent_run r WHERE r.run_id = c.last_run_id) AS last_state "
-                        + "FROM agent_conversation c WHERE c.user_id = ? "
+                        + "FROM agent_conversation c WHERE c.user_id = ? AND c.agent_type = ? "
                         + "ORDER BY c.updated_at DESC LIMIT 50",
                 (rs, rowNum) -> new ConversationSummary(
                         rs.getString("conversation_id"),
@@ -170,14 +208,24 @@ public class ConversationService {
                         rs.getString("last_state"),
                         toLocal(rs, "updated_at")
                 ),
-                userId);
+                userId,
+                agentType.name());
     }
 
     /**
      * 会话详情：消息按时间正序（前端直接顺序渲染）。
      */
     public ConversationDetail detail(String userId, String conversationId) {
-        ConversationRow row = requireOwned(userId, conversationId);
+        return detail(userId, conversationId, AgentType.MUSIC_USER);
+    }
+
+    /** 会话详情（带领域校验）。 */
+    public ConversationDetail detail(
+            String userId,
+            String conversationId,
+            AgentType agentType
+    ) {
+        ConversationRow row = requireOwned(userId, conversationId, agentType);
 
         List<ConversationMessage> messages = jdbcTemplate.query(
                 "SELECT m.run_id, m.role, m.content, m.state, m.created_at, "
@@ -214,13 +262,29 @@ public class ConversationService {
             String message,
             UUID runId
     ) {
+        return beginTurn(userId, conversationId, message, runId, AgentType.MUSIC_USER);
+    }
+
+    /**
+     * 开始一轮（带领域校验）。
+     *
+     * <p>领域必须由调用方按**入口**传入：售后入口传 AFTER_SALES。
+     * 传错不会"串台"，而是拿不到会话（404）——这正是要的效果。
+     */
+    public ConversationSeed beginTurn(
+            String userId,
+            String conversationId,
+            String message,
+            UUID runId,
+            AgentType agentType
+    ) {
         String effectiveConversationId = (conversationId == null || conversationId.isBlank())
-                ? create(userId)
-                : requireOwned(userId, conversationId).conversationId();
+                ? create(userId, agentType)
+                : requireOwned(userId, conversationId, agentType).conversationId();
 
         assertNoActiveRun(effectiveConversationId);
 
-        ConversationRow row = requireOwned(userId, effectiveConversationId);
+        ConversationRow row = requireOwned(userId, effectiveConversationId, agentType);
         ConversationRefs refs = ConversationRefs.fromJson(row.refsJson());
 
         List<org.springframework.ai.chat.messages.Message> history =
@@ -524,6 +588,8 @@ public class ConversationService {
             String title,
             String refsJson,
             String lastRunId,
+            /** 会话所属业务领域（{@link AgentType} 的名字）；历史行为 MUSIC_USER。 */
+            String agentType,
             LocalDateTime createdAt,
             LocalDateTime updatedAt
     ) {

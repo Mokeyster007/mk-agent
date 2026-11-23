@@ -153,7 +153,7 @@ class ShopPostgresIdentityDisabledTest extends AbstractPostgresShopTest {
         ShopApiClient.Reply products = api.get("/shop/products", null);
 
         assertEquals(200, products.status(), products.raw());
-        assertEquals(3, products.body().size());
+        assertEquals(ShopSeedInitializer.SEED_PRODUCT_COUNT, products.body().size());
         assertNotNull(products.body().get(0).get("sku"));
     }
 

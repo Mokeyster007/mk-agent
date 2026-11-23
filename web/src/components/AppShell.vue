@@ -12,7 +12,6 @@
  * 断点只有一个：<900px 侧栏变抽屉。桌面端宽度变化不影响主区结构。
  */
 import AppIcon from './AppIcon.vue'
-import PlaybackBar from './PlaybackBar.vue'
 
 defineProps<{
   panelOpen: boolean
@@ -50,11 +49,6 @@ defineEmits<{
       <div class="shell__content">
         <slot />
       </div>
-
-      <!-- 常驻播放器：独立一行，不在消息滚动区里，也不浮在内容上方 -->
-      <div class="shell__player">
-        <PlaybackBar />
-      </div>
     </main>
 
     <div v-if="panelOpen" class="shell__panel" role="dialog" aria-modal="true" aria-label="任务详情">
@@ -89,7 +83,7 @@ defineEmits<{
 
 .shell__main {
   display: grid;
-  grid-template-rows: var(--header-h) minmax(0, 1fr) auto;
+  grid-template-rows: var(--header-h) minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   height: 100%;

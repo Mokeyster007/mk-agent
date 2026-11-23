@@ -45,8 +45,8 @@ export const IS_DEV = POLICY.dev
 /** 是否允许在界面上修改联调身份 */
 export const ALLOW_DEV_IDENTITY = POLICY.allowSwitch
 
-/** 构建期默认身份；缺省用种子数据里的普通用户 */
-const CONFIGURED_USER_ID = (import.meta.env.VITE_DEV_USER_ID ?? 'music-user-1').trim()
+/** 构建期默认身份；缺省用纯商城买家身份 */
+const CONFIGURED_USER_ID = (import.meta.env.VITE_DEV_USER_ID ?? 'shop-user-1').trim()
 
 function readStored(): string | null {
   if (!ALLOW_DEV_IDENTITY) {

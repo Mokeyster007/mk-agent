@@ -48,7 +48,13 @@ public enum AgentEventType {
      * 收到本事件后紧跟一条 done：done 只表示"本段连接结束"，
      * 任务本身仍处于 WAITING_APPROVAL，不是终态。
      */
-    APPROVAL_REQUIRED("approval_required");
+    APPROVAL_REQUIRED("approval_required"),
+
+    /**
+     * 服务端发出的结构化业务载荷（商品卡、比较表、购物车快照、结算预览、订单创建结果、售后状态等）。
+     * 前端直接按此渲染，绝不从聊天文本反解析业务状态或单号。
+     */
+    STRUCTURED_DATA("structured_data");
 
     private final String wireName;
 

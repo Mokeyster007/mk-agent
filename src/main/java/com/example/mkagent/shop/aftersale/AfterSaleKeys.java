@@ -50,6 +50,9 @@ public final class AfterSaleKeys {
     /** 表单键前缀，避免与 Agent 侧的键空间混淆。 */
     private static final String FORM_PREFIX = "aftersale-form";
 
+    /** 收货键前缀（B2）：与买家提交的键空间分开。 */
+    private static final String RECEIPT_PREFIX = "aftersale-receipt";
+
     /** {@code clientRequestId} 允许的字符集（UUID / nanoid / 自增序号都能用）。 */
     private static final Pattern CLIENT_ID_PATTERN = Pattern.compile("[A-Za-z0-9_.:-]{8,64}");
 
@@ -100,6 +103,58 @@ public final class AfterSaleKeys {
                 + "|o" + lengthPrefix(orderNo == null ? "" : orderNo)
                 + "|q" + quantity
                 + "|r" + lengthPrefix(reason == null ? "" : reason);
+        return sha256Hex(material);
+    }
+
+    /**
+     * 派生**收货动作**的幂等键（B2）。
+     *
+     * <p>与表单键同一套纪律：身份来自"这一次操作"，而不是"操作了什么"。
+     * 不同的合法分批收货用不同的 {@code clientRequestId}，
+     * 因此它们各自入库；同一次点击的重试则命中同一个键、返回同一条记录。
+     *
+     * @param operatorId      服务端解析出的客服身份
+     * @param clientRequestId 前端在打开收货面板时生成的标识
+     */
+    public static String receiptKey(String operatorId, String clientRequestId) {
+        if (operatorId == null || operatorId.isBlank()) {
+            throw new IllegalArgumentException("幂等键缺少 operatorId");
+        }
+        if (clientRequestId == null || clientRequestId.isBlank()) {
+            throw new IllegalArgumentException("幂等键缺少 clientRequestId");
+        }
+        if (!CLIENT_ID_PATTERN.matcher(clientRequestId).matches()) {
+            throw new IllegalArgumentException(
+                    "clientRequestId 必须是 8~64 位字母、数字或 _ . : - 组成的字符串");
+        }
+
+        String material = KEY_VERSION
+                + "|" + RECEIPT_PREFIX
+                + "|u" + lengthPrefix(operatorId)
+                + "|k" + lengthPrefix(clientRequestId);
+
+        return sha256Hex(material);
+    }
+
+    /**
+     * 收货请求哈希：同键不同参数必须被拒绝。
+     *
+     * <p>哈希里包含退货单号与三个数量：如果同一次"收货动作"被复用于另一张单，
+     * 或改了合格/损坏的拆分，静默返回上一条记录会让操作员以为改动生效了。
+     */
+    public static String receiptRequestHash(
+            String returnNo,
+            int receivedQty,
+            int qualifiedQty,
+            int damagedQty,
+            String note
+    ) {
+        String material = "receive_return"
+                + "|r" + lengthPrefix(returnNo == null ? "" : returnNo)
+                + "|a" + receivedQty
+                + "|q" + qualifiedQty
+                + "|d" + damagedQty
+                + "|n" + lengthPrefix(note == null ? "" : note);
         return sha256Hex(material);
     }
 

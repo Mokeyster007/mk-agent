@@ -208,7 +208,6 @@ class ApprovalPauseBehaviourTest {
                 Set.of(WRITE_TOOL), Set.of(WRITE_TOOL, READ_TOOL), approvalEnabled));
         agent.setApprovalPauseGateway(gateway);
         agent.setApprovalSummaryBuilder(new ApprovalSummaryBuilder(
-                ids -> List.of("城市霓虹", "深夜电台"),
                 new ApprovalProperties()
         ));
         agent.setHandoffLocks(locks);

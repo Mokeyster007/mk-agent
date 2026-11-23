@@ -1,22 +1,12 @@
 package com.example.mkagent.shop.catalog;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
- * 可售商品视图（商品 + 当前可售库存）。
+ * 可售商品视图（商品 + 结构化规格 + 当前可售库存）。
  *
- * <p>{@code available} 来自库存余额表，不是商品表上的冗余计数：
- * 商品是"卖什么"，库存是"还有多少"，两者的变更频率与责任方都不同。
- *
- * <p>没有库存行的商品 {@code available = 0}：
- * "没有库存记录"和"库存为零"在**可售性**上是同一件事，
- * 但在排查时要能分开——所以库存表缺行会在管理端单独看得出来（余额列表里没有这一行）。
- *
- * @param id         商品 id（服务端生成的固定种子 id）
- * @param sku        SKU 编码（订单行与库存流水都用它做关联）
- * @param name       商品名
- * @param subtitle   副标题（卖点 / 规格简述）
- * @param priceCents 售价（分）
- * @param available  当前可售数量
- * @param status     商品状态（ACTIVE / INACTIVE）
+ * <p>缺失规格统一保持 {@code null}，对外展示为“未知”，绝不臆测或伪造规格依据。
  */
 public record ShopProduct(
         long id,
@@ -25,21 +15,91 @@ public record ShopProduct(
         String subtitle,
         long priceCents,
         int available,
-        String status
+        String status,
+        String category,
+        String connectivity,
+        Boolean macCompatible,
+        Boolean silentFeature,
+        String switchType,
+        String batteryInfo,
+        Integer weightGrams
 ) {
 
-    /**
-     * 是否可下单。
-     *
-     * <p>只看是否上架，**不看库存**：A0 的规则是"下单不预占、不扣库存"，
-     * 因此"有没有货"不是下单的前提条件，而是发货时才校验的条件。
-     * 如果这里按库存拦截，浏览器里就永远走不到"库存不足 → 发货失败"这条路径，
-     * 验收里的那条规则也就无法被真实复现。
-     *
-     * <p>页面仍然展示 {@code available}，让用户在点之前知道风险，
-     * 但"能不能点"与"点了会不会成功"是两件事。
-     */
     public boolean purchasable() {
         return "ACTIVE".equals(status);
+    }
+
+    public boolean isWireless() {
+        if (connectivity == null) {
+            return false;
+        }
+        return switch (connectivity) {
+            case "WIRELESS_24G", "BLUETOOTH", "TRI_MODE" -> true;
+            default -> false;
+        };
+    }
+
+    public String categoryLabel() {
+        if (category == null || category.isBlank()) {
+            return "未知";
+        }
+        return switch (category) {
+            case "KEYBOARD" -> "键盘";
+            case "MOUSE" -> "鼠标";
+            case "ACCESSORY" -> "配件";
+            default -> category;
+        };
+    }
+
+    public String connectivityLabel() {
+        if (connectivity == null || connectivity.isBlank()) {
+            return "未知";
+        }
+        return switch (connectivity) {
+            case "WIRED" -> "有线连接";
+            case "WIRELESS_24G" -> "无线 2.4G";
+            case "BLUETOOTH" -> "蓝牙无线";
+            case "TRI_MODE" -> "三模无线（蓝牙 / 2.4G / 有线）";
+            default -> connectivity;
+        };
+    }
+
+    public String macCompatibleLabel() {
+        if (macCompatible == null) {
+            return "未知";
+        }
+        return macCompatible ? "支持 Mac" : "不支持 Mac（仅 Windows）";
+    }
+
+    public String silentLabel() {
+        if (silentFeature == null) {
+            return "未知";
+        }
+        return silentFeature ? "静音/低噪设计" : "非静音（常规敲击声）";
+    }
+
+    public String switchTypeLabel() {
+        return (switchType == null || switchType.isBlank()) ? "未知" : switchType;
+    }
+
+    public String batteryLabel() {
+        return (batteryInfo == null || batteryInfo.isBlank()) ? "未知" : batteryInfo;
+    }
+
+    public String weightLabel() {
+        return weightGrams == null ? "未知" : weightGrams + "g";
+    }
+
+    /** 可核对规格键值表（供商品卡、比较表和 Agent 工具复用）。 */
+    public Map<String, String> verifiableSpecs() {
+        Map<String, String> map = new LinkedHashMap<>();
+        map.put("品类", categoryLabel());
+        map.put("连接方式", connectivityLabel());
+        map.put("Mac 兼容", macCompatibleLabel());
+        map.put("静音特性", silentLabel());
+        map.put("轴体/微动", switchTypeLabel());
+        map.put("续航/供电", batteryLabel());
+        map.put("重量", weightLabel());
+        return map;
     }
 }
